@@ -57,3 +57,8 @@ http://localhost:39210
 ## 合规说明
 
 TokenSea 在产品代码、服务命名和业务接口中使用自有命名体系。第三方开源组件的许可证、版权声明、SBOM、版本锁定和漏洞响应材料保存在 `NOTICE`、`third_party/notices`、`compliance` 与 `security` 目录中。生产交付时不得删除这些合规材料。
+
+
+## 供应商与模型目录
+
+内置供应商与模型模板见 `docs/provider-model-catalog-update-20260709.md`；模板仅作为系统初始化配置，不包含真实业务数据和供应商密钥。
