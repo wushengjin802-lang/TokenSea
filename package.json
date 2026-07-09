@@ -1,0 +1,1 @@
+{"name":"tokensea","version":"1.0.0","private":true,"workspaces":["apps/*","packages/*"],"scripts":{"console:dev":"npm --workspace @tokensea/console run dev","console:build":"npm --workspace @tokensea/console run build"}}

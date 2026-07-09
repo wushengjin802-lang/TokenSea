@@ -1,0 +1,12 @@
+
+global:
+  scrape_interval: 15s
+scrape_configs:
+  - job_name: tokensea-control-plane
+    metrics_path: /actuator/prometheus
+    static_configs:
+      - targets: ['tokensea-control-plane:39211']
+  - job_name: tokensea-gateway-runtime
+    metrics_path: /metrics
+    static_configs:
+      - targets: ['tokensea-gateway-runtime:39212']

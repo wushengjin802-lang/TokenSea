@@ -1,0 +1,10 @@
+TokenSea includes or interoperates with third-party open-source components.
+
+Important third-party runtime component:
+- LiteLLM / BerriAI/litellm
+  - Non-enterprise portions are reported by upstream as MIT licensed.
+  - Enterprise directory/features are subject to a separate enterprise/commercial license.
+  - TokenSea must not remove upstream copyright and license notices.
+  - TokenSea must not use Enterprise-only code or features without a valid commercial license.
+
+TokenSea product/service names hide third-party implementation details from business-facing APIs, but compliance documents, SBOM, and customer due-diligence materials must disclose third-party components truthfully.

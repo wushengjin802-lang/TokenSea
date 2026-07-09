@@ -1,0 +1,9 @@
+LiteLLM license notice placeholder.
+
+For the exact license text of the pinned upstream version, copy the LICENSE file from the corresponding BerriAI/litellm release/tag into this file during dependency lock.
+
+Known upstream license boundary at design time:
+- Non-enterprise portions: MIT License.
+- enterprise/ directory, if used: separate enterprise/commercial license.
+
+Do not remove this notice from private deployment packages.

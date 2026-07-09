@@ -1,0 +1,46 @@
+providers:
+  - provider_type: deepseek
+    display_name: DeepSeek
+    api_style: openai_compatible
+    default_base_url: https://api.deepseek.com
+    model_examples: [deepseek-chat, deepseek-reasoner]
+  - provider_type: qwen
+    display_name: 通义千问 / DashScope 兼容模式
+    api_style: openai_compatible
+    default_base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+    model_examples: [qwen-plus, qwen-max, qwen-long]
+  - provider_type: zhipu
+    display_name: 智谱 GLM
+    api_style: openai_compatible
+    default_base_url: https://open.bigmodel.cn/api/paas/v4
+    model_examples: [glm-4-plus, glm-4-air]
+  - provider_type: volcengine
+    display_name: 火山方舟
+    api_style: openai_compatible
+    default_base_url: https://ark.cn-beijing.volces.com/api/v3
+    model_examples: [doubao-pro-32k]
+  - provider_type: baidu
+    display_name: 百度千帆
+    api_style: openai_compatible
+    default_base_url: https://qianfan.baidubce.com/v2
+    model_examples: [ernie-4.0-turbo]
+  - provider_type: tencent
+    display_name: 腾讯混元
+    api_style: openai_compatible
+    default_base_url: null
+    model_examples: [hunyuan-turbo]
+  - provider_type: xunfei
+    display_name: 讯飞星火
+    api_style: openai_compatible
+    default_base_url: null
+    model_examples: [spark-pro]
+  - provider_type: vllm
+    display_name: 私有 vLLM
+    api_style: openai_compatible
+    default_base_url: http://vllm.internal/v1
+    model_examples: [local-model]
+  - provider_type: ollama
+    display_name: 私有 Ollama
+    api_style: openai_compatible
+    default_base_url: http://ollama.internal/v1
+    model_examples: [llama3.1]
