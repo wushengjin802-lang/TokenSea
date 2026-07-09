@@ -1,4 +1,3 @@
-
 import axios from 'axios'
 import { message } from 'ant-design-vue'
 
@@ -16,33 +15,42 @@ api.interceptors.response.use((resp) => resp, (err) => {
   return Promise.reject(err)
 })
 
+function unwrap<T = any>(payload: any): T {
+  if (payload && payload.success === false) {
+    const msg = payload.message || '操作失败'
+    message.error(msg)
+    throw new Error(msg)
+  }
+  return payload?.data ?? payload
+}
+
 export async function list(path: string) {
   const r = await api.get(path)
-  return r.data.data || []
+  return unwrap<any[]>(r.data) || []
 }
 export async function get(path: string) {
   const r = await api.get(path)
-  return r.data.data
+  return unwrap(r.data)
 }
 export async function create(path: string, payload: any) {
   const r = await api.post(path, payload)
-  return r.data.data
+  return unwrap(r.data)
 }
 export async function update(path: string, id: string, payload: any) {
   const r = await api.put(`${path}/${id}`, payload)
-  return r.data.data
+  return unwrap(r.data)
 }
 export async function remove(path: string, id: string) {
   const r = await api.delete(`${path}/${id}`)
-  return r.data.data
+  return unwrap(r.data)
 }
 export async function postAction(path: string, payload: any = {}) {
   const r = await api.post(path, payload)
-  return r.data.data
+  return unwrap(r.data)
 }
 export async function patchAction(path: string, payload: any = {}) {
   const r = await api.patch(path, payload)
-  return r.data.data
+  return unwrap(r.data)
 }
 export function unavailable(name: string) {
   message.warning(`${name} 暂不可用，入口已保留`)

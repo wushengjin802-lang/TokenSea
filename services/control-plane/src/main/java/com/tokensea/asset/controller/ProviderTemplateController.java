@@ -20,6 +20,10 @@ import java.util.Map;
 @RestController
 @RequestMapping("/api/provider-templates")
 public class ProviderTemplateController extends BaseCrudController<ProviderTemplate> {
+    private static final String STATUS_NOT_ENABLED = "未启用";
+    private static final String STATUS_ENABLED = "已启用";
+    private static final String STATUS_DISABLED = "已停用";
+
     private final ProviderTemplateMapper mapper;
     private final ProviderInstanceMapper instances;
     private final ProviderMapper legacyProviders;
@@ -34,10 +38,26 @@ public class ProviderTemplateController extends BaseCrudController<ProviderTempl
 
     @Override protected BaseMapper<ProviderTemplate> mapper() { return mapper; }
 
+    @Override
+    @GetMapping
+    public ApiResponse<List<ProviderTemplate>> list() {
+        List<ProviderTemplate> templates = mapper.selectList(null);
+        templates.forEach(this::applyEnableStatus);
+        return ApiResponse.ok(templates);
+    }
+
     @PostMapping("/{id}/enable")
     public ApiResponse<ProviderInstance> enable(@PathVariable("id") String id, @RequestBody(required = false) Map<String, Object> req) {
         ProviderTemplate t = mapper.selectById(id);
         if (t == null) return ApiResponse.fail("供应商模板不存在");
+        if (STATUS_DISABLED.equals(t.getStatus())) return ApiResponse.fail("该供应商模板已停用，不能启用");
+
+        ProviderInstance existing = findActiveInstance(id);
+        if (existing != null) {
+            markTemplateEnabled(t);
+            return ApiResponse.ok(existing);
+        }
+
         ProviderInstance i = new ProviderInstance();
         i.setProviderTemplateId(t.getId());
         i.setInstanceName(text(req, "instanceName", t.getProviderName() + "-生产"));
@@ -66,6 +86,8 @@ public class ProviderTemplateController extends BaseCrudController<ProviderTempl
         p.setRateLimitRpm(i.getRateLimitRpm());
         p.setRateLimitTpm(i.getRateLimitTpm());
         legacyProviders.insert(p);
+
+        markTemplateEnabled(t);
         return ApiResponse.ok(i);
     }
 
@@ -74,8 +96,8 @@ public class ProviderTemplateController extends BaseCrudController<ProviderTempl
         ProviderTemplate t = mapper.selectById(id);
         if (t == null) return ApiResponse.fail("供应商模板不存在");
         ProviderTemplate c = new ProviderTemplate();
-        c.setProviderName(t.getProviderName() + "-自定义");
-        c.setProviderType(t.getProviderType() + "_custom");
+        c.setProviderName(nextCopyName(t.getProviderName()));
+        c.setProviderType(nextCopyType(t.getProviderType()));
         c.setProtocol(t.getProtocol());
         c.setDefaultApiBase(t.getDefaultApiBase());
         c.setAuthType(t.getAuthType());
@@ -86,7 +108,7 @@ public class ProviderTemplateController extends BaseCrudController<ProviderTempl
         c.setDefaultRateLimitTpm(t.getDefaultRateLimitTpm());
         c.setModelTemplateCount(t.getModelTemplateCount());
         c.setBuiltIn("否");
-        c.setStatus("可配置");
+        c.setStatus(STATUS_NOT_ENABLED);
         c.setDescription("复制自 " + t.getProviderName());
         mapper.insert(c);
         return ApiResponse.ok(c);
@@ -95,6 +117,57 @@ public class ProviderTemplateController extends BaseCrudController<ProviderTempl
     @GetMapping("/{id}/model-templates")
     public ApiResponse<List<ModelTemplate>> modelTemplates(@PathVariable("id") String id) {
         return ApiResponse.ok(modelTemplates.selectList(new QueryWrapper<ModelTemplate>().eq("provider_template_id", id)));
+    }
+
+    private void applyEnableStatus(ProviderTemplate template) {
+        if (template == null || STATUS_DISABLED.equals(template.getStatus())) return;
+        Long count = instances.selectCount(new QueryWrapper<ProviderInstance>()
+                .eq("provider_template_id", template.getId())
+                .ne("status", "停用"));
+        int enabledCount = count == null ? 0 : count.intValue();
+        template.setEnabledInstanceCount(enabledCount);
+        template.setStatus(enabledCount > 0 ? STATUS_ENABLED : normalizeTemplateStatus(template.getStatus()));
+    }
+
+    private ProviderInstance findActiveInstance(String templateId) {
+        return instances.selectOne(new QueryWrapper<ProviderInstance>()
+                .eq("provider_template_id", templateId)
+                .ne("status", "停用")
+                .last("limit 1"));
+    }
+
+    private void markTemplateEnabled(ProviderTemplate t) {
+        if (!STATUS_ENABLED.equals(t.getStatus())) {
+            t.setStatus(STATUS_ENABLED);
+            mapper.updateById(t);
+        }
+    }
+
+    private String normalizeTemplateStatus(String status) {
+        if (status == null || status.isBlank()) return STATUS_NOT_ENABLED;
+        if (STATUS_ENABLED.equals(status) || STATUS_DISABLED.equals(status) || STATUS_NOT_ENABLED.equals(status)) return status;
+        if ("停用".equals(status) || "禁用".equals(status) || "DISABLED".equalsIgnoreCase(status)) return STATUS_DISABLED;
+        return STATUS_NOT_ENABLED;
+    }
+
+    private String nextCopyName(String sourceName) {
+        String base = sourceName + "-自定义";
+        if (mapper.selectCount(new QueryWrapper<ProviderTemplate>().eq("provider_name", base)) == 0) return base;
+        for (int i = 2; i < 1000; i++) {
+            String candidate = base + "-" + i;
+            if (mapper.selectCount(new QueryWrapper<ProviderTemplate>().eq("provider_name", candidate)) == 0) return candidate;
+        }
+        return base + "-" + System.currentTimeMillis();
+    }
+
+    private String nextCopyType(String sourceType) {
+        String base = sourceType + "_custom";
+        if (mapper.selectCount(new QueryWrapper<ProviderTemplate>().eq("provider_type", base)) == 0) return base;
+        for (int i = 2; i < 1000; i++) {
+            String candidate = base + "_" + i;
+            if (mapper.selectCount(new QueryWrapper<ProviderTemplate>().eq("provider_type", candidate)) == 0) return candidate;
+        }
+        return base + "_" + System.currentTimeMillis();
     }
 
     private static String text(Map<String, Object> req, String key, String fallback) {

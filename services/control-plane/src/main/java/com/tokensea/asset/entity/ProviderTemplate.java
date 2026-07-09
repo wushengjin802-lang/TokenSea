@@ -1,6 +1,7 @@
 package com.tokensea.asset.entity;
 
 import com.baomidou.mybatisplus.annotation.TableName;
+import com.baomidou.mybatisplus.annotation.TableField;
 import com.tokensea.common.BaseEntity;
 import lombok.Data;
 import lombok.EqualsAndHashCode;
@@ -23,4 +24,6 @@ public class ProviderTemplate extends BaseEntity {
     private String builtIn;
     private String status;
     private String description;
+    @TableField(exist = false)
+    private Integer enabledInstanceCount;
 }
