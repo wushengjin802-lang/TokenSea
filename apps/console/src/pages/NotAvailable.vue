@@ -1,8 +1,5 @@
-
-<template><div class="card not-available"><div class="eyebrow">Reserved</div><h1 class="page-title">{{ title }}</h1><p class="page-desc">该能力暂不可用，入口已保留。后续启用时会接入权限、审计、配置与接口联调。</p><button class="btn primary" @click="router.push('/dashboard')">返回总览</button></div></template>
+<template><section class="not-found" role="alert"><span>404</span><h1>页面不存在</h1><p>请求的地址不属于当前控制台。</p><router-link class="btn primary" :to="home">返回工作台</router-link></section></template>
 <script setup lang="ts">
-import { useRouter } from 'vue-router'
-
-defineProps<{ title?: string }>()
-const router = useRouter()
+import { isAdmin } from '../api/client'
+const home = isAdmin() ? '/dashboard' : '/workspace'
 </script>

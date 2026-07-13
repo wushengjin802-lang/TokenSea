@@ -1,0 +1,16 @@
+# Local secrets
+.env
+**/.env
+!.env.example
+!**/.env.example
+
+# Build and runtime output
+**/target/
+**/__pycache__/
+*.py[cod]
+configs/gateway/runtime.generated.yaml
+
+# Local generated reports and frontend artifacts
+docs/assessment/
+**/dist/
+node_modules/

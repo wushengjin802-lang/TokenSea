@@ -1,49 +1,50 @@
-
 import { createRouter, createWebHistory } from 'vue-router'
 import Login from './pages/Login.vue'
 import Layout from './layouts/MainLayout.vue'
 import Dashboard from './pages/Dashboard.vue'
 import DataPage from './pages/DataPage.vue'
 import Keys from './pages/Keys.vue'
-import Usage from './pages/Usage.vue'
-import Billing from './pages/Billing.vue'
-import Monitoring from './pages/Monitoring.vue'
-import ApiDocs from './pages/ApiDocs.vue'
+import Calls from './pages/Calls.vue'
+import RoutePolicies from './pages/RoutePolicies.vue'
 import Playground from './pages/Playground.vue'
-import NotAvailable from './pages/NotAvailable.vue'
-import { findMenuTitle } from './config/menu'
+import QuickStart from './pages/QuickStart.vue'
+import DeveloperModels from './pages/DeveloperModels.vue'
+import CostStatements from './pages/CostStatements.vue'
+import TenantWorkspace from './pages/TenantWorkspace.vue'
+import NotFound from './pages/NotAvailable.vue'
+import { identity, isAdmin } from './api/client'
+import { resources, resourceRoutes } from './config/resources'
 
-const routes = [
-  { path: '/login', component: Login },
-  { path: '/', component: Layout, children: [
-    { path: '', redirect: '/dashboard' },
-    { path: 'dashboard', component: Dashboard },
-    { path: 'tenants', component: DataPage, props: { title: '租户管理', eyebrow: 'Tenant Center', desc: '管理企业客户、内部部门和外部客户租户，承载预算、模型范围、责任人与审计边界。', apiPath: '/api/tenants', fields: ['name','type','status','ownerName','contactEmail','monthlyBudget','remark'], labels: {name:'租户名称',type:'租户类型',status:'状态',ownerName:'负责人',contactEmail:'联系邮箱',monthlyBudget:'月预算',remark:'备注'} } },
-    { path: 'projects', component: DataPage, props: { title: '项目 / 应用', eyebrow: 'Project & App', desc: '按租户拆分项目与应用，用于模型访问、预算分摊和调用归因。', apiPath: '/api/projects', fields: ['tenantId','name','ownerName','monthlyBudget','status'], labels: {tenantId:'租户 ID',name:'项目名称',ownerName:'负责人',monthlyBudget:'月预算',status:'状态'} } },
-    { path: 'apps', component: DataPage, props: { title: '应用管理', eyebrow: 'Applications', desc: '维护业务系统、Agent、知识库和开发工具的接入应用。', apiPath: '/api/apps', fields: ['tenantId','projectId','name','ownerName','environment','status'], labels: {tenantId:'租户 ID',projectId:'项目 ID',name:'应用名称',ownerName:'负责人',environment:'环境',status:'状态'} } },
-    { path: 'providers', component: DataPage, props: { title: '供应商管理', eyebrow: 'Provider Registry', desc: '按“供应商模板 + 供应商实例”管理模型厂商。模板内置能力定义，实例承载真实 API Base、区域、Key 托管和健康状态。', apiPath: '/api/provider-instances', tabs: [{key:'templates',label:'供应商模板',kind:'builtin'},{key:'instances',label:'供应商实例',kind:'data'}], defaultTab: 'templates', builtinApiPath:'/api/provider-templates', builtinFields: ['providerName','providerType','protocol','supportedEndpoints','modelTemplateCount','builtIn','status'], builtinLabels: {providerName:'供应商',providerType:'供应商类型',protocol:'协议',supportedEndpoints:'支持端点',modelTemplateCount:'模型模板数',builtIn:'是否内置',status:'启用状态'}, hideDetailPanel:true, builtinActions: ['启用','复制','模型'], builtinActionMap:{'启用':':id/enable','复制':':id/copy','模型':'GET :id/model-templates'}, relatedFields:['providerModelName','defaultDisplayName','capabilityTags','supportedEndpoints','status'], relatedLabels:{providerModelName:'模型模板',defaultDisplayName:'展示名称',capabilityTags:'能力标签',supportedEndpoints:'支持端点',status:'状态'}, builtinCreateLabel: '新增自定义模板', builtinFooterNote: '启用模板会创建一个供应商实例；已启用的模板不会重复创建实例。如需多个实例，请在供应商实例页新建。', fields: ['instanceName','providerType','apiStyle','apiBase','region','keyStatus','healthStatus','status','rateLimitRpm','rateLimitTpm'], labels: {instanceName:'实例名称',providerType:'来源模板',apiStyle:'协议',apiBase:'API Base',region:'区域',keyStatus:'Key 状态',healthStatus:'健康状态',status:'状态',rateLimitRpm:'RPM',rateLimitTpm:'TPM'}, createLabel:'新建供应商实例', dataFooterNote:'供应商实例来自 /api/provider-instances；API Key 请在密钥托管入口加密保存。', requiredFields: ['instanceName','providerType','apiStyle','status'], wideFields: ['apiBase'], numberFields: ['rateLimitRpm','rateLimitTpm'], examples: {instanceName:'示例：DeepSeek-生产',providerType:'示例：DeepSeek',apiStyle:'示例：OpenAI 兼容',apiBase:'示例：https://api.deepseek.com',region:'示例：CN',status:'示例：启用',rateLimitRpm:'示例：600',rateLimitTpm:'示例：300000'}, descriptions: {providerType:'来源模板用于继承供应商协议、端点和错误码映射能力，例如 DeepSeek、Qwen、vLLM。实例名称不可重复。',apiStyle:'协议决定请求格式和鉴权方式。OpenAI-compatible 表示可复用 /v1/chat/completions 格式。',apiBase:'实际 API Base，不包含具体模型调用路径。敏感的 API Key 不在此字段保存。',region:'区域 / 可用区用于合规、网络路由和故障切换。',keyStatus:'Key 托管状态：已托管、未配置或无需 Key。',healthStatus:'健康状态可由测试连接和监控中心更新。',status:'供应商实例状态：启用、暂停、停用。停用后保留配置但不建议调度。',rateLimitRpm:'RPM = Requests Per Minute，每分钟最多请求次数，用于供应商级调用限流。',rateLimitTpm:'TPM = Tokens Per Minute，每分钟最多 Token 数，用于控制供应商吞吐上限。'}, fieldOptions: {providerType: [{label:'OpenAI',value:'openai'},{label:'Azure OpenAI',value:'azure_openai'},{label:'Anthropic Claude',value:'anthropic'},{label:'Google Gemini',value:'gemini'},{label:'DeepSeek',value:'deepseek'},{label:'Qwen / 阿里云百炼',value:'qwen'},{label:'Z.AI / 智谱 GLM',value:'zhipu'},{label:'火山方舟 / 豆包',value:'volcengine_ark'},{label:'百度千帆',value:'baidu_qianfan'},{label:'讯飞星火',value:'iflytek_spark'},{label:'腾讯混元 / TokenHub',value:'tencent_hunyuan'},{label:'Moonshot / Kimi',value:'moonshot'},{label:'MiniMax',value:'minimax'},{label:'SiliconFlow',value:'siliconflow'},{label:'Mistral AI',value:'mistral'},{label:'Cohere',value:'cohere'},{label:'Groq',value:'groq'},{label:'Together AI',value:'together'},{label:'Perplexity',value:'perplexity'},{label:'xAI / Grok',value:'xai'},{label:'vLLM',value:'vllm'},{label:'Ollama',value:'ollama'},{label:'Custom Provider',value:'custom'}],apiStyle: [{label:'OpenAI-compatible',value:'openai_compatible'},{label:'Azure',value:'azure'},{label:'Anthropic',value:'anthropic'},{label:'Gemini',value:'gemini'},{label:'vLLM',value:'vllm'}],region: [{label:'CN',value:'CN'},{label:'JP',value:'JP'},{label:'US',value:'US'},{label:'EU',value:'EU'},{label:'内网',value:'内网'}],keyStatus:[{label:'已托管',value:'已托管'},{label:'未配置',value:'未配置'},{label:'无需 Key',value:'无需 Key'}],healthStatus:[{label:'健康',value:'健康'},{label:'观察',value:'观察'},{label:'异常',value:'异常'}],status: [{label:'启用',value:'启用'},{label:'暂停',value:'暂停'},{label:'停用',value:'停用'}]} } },
-    { path: 'models', component: DataPage, props: { title: '模型目录', eyebrow: 'Model Registry', desc: '按“模型模板 + 平台模型”治理模型资产。业务系统调用平台模型名，平台模型再映射到一个或多个真实模型模板。', apiPath: '/api/model-templates', tabs: [{key:'platform',label:'平台模型',kind:'builtin'},{key:'templates',label:'模型模板',kind:'data'}], defaultTab:'platform', builtinApiPath:'/api/platform-models', builtinFields: ['platformModelName','displayName','actualModels','routePolicy','visibilityScope','pricePolicy','status'], builtinLabels: {platformModelName:'平台模型名',displayName:'展示名称',actualModels:'实际模型',routePolicy:'路由策略',visibilityScope:'可见范围',pricePolicy:'价格策略',status:'状态'}, hideDetailPanel:true, builtinActions: ['映射','路由','价格','发布'], builtinActionMap:{'映射':'edit','路由':'edit','价格':'edit','发布':'PATCH :id/publish'}, builtinCreateLabel:'新增平台模型', builtinFooterNote:'平台模型是业务系统调用的模型别名。发布前需校验实际模型、价格策略、路由策略和可见范围。', fields: ['providerModelName','defaultDisplayName','providerName','contextLength','capabilityTags','supportedEndpoints','status'], labels: {providerModelName:'模型模板',defaultDisplayName:'展示名称',providerName:'默认供应商',contextLength:'上下文',capabilityTags:'能力标签',supportedEndpoints:'支持端点',status:'状态'}, createLabel:'新增自定义模型模板', dataFooterNote:'模型模板用于平台模型映射。业务系统应调用平台模型名，而不是直接调用供应商真实模型名。', requiredFields: ['providerModelName','defaultDisplayName','capabilityTags','supportedEndpoints','status'], numberFields: ['contextLength'], examples: {providerModelName:'示例：deepseek-chat',defaultDisplayName:'示例：DeepSeek Chat',providerName:'示例：DeepSeek',contextLength:'示例：64000'}, descriptions: {providerModelName:'模型模板 ID 或供应商真实模型名，例如 qwen-plus、deepseek-chat、gpt-4o-mini。',defaultDisplayName:'控制台展示名称，建议包含厂商和模型定位。',providerName:'默认所属供应商模板，例如 Qwen、DeepSeek、OpenAI。',contextLength:'模型单次请求可处理的最大上下文 Token 数，例如 32K、128K、200K。',capabilityTags:'用于表达模型能力，如文本生成、代码生成、长上下文、多模态、低成本、高质量。',supportedEndpoints:'模型支持的 API 端点类型，会影响运行时是否允许对应调用。',status:'模型模板状态：可发布、观察、已废弃。平台模型另有草稿、测试、灰度、已发布、停用、下架。'}, fieldOptions: {providerName:[{label:'OpenAI',value:'OpenAI'},{label:'Anthropic Claude',value:'Anthropic Claude'},{label:'Google Gemini',value:'Google Gemini'},{label:'DeepSeek',value:'DeepSeek'},{label:'Qwen / 阿里云百炼',value:'Qwen / 阿里云百炼'},{label:'Z.AI / 智谱 GLM',value:'Z.AI / 智谱 GLM'},{label:'火山方舟 / 豆包',value:'火山方舟 / 豆包'},{label:'百度千帆',value:'百度千帆'},{label:'讯飞星火',value:'讯飞星火'},{label:'腾讯混元 / TokenHub',value:'腾讯混元 / TokenHub'},{label:'Moonshot / Kimi',value:'Moonshot / Kimi'},{label:'MiniMax',value:'MiniMax'},{label:'vLLM',value:'vLLM'},{label:'Ollama',value:'Ollama'}],capabilityTags: [{label:'文本生成',value:'["文本生成"]'},{label:'推理',value:'["推理"]'},{label:'代码生成',value:'["代码生成"]'},{label:'智能体',value:'["智能体"]'},{label:'长上下文',value:'["长上下文"]'},{label:'多模态',value:'["多模态"]'},{label:'视觉理解',value:'["视觉理解"]'},{label:'图像生成',value:'["图像生成"]'},{label:'视频生成',value:'["视频生成"]'},{label:'语音',value:'["语音"]'},{label:'实时语音',value:'["实时语音"]'},{label:'Embedding',value:'["Embedding"]'},{label:'Rerank',value:'["Rerank"]'},{label:'搜索增强',value:'["搜索增强"]'},{label:'低成本',value:'["低成本"]'},{label:'低延迟',value:'["低延迟"]'},{label:'高质量',value:'["高质量"]'},{label:'国产化',value:'["国产化"]'},{label:'私有部署',value:'["私有部署"]'}],supportedEndpoints: [{label:'Chat',value:'["Chat"]'},{label:'Responses',value:'["Responses"]'},{label:'Messages',value:'["Messages"]'},{label:'Embeddings',value:'["Embeddings"]'},{label:'Images',value:'["Images"]'},{label:'Audio',value:'["Audio"]'},{label:'Video',value:'["Video"]'},{label:'Realtime',value:'["Realtime"]'},{label:'Rerank',value:'["Rerank"]'},{label:'Search',value:'["Search"]'},{label:'Chat + Responses',value:'["Chat","Responses"]'},{label:'Chat + Embeddings',value:'["Chat","Embeddings"]'}],status: [{label:'可发布',value:'可发布'},{label:'观察',value:'观察'},{label:'已废弃',value:'已废弃'}]} } },
-    { path: 'pricing', component: DataPage, props: { title: '模型价格', eyebrow: 'Pricing', desc: '维护供应商成本价、对客销售价、币种和价格生效周期。', apiPath: '/api/model-prices', fields: ['modelId','currency','inputCostPer1k','outputCostPer1k','inputPricePer1k','outputPricePer1k','status'], labels: {modelId:'模型 ID',currency:'币种',inputCostPer1k:'输入成本/1K',outputCostPer1k:'输出成本/1K',inputPricePer1k:'输入售价/1K',outputPricePer1k:'输出售价/1K',status:'状态'} } },
-    { path: 'keys', component: Keys },
-    { path: 'key-wizard', component: Keys },
-    { path: 'budgets', component: DataPage, props: { title: '预算管理', eyebrow: 'Budget Policy', desc: '按租户、项目、应用和 Key 配置预算阈值、阻断策略和降级策略。', apiPath: '/api/keys', readonly: true, fields: ['name','tenantId','budgetAmount','rpmLimit','tpmLimit','qpsLimit','status'], labels: {name:'Key 名称',tenantId:'租户 ID',budgetAmount:'预算',rpmLimit:'RPM',tpmLimit:'TPM',qpsLimit:'QPS',status:'状态'} } },
-    { path: 'routes', component: DataPage, props: { title: '路由策略', eyebrow: 'Route Policy', desc: '配置模型别名到供应商部署的映射、优先级、Fallback 与负载均衡策略。', apiPath: '/api/routes', fields: ['name','modelAlias','strategy','fallbackEnabled','status','config'], labels: {name:'策略名称',modelAlias:'模型别名',strategy:'策略类型',fallbackEnabled:'启用 Fallback',status:'状态',config:'策略配置'} } },
-    { path: 'usage', component: Usage },
-    { path: 'logs', component: Usage, props: { mode: 'logs' } },
-    { path: 'billing', component: Billing },
-    { path: 'audit', component: DataPage, props: { title: '操作审计', eyebrow: 'Audit', desc: '记录用户登录、Key、模型、价格、预算和路由策略的变更轨迹。', apiPath: '/api/audit', readonly: true, fields: ['actorName','action','objectType','objectId','ipAddress','createdAt'], labels: {actorName:'操作人',action:'动作',objectType:'对象类型',objectId:'对象 ID',ipAddress:'IP 地址',createdAt:'时间'} } },
-    { path: 'monitoring', component: Monitoring },
-    { path: 'api-docs', component: ApiDocs },
-    { path: 'sdk', component: ApiDocs, props: { mode: 'sdk' } },
-    { path: 'access-guide', component: ApiDocs, props: { mode: 'guide' } },
-    { path: 'playground', component: Playground },
-    { path: ':pathMatch(.*)*', component: NotAvailable, props: (route:any) => ({ title: findMenuTitle('/' + route.params.pathMatch) }) },
+const opts=(values:[string,unknown][])=>values.map(([label,value])=>({label,value}))
+const admin={requiresAdmin:true}
+const tenantStatus=opts([['草稿','DRAFT'],['启用','ACTIVE'],['暂停','SUSPENDED']])
+const managedResources=resourceRoutes.map(([path,key])=>({path,component:DataPage,meta:admin,props:resources[key]}))
+
+const routes=[
+  {path:'/login',component:Login},
+  {path:'/',component:Layout,children:[
+    {path:'',redirect:()=>isAdmin()?'/dashboard':'/workspace'},
+    {path:'dashboard',component:Dashboard,meta:admin},
+    {path:'workspace',component:TenantWorkspace},
+    {path:'tenants',component:DataPage,meta:admin,props:{title:'租户',desc:'管理租户责任边界、成本预算和模型范围。',apiPath:'/api/tenants',fields:['name','type','ownerName','contactEmail','modelScope','monthlyBudget','status'],labels:{name:'租户名称',type:'租户类型',ownerName:'负责人',contactEmail:'联系邮箱',modelScope:'模型范围',monthlyBudget:'月预算',status:'状态'},requiredFields:['name','type','modelScope'],numberFields:['monthlyBudget'],optionSources:{modelScope:{path:'/api/platform-models',label:'displayName',value:'platformModelName',multiple:true}},fieldOptions:{type:opts([['内部租户','INTERNAL'],['外部客户','EXTERNAL']]),status:tenantStatus},fieldTypes:{type:'select',modelScope:'multiselect',status:'select'},builtinActions:['启用并生成默认 Key'],builtinActionMap:{'启用并生成默认 Key':':id/activate'},statePath:'status'}},
+    {path:'projects',component:DataPage,meta:admin,props:{title:'项目',desc:'按租户管理项目成本预算与负责人。',apiPath:'/api/projects',fields:['tenantId','name','ownerName','monthlyBudget','status'],labels:{tenantId:'所属租户',name:'项目名称',ownerName:'负责人',monthlyBudget:'月预算',status:'状态'},requiredFields:['tenantId','name'],numberFields:['monthlyBudget'],optionSources:{tenantId:{path:'/api/tenants',label:'name',value:'id'}},fieldOptions:{status:tenantStatus},fieldTypes:{tenantId:'select',status:'select'},statePath:'status'}},
+    {path:'apps',component:DataPage,meta:admin,props:{title:'应用',desc:'维护真实业务应用与项目归属。',apiPath:'/api/apps',fields:['tenantId','projectId','name','ownerName','environment','status'],labels:{tenantId:'所属租户',projectId:'所属项目',name:'应用名称',ownerName:'负责人',environment:'环境',status:'状态'},requiredFields:['tenantId','projectId','name'],optionSources:{tenantId:{path:'/api/tenants',label:'name',value:'id'},projectId:{path:'/api/projects',label:'name',value:'id'}},fieldOptions:{environment:opts([['开发','DEV'],['测试','TEST'],['生产','PROD']]),status:tenantStatus},fieldTypes:{tenantId:'select',projectId:'select',environment:'select',status:'select'},statePath:'status'}},
+    ...managedResources,
+    {path:'routes',component:RoutePolicies,meta:admin},
+    {path:'keys',component:Keys,meta:admin},
+    {path:'usage',component:Calls,props:{mode:'usage'},meta:admin},
+    {path:'logs',component:Calls,props:{mode:'logs'},meta:admin},
+    {path:'cost-statements',component:CostStatements,meta:admin},
+    {path:'quick-start',component:QuickStart},
+    {path:'developer-models',component:DeveloperModels},
+    {path:'playground',component:Playground},
+    {path:'providers',redirect:'/provider-channels'},
+    {path:'models',redirect:'/service-models'},
+    {path:'pricing',redirect:'/price-versions'},
+    {path:'billing',redirect:'/cost-statements'},
+    {path:':pathMatch(.*)*',component:NotFound}
   ]}
 ]
-
-const router = createRouter({ history: createWebHistory(), routes })
-router.beforeEach((to) => {
-  if (to.path !== '/login' && !localStorage.getItem('tokensea_token')) return '/login'
-})
+const router=createRouter({history:createWebHistory(),routes})
+router.beforeEach(to=>{if(to.path==='/login')return localStorage.getItem('tokensea_token')?(isAdmin()?'/dashboard':'/workspace'):true;if(!localStorage.getItem('tokensea_token'))return{path:'/login',query:{redirect:to.fullPath}};if(to.meta.requiresAdmin&&!identity().roles.includes('ADMIN'))return'/workspace';return true})
 export default router
-

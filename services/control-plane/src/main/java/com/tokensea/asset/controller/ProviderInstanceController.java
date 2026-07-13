@@ -1,80 +1,148 @@
 package com.tokensea.asset.controller;
 
 import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
-import com.baomidou.mybatisplus.core.mapper.BaseMapper;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.tokensea.asset.entity.ProviderInstance;
 import com.tokensea.asset.mapper.ProviderInstanceMapper;
+import com.tokensea.asset.service.ProviderConnectionService;
+import com.tokensea.audit.entity.AuditLog;
+import com.tokensea.audit.mapper.AuditLogMapper;
 import com.tokensea.common.ApiResponse;
-import com.tokensea.common.BaseCrudController;
+import org.springframework.http.HttpStatus;
+import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.web.bind.annotation.*;
+import org.springframework.web.server.ResponseStatusException;
+
+import java.time.OffsetDateTime;
+import java.util.List;
+import java.util.Set;
+import java.util.UUID;
 
 @RestController
 @RequestMapping("/api/provider-instances")
-public class ProviderInstanceController extends BaseCrudController<ProviderInstance> {
+public class ProviderInstanceController {
+    private static final Set<String> STATUSES = Set.of("启用", "暂停", "停用");
+    private static final long TEST_VALID_MINUTES = 30;
     private final ProviderInstanceMapper mapper;
-    public ProviderInstanceController(ProviderInstanceMapper mapper) { this.mapper = mapper; }
-    @Override protected BaseMapper<ProviderInstance> mapper() { return mapper; }
+    private final ProviderConnectionService connections;
+    private final AuditLogMapper audits;
+    private final ObjectMapper json;
+    private final TransactionTemplate transactions;
 
-    @Override
-    @PostMapping
-    public ApiResponse<ProviderInstance> create(@RequestBody ProviderInstance body) {
-        String validation = validate(body);
-        if (validation != null) return ApiResponse.fail(validation);
-        ProviderInstance existing = mapper.selectOne(new QueryWrapper<ProviderInstance>()
-                .eq("instance_name", body.getInstanceName())
-                .last("limit 1"));
-        if (existing != null) return ApiResponse.fail("供应商实例名称已存在，请使用不同的实例名称");
-        mapper.insert(body);
-        return ApiResponse.ok(body);
+    public ProviderInstanceController(ProviderInstanceMapper mapper, ProviderConnectionService connections,
+                                      AuditLogMapper audits, ObjectMapper json, TransactionTemplate transactions) {
+        this.mapper = mapper; this.connections = connections; this.audits = audits;
+        this.json = json; this.transactions = transactions;
     }
 
-    @Override
+    public record CreateRequest(String providerTemplateId, String instanceName, String providerType,
+                                String apiStyle, String apiBase, String region, String environment,
+                                String owner, Integer rateLimitRpm, Integer rateLimitTpm) {}
+    public record UpdateRequest(String instanceName, String apiStyle, String apiBase, String region,
+                                String environment, String owner, Integer rateLimitRpm, Integer rateLimitTpm) {}
+    public record StatusRequest(String status) {}
+
+    @GetMapping public ApiResponse<List<ProviderInstance>> list() { return ApiResponse.ok(mapper.selectList(null)); }
+    @GetMapping("/{id}") public ApiResponse<ProviderInstance> get(@PathVariable String id) { return ApiResponse.ok(require(id)); }
+
+    @PostMapping
+    public ApiResponse<ProviderInstance> create(@RequestBody CreateRequest req) {
+        if (blank(req.instanceName()) || blank(req.providerType()) || blank(req.apiStyle())) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "实例名称、来源模板和协议不能为空");
+        }
+        if (mapper.selectCount(new QueryWrapper<ProviderInstance>().eq("instance_name", req.instanceName())) > 0) {
+            throw new ResponseStatusException(HttpStatus.CONFLICT, "供应商渠道名称已存在");
+        }
+        return ApiResponse.ok(transactions.execute(status -> {
+            ProviderInstance value = new ProviderInstance();
+            value.setProviderTemplateId(req.providerTemplateId()); value.setInstanceName(req.instanceName());
+            value.setProviderType(req.providerType()); value.setApiStyle(req.apiStyle()); value.setApiBase(req.apiBase());
+            value.setRegion(req.region()); value.setEnvironment(blank(req.environment()) ? "生产" : req.environment());
+            value.setOwner(req.owner()); value.setRateLimitRpm(req.rateLimitRpm()); value.setRateLimitTpm(req.rateLimitTpm());
+            value.setCredentialRef(null); value.setKeyStatus("未配置"); value.setHealthStatus("观察");
+            value.setEnabledModels("[]"); value.setStatus("暂停");
+            mapper.insert(value); audit("CREATE", value, null); return value;
+        }));
+    }
+
     @PutMapping("/{id}")
-    public ApiResponse<ProviderInstance> update(@PathVariable("id") String id, @RequestBody ProviderInstance body) {
-        String validation = validate(body);
-        if (validation != null) return ApiResponse.fail(validation);
-        ProviderInstance existing = mapper.selectOne(new QueryWrapper<ProviderInstance>()
-                .eq("instance_name", body.getInstanceName())
-                .ne("id", id)
-                .last("limit 1"));
-        if (existing != null) return ApiResponse.fail("供应商实例名称已存在，请使用不同的实例名称");
-        body.setId(id);
-        mapper.updateById(body);
-        return ApiResponse.ok(body);
+    public ApiResponse<ProviderInstance> update(@PathVariable String id, @RequestBody UpdateRequest req) {
+        ProviderInstance current = require(id);
+        if (blank(req.instanceName()) || blank(req.apiStyle())) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "实例名称和协议不能为空");
+        }
+        if (mapper.selectCount(new QueryWrapper<ProviderInstance>().eq("instance_name", req.instanceName()).ne("id", id)) > 0) {
+            throw new ResponseStatusException(HttpStatus.CONFLICT, "供应商渠道名称已存在");
+        }
+        return ApiResponse.ok(transactions.execute(status -> {
+            ProviderInstance before = require(id);
+            current.setInstanceName(req.instanceName()); current.setApiStyle(req.apiStyle()); current.setApiBase(req.apiBase());
+            current.setRegion(req.region()); current.setEnvironment(req.environment()); current.setOwner(req.owner());
+            current.setRateLimitRpm(req.rateLimitRpm()); current.setRateLimitTpm(req.rateLimitTpm());
+            clearConnectionResult(current); current.setStatus("暂停");
+            mapper.updateById(current); audit("UPDATE_CONFIGURATION", current, before); return current;
+        }));
     }
 
     @PostMapping("/{id}/test-connection")
-    public ApiResponse<ProviderInstance> testConnection(@PathVariable("id") String id) {
-        ProviderInstance i = mapper.selectById(id);
-        if (i == null) return ApiResponse.fail("供应商实例不存在");
-        i.setHealthStatus(i.getApiBase() == null || i.getApiBase().isBlank() ? "异常" : "健康");
-        mapper.updateById(i);
-        return ApiResponse.ok(i);
+    public ApiResponse<ProviderInstance> testConnection(@PathVariable String id) {
+        ProviderInstance snapshot = require(id);
+        ProviderConnectionService.TestResult result = connections.test(snapshot); // no DB transaction during network I/O
+        ProviderInstance saved = transactions.execute(status -> {
+            ProviderInstance current = require(id);
+            ProviderInstance before = require(id);
+            current.setLastConnectionTestAt(OffsetDateTime.now());
+            current.setLastConnectionTestStatus(result.success() ? "成功" : "失败");
+            current.setLastConnectionTestError(result.error());
+            current.setLastConnectionTestHost(result.targetHost());
+            current.setLastConnectionTestAddresses(result.targetHost());
+            current.setLastConnectionTestPort(result.targetPort());
+            current.setHealthStatus(result.success() ? "健康" : "异常");
+            mapper.updateById(current); audit("TEST_CONNECTION", current, before); return current;
+        });
+        if (!result.success()) throw new ResponseStatusException(HttpStatus.BAD_GATEWAY, result.errorCode()+": "+result.error());
+        return ApiResponse.ok(saved);
     }
 
     @PatchMapping("/{id}/status")
-    public ApiResponse<ProviderInstance> status(@PathVariable("id") String id, @RequestBody ProviderInstance body) {
-        ProviderInstance i = mapper.selectById(id);
-        if (i == null) return ApiResponse.fail("供应商实例不存在");
-        i.setStatus(body.getStatus());
-        mapper.updateById(i);
-        return ApiResponse.ok(i);
+    public ApiResponse<ProviderInstance> status(@PathVariable String id, @RequestBody StatusRequest req) {
+        if (req == null || !STATUSES.contains(req.status())) throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "渠道状态无效");
+        return ApiResponse.ok(transactions.execute(tx -> {
+            ProviderInstance value = require(id); ProviderInstance before = require(id);
+            if ("启用".equals(req.status()) && !recentlyVerified(value)) {
+                throw new ResponseStatusException(HttpStatus.CONFLICT, "渠道必须在最近 30 分钟内通过连接测试后才能启用");
+            }
+            value.setStatus(req.status()); mapper.updateById(value); audit("STATE_CHANGE", value, before); return value;
+        }));
     }
 
-    private static String validate(ProviderInstance body) {
-        if (body == null) return "供应商实例不能为空";
-        if (blank(body.getInstanceName())) return "请填写实例名称";
-        if (blank(body.getProviderType())) return "请选择来源模板";
-        if (blank(body.getApiStyle())) return "请选择协议";
-        if (blank(body.getStatus())) body.setStatus("暂停");
-        if (blank(body.getEnvironment())) body.setEnvironment("生产");
-        if (blank(body.getKeyStatus())) body.setKeyStatus("未配置");
-        if (blank(body.getHealthStatus())) body.setHealthStatus("观察");
-        if (blank(body.getEnabledModels())) body.setEnabledModels("[]");
-        return null;
-    }
+    @DeleteMapping("/{id}")
+    @ResponseStatus(HttpStatus.METHOD_NOT_ALLOWED)
+    public void delete(@PathVariable String id) { throw new ResponseStatusException(HttpStatus.METHOD_NOT_ALLOWED, "供应商渠道禁止物理删除，请停用"); }
 
-    private static boolean blank(String v) {
-        return v == null || v.isBlank();
+    private boolean recentlyVerified(ProviderInstance value) {
+        return "成功".equals(value.getLastConnectionTestStatus()) && value.getLastConnectionTestAt() != null
+                && value.getLastConnectionTestAt().isAfter(OffsetDateTime.now().minusMinutes(TEST_VALID_MINUTES))
+                && ("无需 Key".equals(value.getKeyStatus()) || "已托管".equals(value.getKeyStatus()) || "已配置".equals(value.getKeyStatus()));
     }
+    private static void clearConnectionResult(ProviderInstance value) {
+        value.setHealthStatus("观察"); value.setLastConnectionTestAt(null);
+        value.setLastConnectionTestStatus(null); value.setLastConnectionTestError(null);
+        value.setLastConnectionTestHost(null); value.setLastConnectionTestAddresses(null);
+        value.setLastConnectionTestPort(null);
+    }
+    private ProviderInstance require(String id) {
+        ProviderInstance value = mapper.selectById(id);
+        if (value == null) throw new ResponseStatusException(HttpStatus.NOT_FOUND, "供应商渠道不存在");
+        return value;
+    }
+    private void audit(String action, ProviderInstance after, ProviderInstance before) {
+        try {
+            AuditLog log = new AuditLog(); log.setId(UUID.randomUUID().toString().replace("-", ""));
+            log.setAction(action); log.setObjectType("ProviderInstance"); log.setObjectId(after.getId());
+            log.setBeforeValue(before == null ? null : json.writeValueAsString(before)); log.setAfterValue(json.writeValueAsString(after));
+            audits.insert(log);
+        } catch (Exception e) { throw new IllegalStateException("关键操作审计写入失败", e); }
+    }
+    private static boolean blank(String value) { return value == null || value.isBlank(); }
 }

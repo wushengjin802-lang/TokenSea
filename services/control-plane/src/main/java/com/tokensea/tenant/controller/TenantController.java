@@ -1,16 +1,17 @@
 package com.tokensea.tenant.controller;
 
-import com.baomidou.mybatisplus.core.mapper.BaseMapper;
-import com.tokensea.common.BaseCrudController;
-import com.tokensea.tenant.entity.Tenant;
-import com.tokensea.tenant.mapper.TenantMapper;
-import org.springframework.web.bind.annotation.RequestMapping;
-import org.springframework.web.bind.annotation.RestController;
-
-@RestController
-@RequestMapping("/api/tenants")
-public class TenantController extends BaseCrudController<Tenant> {
-    private final TenantMapper mapper;
-    public TenantController(TenantMapper mapper) { this.mapper = mapper; }
-    @Override protected BaseMapper<Tenant> mapper() { return mapper; }
+import com.tokensea.audit.service.AuditService;import com.tokensea.common.ApiResponse;import com.tokensea.tenant.entity.Tenant;import com.tokensea.tenant.mapper.TenantMapper;import org.springframework.http.HttpStatus;import org.springframework.transaction.annotation.Transactional;import org.springframework.web.bind.annotation.*;import org.springframework.web.server.ResponseStatusException;import org.springframework.jdbc.core.JdbcTemplate;import java.math.BigDecimal;import java.util.List;import java.util.Set;import java.util.UUID;import java.util.Base64;import java.security.SecureRandom;import java.security.MessageDigest;import java.nio.charset.StandardCharsets;import java.util.HexFormat;
+@RestController @RequestMapping("/api/tenants")
+public class TenantController{
+ private static final Set<String> STATES=Set.of("DRAFT","ACTIVE","SUSPENDED");private final TenantMapper mapper;private final AuditService audits;private final JdbcTemplate jdbc;private final SecureRandom random=new SecureRandom();
+ public TenantController(TenantMapper mapper,AuditService audits,JdbcTemplate jdbc){this.mapper=mapper;this.audits=audits;this.jdbc=jdbc;}
+ public record Request(String name,String type,String ownerName,String contactEmail,String modelScope,BigDecimal monthlyBudget,String remark){} public record StateRequest(String status){} public record ActivationResult(Tenant tenant,String apiKeyId,String keyPrefix,String plainTextKey){}
+ @GetMapping public ApiResponse<List<Tenant>> list(){return ApiResponse.ok(mapper.selectList(null));}@GetMapping("/{id}") public ApiResponse<Tenant> get(@PathVariable String id){return ApiResponse.ok(require(id));}
+ @PostMapping @Transactional public ApiResponse<Tenant> create(@RequestBody Request r){validate(r);Tenant v=new Tenant();apply(v,r);v.setStatus("DRAFT");mapper.insert(v);audits.record("TENANT_CREATE","Tenant",v.getId(),null,v);return ApiResponse.ok(v);}
+ @PutMapping("/{id}") @Transactional public ApiResponse<Tenant> update(@PathVariable String id,@RequestBody Request r){validate(r);Tenant v=require(id),before=audits.snapshot(v,Tenant.class);apply(v,r);mapper.updateById(v);audits.record("TENANT_UPDATE","Tenant",id,before,v);return ApiResponse.ok(v);}
+ @PatchMapping("/{id}/status") @Transactional public ApiResponse<Tenant> status(@PathVariable String id,@RequestBody StateRequest r){if(r==null||!STATES.contains(r.status()))bad("租户状态无效");if("ACTIVE".equals(r.status()))throw new ResponseStatusException(HttpStatus.CONFLICT,"请使用租户启用接口创建默认访问密钥");Tenant v=require(id),before=audits.snapshot(v,Tenant.class);if("DRAFT".equals(v.getStatus())&&"SUSPENDED".equals(r.status()))bad("草稿租户不能直接暂停");v.setStatus(r.status());mapper.updateById(v);audits.record("TENANT_STATE_CHANGE","Tenant",id,before,v);return ApiResponse.ok(v);}
+ @PostMapping("/{id}/activate") @Transactional public ApiResponse<ActivationResult> activate(@PathVariable String id)throws Exception{Tenant v=require(id);if("ACTIVE".equals(v.getStatus())){List<java.util.Map<String,Object>> existing=jdbc.queryForList("select id,key_prefix from api_key where tenant_id=? and is_default=true",id);if(existing.isEmpty())throw new ResponseStatusException(HttpStatus.CONFLICT,"租户已启用但默认访问密钥缺失");return ApiResponse.ok(new ActivationResult(v,String.valueOf(existing.get(0).get("id")),String.valueOf(existing.get(0).get("key_prefix")),null));}Tenant before=audits.snapshot(v,Tenant.class);byte[] bytes=new byte[32];random.nextBytes(bytes);String token="ts_"+Base64.getUrlEncoder().withoutPadding().encodeToString(bytes),keyId=UUID.randomUUID().toString().replace("-",""),prefix=token.substring(0,12);String scope=jdbc.queryForObject("select coalesce(jsonb_agg(platform_model_name),'[]'::jsonb)::text from platform_model where status='已发布' and (visibility_scope='全部租户' or visibility_scope=?)",String.class,id);jdbc.update("insert into api_key(id,tenant_id,name,key_prefix,key_hash,status,approval_status,model_scope,is_default) values(?,?,?,?,?,'ACTIVE','APPROVED',?,true)",keyId,id,"默认访问密钥",prefix,sha256(token),scope==null?"[]":scope);v.setStatus("ACTIVE");mapper.updateById(v);audits.record("TENANT_ACTIVATE","Tenant",id,before,java.util.Map.of("tenant",v,"defaultApiKeyId",keyId,"keyPrefix",prefix));return ApiResponse.ok(new ActivationResult(v,keyId,prefix,token));}
+ @DeleteMapping("/{id}") public void delete(@PathVariable String id){throw new ResponseStatusException(HttpStatus.METHOD_NOT_ALLOWED,"租户禁止物理删除");}
+ private Tenant require(String id){Tenant v=mapper.selectById(id);if(v==null)throw new ResponseStatusException(HttpStatus.NOT_FOUND,"租户不存在");return v;}private void validate(Request r){if(r==null||blank(r.name()))bad("租户名称不能为空");if(r.monthlyBudget()!=null&&r.monthlyBudget().signum()<0)bad("预算不能为负数");}private void apply(Tenant v,Request r){v.setName(r.name());v.setType(blank(r.type())?"INTERNAL":r.type());v.setOwnerName(r.ownerName());v.setContactEmail(r.contactEmail());v.setModelScope(blank(r.modelScope())?"[]":r.modelScope());v.setMonthlyBudget(r.monthlyBudget());v.setRemark(r.remark());}private static void bad(String m){throw new ResponseStatusException(HttpStatus.BAD_REQUEST,m);}private static boolean blank(String v){return v==null||v.isBlank();}
+ private static String sha256(String v)throws Exception{return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(v.getBytes(StandardCharsets.UTF_8)));}
 }

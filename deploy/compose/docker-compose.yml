@@ -5,9 +5,9 @@ services:
     environment:
       POSTGRES_DB: ${TOKENSEA_DB_NAME:-tokensea}
       POSTGRES_USER: ${TOKENSEA_DB_USER:-tokensea}
-      POSTGRES_PASSWORD: ${TOKENSEA_DB_PASSWORD:-change-me}
+      POSTGRES_PASSWORD: ${TOKENSEA_DB_PASSWORD:?TOKENSEA_DB_PASSWORD is required}
     ports:
-      - "${TOKENSEA_POSTGRES_PORT:-39213}:5432"
+      - "127.0.0.1:${TOKENSEA_POSTGRES_PORT:-39213}:5432"
     volumes:
       - tokensea-postgres-data:/var/lib/postgresql/data
     healthcheck:
@@ -15,14 +15,27 @@ services:
       interval: 10s
       timeout: 5s
       retries: 10
+    networks:
+      - tokensea-internal
+      - tokensea-public
 
   tokensea-redis:
     image: redis:7-alpine
+    environment:
+      REDIS_PASSWORD: ${TOKENSEA_REDIS_PASSWORD:?TOKENSEA_REDIS_PASSWORD is required}
     ports:
-      - "${TOKENSEA_REDIS_PORT:-39214}:6379"
-    command: ["redis-server", "--appendonly", "yes"]
+      - "127.0.0.1:${TOKENSEA_REDIS_PORT:-39214}:6379"
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${TOKENSEA_REDIS_PASSWORD:?TOKENSEA_REDIS_PASSWORD is required}"]
     volumes:
       - tokensea-redis-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" ping | grep PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - tokensea-internal
+      - tokensea-public
 
   tokensea-control-plane:
     build: ../../services/control-plane
@@ -30,44 +43,123 @@ services:
       SERVER_PORT: 39211
       SPRING_DATASOURCE_URL: ${TOKENSEA_DB_URL:-jdbc:postgresql://tokensea-postgres:5432/tokensea}
       SPRING_DATASOURCE_USERNAME: ${TOKENSEA_DB_USER:-tokensea}
-      SPRING_DATASOURCE_PASSWORD: ${TOKENSEA_DB_PASSWORD:-change-me}
+      SPRING_DATASOURCE_PASSWORD: ${TOKENSEA_DB_PASSWORD:?TOKENSEA_DB_PASSWORD is required}
       SPRING_DATA_REDIS_HOST: tokensea-redis
       SPRING_DATA_REDIS_PORT: 6379
-      TOKENSEA_JWT_SECRET: ${TOKENSEA_JWT_SECRET:-change-me-change-me-change-me-change-me}
-      TOKENSEA_CRYPTO_KEY: ${TOKENSEA_CRYPTO_KEY:-change-me-change-me-change-me-32bytes}
+      SPRING_DATA_REDIS_PASSWORD: ${TOKENSEA_REDIS_PASSWORD:?TOKENSEA_REDIS_PASSWORD is required}
+      TOKENSEA_JWT_SECRET: ${TOKENSEA_JWT_SECRET:?TOKENSEA_JWT_SECRET is required}
+      TOKENSEA_CRYPTO_KEY: ${TOKENSEA_CRYPTO_KEY:?TOKENSEA_CRYPTO_KEY is required}
+      TOKENSEA_RUNTIME_ENGINE_KEY: ${TOKENSEA_RUNTIME_CORE_KEY:?TOKENSEA_RUNTIME_CORE_KEY is required}
+      TOKENSEA_CORS_ALLOWED_ORIGINS: ${TOKENSEA_CORS_ALLOWED_ORIGINS:-http://localhost:39210}
+      TOKENSEA_ALLOWED_EGRESS_HOSTS: ${TOKENSEA_ALLOWED_EGRESS_HOSTS:-}
+      TOKENSEA_EGRESS_ALLOWED_PORTS: ${TOKENSEA_EGRESS_ALLOWED_PORTS:-80,443}
+      TOKENSEA_EGRESS_PROXY_HOST: tokensea-egress-proxy
+      TOKENSEA_EGRESS_PROXY_PORT: 18080
+      TOKENSEA_BOOTSTRAP_TOKEN: ${TOKENSEA_BOOTSTRAP_TOKEN:-}
+      TOKENSEA_BUDGET_CURRENCY: ${TOKENSEA_BUDGET_CURRENCY:-CNY}
     ports:
-      - "${TOKENSEA_CONTROL_PORT:-39211}:39211"
+      - "127.0.0.1:${TOKENSEA_CONTROL_PORT:-39211}:39211"
     depends_on:
       tokensea-postgres:
         condition: service_healthy
       tokensea-redis:
-        condition: service_started
+        condition: service_healthy
+      tokensea-egress-proxy:
+        condition: service_healthy
+    networks:
+      - tokensea-internal
+      - tokensea-public
 
   tokensea-gateway-runtime:
     build: ../../services/gateway-runtime
     environment:
       TOKENSEA_CONTROL_BASE: http://tokensea-control-plane:39211
-      TOKENSEA_DB_DSN: postgresql://${TOKENSEA_DB_USER:-tokensea}:${TOKENSEA_DB_PASSWORD:-change-me}@tokensea-postgres:5432/${TOKENSEA_DB_NAME:-tokensea}
-      TOKENSEA_REDIS_URL: redis://tokensea-redis:6379/0
+      TOKENSEA_DB_HOST: tokensea-postgres
+      TOKENSEA_DB_PORT: 5432
+      TOKENSEA_DB_NAME: ${TOKENSEA_DB_NAME:-tokensea}
+      TOKENSEA_DB_USER: ${TOKENSEA_DB_USER:-tokensea}
+      TOKENSEA_DB_PASSWORD: ${TOKENSEA_DB_PASSWORD:?TOKENSEA_DB_PASSWORD is required}
+      TOKENSEA_REDIS_URL: redis://:${TOKENSEA_REDIS_PASSWORD:?TOKENSEA_REDIS_PASSWORD is required}@tokensea-redis:6379/0
+      TOKENSEA_REDIS_PASSWORD: ${TOKENSEA_REDIS_PASSWORD:?TOKENSEA_REDIS_PASSWORD is required}
       TOKENSEA_RUNTIME_ENGINE_URL: http://tokensea-runtime-core:39218
+      TOKENSEA_RUNTIME_ENGINE_KEY: ${TOKENSEA_RUNTIME_CORE_KEY:?TOKENSEA_RUNTIME_CORE_KEY is required}
+      TOKENSEA_CRYPTO_KEY: ${TOKENSEA_CRYPTO_KEY:?TOKENSEA_CRYPTO_KEY is required}
       TOKENSEA_RUNTIME_CORE_BASE: ${TOKENSEA_RUNTIME_CORE_BASE:-http://tokensea-runtime-core:39218}
+      TOKENSEA_OUTBOX_DIR: /var/lib/tokensea-gateway/outbox
     ports:
-      - "${TOKENSEA_GATEWAY_PORT:-39212}:39212"
+      - "127.0.0.1:${TOKENSEA_GATEWAY_PORT:-39212}:39212"
+    volumes:
+      - tokensea-gateway-outbox:/var/lib/tokensea-gateway/outbox
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     depends_on:
-      - tokensea-control-plane
-      - tokensea-runtime-core
+      tokensea-control-plane:
+        condition: service_started
+      tokensea-runtime-core:
+        condition: service_started
+      tokensea-redis:
+        condition: service_healthy
+    networks:
+      - tokensea-internal
+      - tokensea-public
+
+  tokensea-egress-proxy:
+    build: ../../services/egress-proxy
+    environment:
+      TOKENSEA_ALLOWED_EGRESS_HOSTS: ${TOKENSEA_ALLOWED_EGRESS_HOSTS:-}
+      TOKENSEA_EGRESS_ALLOWED_PORTS: ${TOKENSEA_EGRESS_ALLOWED_PORTS:-80,443}
+      TOKENSEA_EGRESS_LISTEN_PORT: 18080
+      TOKENSEA_EGRESS_CONNECT_TIMEOUT_SECONDS: ${TOKENSEA_EGRESS_CONNECT_TIMEOUT_SECONDS:-10}
+      TOKENSEA_EGRESS_IDLE_TIMEOUT_SECONDS: ${TOKENSEA_EGRESS_IDLE_TIMEOUT_SECONDS:-300}
+      TOKENSEA_EGRESS_MAX_HEADER_BYTES: ${TOKENSEA_EGRESS_MAX_HEADER_BYTES:-65536}
+      TOKENSEA_EGRESS_MAX_RESPONSE_BYTES: ${TOKENSEA_EGRESS_MAX_RESPONSE_BYTES:-268435456}
+    expose:
+      - "18080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; s=socket.create_connection(('127.0.0.1',18080),2); s.close()"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 3s
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=8m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - tokensea-internal
+      - tokensea-public
+      - tokensea-provider-egress
 
   tokensea-runtime-core:
     image: ${TOKENSEA_RUNTIME_CORE_IMAGE:-ghcr.io/berriai/litellm:v1.91.0}
     command: ["--port", "39218", "--host", "0.0.0.0"]
     environment:
-      LITELLM_MASTER_KEY: ${TOKENSEA_RUNTIME_CORE_KEY:-change-me-runtime-core-key}
+      LITELLM_MASTER_KEY: ${TOKENSEA_RUNTIME_CORE_KEY:?TOKENSEA_RUNTIME_CORE_KEY is required}
       STORE_MODEL_IN_DB: "False"
+      HTTP_PROXY: http://tokensea-egress-proxy:18080
+      HTTPS_PROXY: http://tokensea-egress-proxy:18080
+      http_proxy: http://tokensea-egress-proxy:18080
+      https_proxy: http://tokensea-egress-proxy:18080
+      NO_PROXY: localhost,127.0.0.1,tokensea-postgres
+      no_proxy: localhost,127.0.0.1,tokensea-postgres
     ports:
-      - "${TOKENSEA_RUNTIME_CORE_PORT:-39218}:39218"
+      - "127.0.0.1:${TOKENSEA_RUNTIME_CORE_PORT:-39218}:39218"
     depends_on:
       tokensea-postgres:
         condition: service_healthy
+      tokensea-egress-proxy:
+        condition: service_healthy
+    networks:
+      - tokensea-internal
+      - tokensea-public
 
   tokensea-console:
     build:
@@ -79,25 +171,40 @@ services:
       VITE_API_BASE: http://localhost:${TOKENSEA_CONTROL_PORT:-39211}
       VITE_GATEWAY_BASE: http://localhost:${TOKENSEA_GATEWAY_PORT:-39212}
     ports:
-      - "${TOKENSEA_CONSOLE_PORT:-39210}:39210"
+      - "127.0.0.1:${TOKENSEA_CONSOLE_PORT:-39210}:39210"
     depends_on:
       - tokensea-control-plane
+    networks:
+      - tokensea-internal
+      - tokensea-public
 
   tokensea-prometheus:
     image: prom/prometheus:v2.55.1
     ports:
-      - "${TOKENSEA_PROMETHEUS_PORT:-39215}:9090"
+      - "127.0.0.1:${TOKENSEA_PROMETHEUS_PORT:-39215}:9090"
     volumes:
       - ../prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    networks:
+      - tokensea-internal
+      - tokensea-public
 
   tokensea-grafana:
     image: grafana/grafana:11.3.0
     ports:
-      - "${TOKENSEA_GRAFANA_PORT:-39216}:3000"
+      - "127.0.0.1:${TOKENSEA_GRAFANA_PORT:-39216}:3000"
     volumes:
       - tokensea-grafana-data:/var/lib/grafana
+    networks:
+      - tokensea-internal
 
 volumes:
   tokensea-postgres-data:
   tokensea-redis-data:
   tokensea-grafana-data:
+  tokensea-gateway-outbox:
+
+networks:
+  tokensea-internal:
+    internal: true
+  tokensea-public:
+  tokensea-provider-egress:

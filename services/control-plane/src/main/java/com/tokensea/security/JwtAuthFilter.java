@@ -11,6 +11,7 @@ import org.springframework.stereotype.Component;
 import org.springframework.web.filter.OncePerRequestFilter;
 import java.io.IOException;
 import java.util.List;
+import org.springframework.security.core.authority.SimpleGrantedAuthority;
 
 @Component
 public class JwtAuthFilter extends OncePerRequestFilter {
@@ -20,11 +21,18 @@ public class JwtAuthFilter extends OncePerRequestFilter {
         String auth = request.getHeader("Authorization");
         if (auth != null && auth.startsWith("Bearer ")) {
             try {
-                String userId = jwtService.subject(auth.substring(7));
-                UsernamePasswordAuthenticationToken a = new UsernamePasswordAuthenticationToken(userId, null, List.of());
+                JwtService.Identity identity = jwtService.identity(auth.substring(7));
+                List<SimpleGrantedAuthority> authorities = identity.roles().stream()
+                        .map(role -> new SimpleGrantedAuthority("ROLE_" + role)).toList();
+                UsernamePasswordAuthenticationToken a = new UsernamePasswordAuthenticationToken(identity, null, authorities);
                 a.setDetails(new WebAuthenticationDetailsSource().buildDetails(request));
                 SecurityContextHolder.getContext().setAuthentication(a);
-            } catch (Exception ignored) {}
+            } catch (Exception ignored) {
+                // 令牌过期、签名变更或格式损坏都属于未认证请求。
+                // 返回 401 让前端清理旧会话并重新登录，不能静默放行到后续规则后变成含义不明的 403。
+                response.setStatus(HttpServletResponse.SC_UNAUTHORIZED);
+                return;
+            }
         }
         chain.doFilter(request, response);
     }

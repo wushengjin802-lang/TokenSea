@@ -1,16 +1,11 @@
 package com.tokensea.project.controller;
-
-import com.baomidou.mybatisplus.core.mapper.BaseMapper;
-import com.tokensea.common.BaseCrudController;
-import com.tokensea.project.entity.Project;
-import com.tokensea.project.mapper.ProjectMapper;
-import org.springframework.web.bind.annotation.RequestMapping;
-import org.springframework.web.bind.annotation.RestController;
-
-@RestController
-@RequestMapping("/api/projects")
-public class ProjectController extends BaseCrudController<Project> {
-    private final ProjectMapper mapper;
-    public ProjectController(ProjectMapper mapper) { this.mapper = mapper; }
-    @Override protected BaseMapper<Project> mapper() { return mapper; }
+import com.tokensea.audit.service.AuditService;import com.tokensea.common.ApiResponse;import com.tokensea.project.entity.Project;import com.tokensea.project.mapper.ProjectMapper;import com.tokensea.tenant.entity.Tenant;import com.tokensea.tenant.mapper.TenantMapper;import org.springframework.http.HttpStatus;import org.springframework.transaction.annotation.Transactional;import org.springframework.web.bind.annotation.*;import org.springframework.web.server.ResponseStatusException;import java.math.BigDecimal;import java.util.List;import java.util.Set;
+@RestController @RequestMapping("/api/projects") public class ProjectController{
+ private static final Set<String> STATES=Set.of("DRAFT","ACTIVE","SUSPENDED");private final ProjectMapper mapper;private final TenantMapper tenants;private final AuditService audits;public ProjectController(ProjectMapper m,TenantMapper t,AuditService a){mapper=m;tenants=t;audits=a;}public record Request(String tenantId,String name,String ownerName,BigDecimal monthlyBudget){}public record StateRequest(String status){}
+ @GetMapping public ApiResponse<List<Project>> list(){return ApiResponse.ok(mapper.selectList(null));}@GetMapping("/{id}") public ApiResponse<Project> get(@PathVariable String id){return ApiResponse.ok(require(id));}
+ @PostMapping @Transactional public ApiResponse<Project> create(@RequestBody Request r){validate(r);Project v=new Project();apply(v,r);v.setStatus("DRAFT");mapper.insert(v);audits.record("PROJECT_CREATE","Project",v.getId(),null,v);return ApiResponse.ok(v);}
+ @PutMapping("/{id}") @Transactional public ApiResponse<Project> update(@PathVariable String id,@RequestBody Request r){validate(r);Project v=require(id),before=audits.snapshot(v,Project.class);apply(v,r);mapper.updateById(v);audits.record("PROJECT_UPDATE","Project",id,before,v);return ApiResponse.ok(v);}
+ @PatchMapping("/{id}/status") @Transactional public ApiResponse<Project> status(@PathVariable String id,@RequestBody StateRequest r){if(r==null||!STATES.contains(r.status()))bad("项目状态无效");Project v=require(id),before=audits.snapshot(v,Project.class);if("ACTIVE".equals(r.status())){Tenant t=tenants.selectById(v.getTenantId());if(t==null||!"ACTIVE".equals(t.getStatus()))throw new ResponseStatusException(HttpStatus.CONFLICT,"所属租户未启用");}v.setStatus(r.status());mapper.updateById(v);audits.record("PROJECT_STATE_CHANGE","Project",id,before,v);return ApiResponse.ok(v);}
+ @DeleteMapping("/{id}") public void delete(@PathVariable String id){throw new ResponseStatusException(HttpStatus.METHOD_NOT_ALLOWED,"项目禁止物理删除");}
+ private void validate(Request r){if(r==null||blank(r.tenantId())||blank(r.name()))bad("租户和项目名称不能为空");if(tenants.selectById(r.tenantId())==null)bad("所属租户不存在");if(r.monthlyBudget()!=null&&r.monthlyBudget().signum()<0)bad("预算不能为负数");}private Project require(String id){Project v=mapper.selectById(id);if(v==null)throw new ResponseStatusException(HttpStatus.NOT_FOUND,"项目不存在");return v;}private void apply(Project v,Request r){v.setTenantId(r.tenantId());v.setName(r.name());v.setOwnerName(r.ownerName());v.setMonthlyBudget(r.monthlyBudget());}private static void bad(String m){throw new ResponseStatusException(HttpStatus.BAD_REQUEST,m);}private static boolean blank(String v){return v==null||v.isBlank();}
 }

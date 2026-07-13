@@ -1,5 +1,5 @@
 
-<template><DataPage title="账单管理" eyebrow="Billing Center" desc="按租户账期汇总 Token、成本、销售额与对账状态，支持后续导出与锁定。" api-path="/api/billing" :fields="fields" :labels="labels" /></template>
+<template><DataPage title="账单" desc="按租户账期读取真实 Token、成本、销售额与账单状态。" api-path="/api/billing" :fields="fields" :labels="labels" readonly /></template>
 <script setup lang="ts">
 import DataPage from './DataPage.vue'
 

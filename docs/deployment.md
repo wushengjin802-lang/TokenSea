@@ -2,12 +2,16 @@
 
 ## Docker Compose
 
-```bash
-cd deploy/compose
-cp ../../.env.example .env
-# 编辑 .env
+```powershell
+cd tokensea/deploy/compose
+Copy-Item .env.example .env
+# 编辑 .env，替换所有 REPLACE_* 值
 
-docker compose up -d --build
+docker compose -p tokensea --env-file ./.env up -d --build
+docker compose -p tokensea --env-file ./.env ps
+docker compose -p tokensea --env-file ./.env logs -f --tail=200
+docker compose -p tokensea --env-file ./.env config --quiet
+docker compose -p tokensea --env-file ./.env down
 ```
 
 ## 初始化

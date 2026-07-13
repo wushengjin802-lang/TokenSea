@@ -1,16 +1,11 @@
 package com.tokensea.app.controller;
-
-import com.baomidou.mybatisplus.core.mapper.BaseMapper;
-import com.tokensea.common.BaseCrudController;
-import com.tokensea.app.entity.AppEntity;
-import com.tokensea.app.mapper.AppEntityMapper;
-import org.springframework.web.bind.annotation.RequestMapping;
-import org.springframework.web.bind.annotation.RestController;
-
-@RestController
-@RequestMapping("/api/apps")
-public class AppController extends BaseCrudController<AppEntity> {
-    private final AppEntityMapper mapper;
-    public AppController(AppEntityMapper mapper) { this.mapper = mapper; }
-    @Override protected BaseMapper<AppEntity> mapper() { return mapper; }
+import com.tokensea.app.entity.AppEntity;import com.tokensea.app.mapper.AppEntityMapper;import com.tokensea.audit.service.AuditService;import com.tokensea.common.ApiResponse;import com.tokensea.project.entity.Project;import com.tokensea.project.mapper.ProjectMapper;import com.tokensea.tenant.entity.Tenant;import com.tokensea.tenant.mapper.TenantMapper;import org.springframework.http.HttpStatus;import org.springframework.transaction.annotation.Transactional;import org.springframework.web.bind.annotation.*;import org.springframework.web.server.ResponseStatusException;import java.util.List;import java.util.Set;
+@RestController @RequestMapping("/api/apps") public class AppController{
+ private static final Set<String> STATES=Set.of("DRAFT","ACTIVE","SUSPENDED");private final AppEntityMapper mapper;private final ProjectMapper projects;private final TenantMapper tenants;private final AuditService audits;public AppController(AppEntityMapper m,ProjectMapper p,TenantMapper t,AuditService a){mapper=m;projects=p;tenants=t;audits=a;}public record Request(String tenantId,String projectId,String name,String ownerName,String environment){}public record StateRequest(String status){}
+ @GetMapping public ApiResponse<List<AppEntity>> list(){return ApiResponse.ok(mapper.selectList(null));}@GetMapping("/{id}") public ApiResponse<AppEntity> get(@PathVariable String id){return ApiResponse.ok(require(id));}
+ @PostMapping @Transactional public ApiResponse<AppEntity> create(@RequestBody Request r){validate(r);AppEntity v=new AppEntity();apply(v,r);v.setStatus("DRAFT");mapper.insert(v);audits.record("APP_CREATE","App",v.getId(),null,v);return ApiResponse.ok(v);}
+ @PutMapping("/{id}") @Transactional public ApiResponse<AppEntity> update(@PathVariable String id,@RequestBody Request r){validate(r);AppEntity v=require(id),before=audits.snapshot(v,AppEntity.class);apply(v,r);mapper.updateById(v);audits.record("APP_UPDATE","App",id,before,v);return ApiResponse.ok(v);}
+ @PatchMapping("/{id}/status") @Transactional public ApiResponse<AppEntity> status(@PathVariable String id,@RequestBody StateRequest r){if(r==null||!STATES.contains(r.status()))bad("应用状态无效");AppEntity v=require(id),before=audits.snapshot(v,AppEntity.class);if("ACTIVE".equals(r.status())){Project p=projects.selectById(v.getProjectId());Tenant t=tenants.selectById(v.getTenantId());if(p==null||!"ACTIVE".equals(p.getStatus())||t==null||!"ACTIVE".equals(t.getStatus()))throw new ResponseStatusException(HttpStatus.CONFLICT,"所属租户或项目未启用");}v.setStatus(r.status());mapper.updateById(v);audits.record("APP_STATE_CHANGE","App",id,before,v);return ApiResponse.ok(v);}
+ @DeleteMapping("/{id}") public void delete(@PathVariable String id){throw new ResponseStatusException(HttpStatus.METHOD_NOT_ALLOWED,"应用禁止物理删除");}
+ private void validate(Request r){if(r==null||blank(r.tenantId())||blank(r.projectId())||blank(r.name()))bad("租户、项目和应用名称不能为空");Tenant t=tenants.selectById(r.tenantId());Project p=projects.selectById(r.projectId());if(t==null||p==null||!r.tenantId().equals(p.getTenantId()))bad("租户与项目关系无效");}private AppEntity require(String id){AppEntity v=mapper.selectById(id);if(v==null)throw new ResponseStatusException(HttpStatus.NOT_FOUND,"应用不存在");return v;}private void apply(AppEntity v,Request r){v.setTenantId(r.tenantId());v.setProjectId(r.projectId());v.setName(r.name());v.setOwnerName(r.ownerName());v.setEnvironment(blank(r.environment())?"DEV":r.environment());}private static void bad(String m){throw new ResponseStatusException(HttpStatus.BAD_REQUEST,m);}private static boolean blank(String v){return v==null||v.isBlank();}
 }

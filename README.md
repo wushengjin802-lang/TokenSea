@@ -43,9 +43,15 @@ TokenSea 是面向企业内部与私有化交付场景的统一 LLM API Gateway 
 
 ## 启动
 
-```bash
-cd deploy/compose
-docker compose --env-file ../../.env.example up -d --build
+```powershell
+cd tokensea/deploy/compose
+Copy-Item .env.example .env
+# 编辑 .env，替换所有 REPLACE_* 值
+docker compose -p tokensea --env-file ./.env up -d --build
+docker compose -p tokensea --env-file ./.env ps
+docker compose -p tokensea --env-file ./.env logs -f --tail=200
+docker compose -p tokensea --env-file ./.env config --quiet
+docker compose -p tokensea --env-file ./.env down
 ```
 
 访问控制台：

@@ -1,6 +1,7 @@
 package com.tokensea.apikey.entity;
 
 import com.baomidou.mybatisplus.annotation.TableName;
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.tokensea.common.BaseEntity;
 import lombok.Data;
 import lombok.EqualsAndHashCode;
@@ -13,6 +14,7 @@ public class ApiKeyEntity extends BaseEntity {
     private String projectId;
     private String appId;
     private String name;
+    @JsonIgnore
     private String keyHash;
     private String keyPrefix;
     private String status;
@@ -22,6 +24,7 @@ public class ApiKeyEntity extends BaseEntity {
     private Integer rpmLimit;
     private Integer tpmLimit;
     private Integer qpsLimit;
+    @JsonIgnore
     private String ipWhitelist;
     private java.time.OffsetDateTime expiresAt;
     private String createdBy;
