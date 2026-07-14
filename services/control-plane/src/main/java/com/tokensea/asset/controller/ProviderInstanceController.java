@@ -43,7 +43,7 @@ public class ProviderInstanceController {
     public record StatusRequest(String status) {}
 
     @GetMapping public ApiResponse<List<ProviderInstance>> list() { return ApiResponse.ok(mapper.selectList(null)); }
-    @GetMapping("/{id}") public ApiResponse<ProviderInstance> get(@PathVariable String id) { return ApiResponse.ok(require(id)); }
+    @GetMapping("/{id}") public ApiResponse<ProviderInstance> get(@PathVariable("id") String id) { return ApiResponse.ok(require(id)); }
 
     @PostMapping
     public ApiResponse<ProviderInstance> create(@RequestBody CreateRequest req) {
@@ -66,7 +66,7 @@ public class ProviderInstanceController {
     }
 
     @PutMapping("/{id}")
-    public ApiResponse<ProviderInstance> update(@PathVariable String id, @RequestBody UpdateRequest req) {
+    public ApiResponse<ProviderInstance> update(@PathVariable("id") String id, @RequestBody UpdateRequest req) {
         ProviderInstance current = require(id);
         if (blank(req.instanceName()) || blank(req.apiStyle())) {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "实例名称和协议不能为空");
@@ -85,7 +85,7 @@ public class ProviderInstanceController {
     }
 
     @PostMapping("/{id}/test-connection")
-    public ApiResponse<ProviderInstance> testConnection(@PathVariable String id) {
+    public ApiResponse<ProviderInstance> testConnection(@PathVariable("id") String id) {
         ProviderInstance snapshot = require(id);
         ProviderConnectionService.TestResult result = connections.test(snapshot); // no DB transaction during network I/O
         ProviderInstance saved = transactions.execute(status -> {
@@ -100,12 +100,12 @@ public class ProviderInstanceController {
             current.setHealthStatus(result.success() ? "健康" : "异常");
             mapper.updateById(current); audit("TEST_CONNECTION", current, before); return current;
         });
-        if (!result.success()) throw new ResponseStatusException(HttpStatus.BAD_GATEWAY, result.errorCode()+": "+result.error());
+        if (!result.success()) return ApiResponse.fail(result.errorCode()+": "+result.error());
         return ApiResponse.ok(saved);
     }
 
     @PatchMapping("/{id}/status")
-    public ApiResponse<ProviderInstance> status(@PathVariable String id, @RequestBody StatusRequest req) {
+    public ApiResponse<ProviderInstance> status(@PathVariable("id") String id, @RequestBody StatusRequest req) {
         if (req == null || !STATUSES.contains(req.status())) throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "渠道状态无效");
         return ApiResponse.ok(transactions.execute(tx -> {
             ProviderInstance value = require(id); ProviderInstance before = require(id);
@@ -118,7 +118,7 @@ public class ProviderInstanceController {
 
     @DeleteMapping("/{id}")
     @ResponseStatus(HttpStatus.METHOD_NOT_ALLOWED)
-    public void delete(@PathVariable String id) { throw new ResponseStatusException(HttpStatus.METHOD_NOT_ALLOWED, "供应商渠道禁止物理删除，请停用"); }
+    public void delete(@PathVariable("id") String id) { throw new ResponseStatusException(HttpStatus.METHOD_NOT_ALLOWED, "供应商渠道禁止物理删除，请停用"); }
 
     private boolean recentlyVerified(ProviderInstance value) {
         return "成功".equals(value.getLastConnectionTestStatus()) && value.getLastConnectionTestAt() != null

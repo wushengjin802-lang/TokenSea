@@ -36,23 +36,23 @@ public class ModelDiscoveryController {
     public record DiscoverySummary(String snapshotId,int discovered,int deploymentsCreated,int diffsCreated,int missingCount) {}
 
     @PostMapping("/{id}/discover-models")
-    public ApiResponse<DiscoverySummary> discover(@PathVariable String id) {
+    public ApiResponse<DiscoverySummary> discover(@PathVariable("id") String id) {
         ProviderInstance instance=instances.selectById(id);
         if(instance==null) throw new ResponseStatusException(HttpStatus.NOT_FOUND,"供应商渠道不存在");
         ProviderConnectionService.DiscoveryResult result=connections.discoverModels(instance);
-        if(!result.success()) throw new ResponseStatusException(HttpStatus.BAD_GATEWAY,result.errorCode()+": "+result.error());
+        if(!result.success()) return ApiResponse.fail(result.errorCode()+": "+result.error());
         List<Map<String,Object>> models=parseModels(result.rawPayload());
         if(models.isEmpty()) throw new ResponseStatusException(HttpStatus.BAD_GATEWAY,"供应商 /models 未返回可识别模型");
         return ApiResponse.ok(transactions.execute(status->persist(instance,result,models)));
     }
 
     @GetMapping("/{id}/model-snapshots")
-    public ApiResponse<List<Map<String,Object>>> snapshots(@PathVariable String id){
+    public ApiResponse<List<Map<String,Object>>> snapshots(@PathVariable("id") String id){
         return ApiResponse.ok(jdbc.queryForList("select id,provider_instance_id,source_endpoint,http_status,checksum,discovered_at,created_at from provider_model_snapshot where provider_instance_id=? order by discovered_at desc",id));
     }
 
     @GetMapping("/{id}/deployments")
-    public ApiResponse<List<Map<String,Object>>> deployments(@PathVariable String id){
+    public ApiResponse<List<Map<String,Object>>> deployments(@PathVariable("id") String id){
         return ApiResponse.ok(jdbc.queryForList("select * from channel_model_deployment where provider_instance_id=? order by provider_model_name",id));
     }
 

@@ -1,5 +1,6 @@
 import { createRouter, createWebHistory } from 'vue-router'
 import Login from './pages/Login.vue'
+import Landing from './pages/Landing.vue'
 import Layout from './layouts/MainLayout.vue'
 import Dashboard from './pages/Dashboard.vue'
 import DataPage from './pages/DataPage.vue'
@@ -23,10 +24,10 @@ const managedResources=resourceRoutes.map(([path,key])=>({path,component:DataPag
 const routes=[
   {path:'/login',component:Login},
   {path:'/',component:Layout,children:[
-    {path:'',redirect:()=>isAdmin()?'/dashboard':'/workspace'},
+    {path:'',component:Landing},
     {path:'dashboard',component:Dashboard,meta:admin},
     {path:'workspace',component:TenantWorkspace},
-    {path:'tenants',component:DataPage,meta:admin,props:{title:'租户',desc:'管理租户责任边界、成本预算和模型范围。',apiPath:'/api/tenants',fields:['name','type','ownerName','contactEmail','modelScope','monthlyBudget','status'],labels:{name:'租户名称',type:'租户类型',ownerName:'负责人',contactEmail:'联系邮箱',modelScope:'模型范围',monthlyBudget:'月预算',status:'状态'},requiredFields:['name','type','modelScope'],numberFields:['monthlyBudget'],optionSources:{modelScope:{path:'/api/platform-models',label:'displayName',value:'platformModelName',multiple:true}},fieldOptions:{type:opts([['内部租户','INTERNAL'],['外部客户','EXTERNAL']]),status:tenantStatus},fieldTypes:{type:'select',modelScope:'multiselect',status:'select'},builtinActions:['启用并生成默认 Key'],builtinActionMap:{'启用并生成默认 Key':':id/activate'},statePath:'status'}},
+    {path:'tenants',component:DataPage,meta:admin,props:{title:'租户',desc:'管理租户责任边界、成本预算和模型范围。',apiPath:'/api/tenants',fields:['name','type','ownerName','contactEmail','modelScope','monthlyBudget','status'],labels:{name:'租户名称',type:'租户类型',ownerName:'负责人',contactEmail:'联系邮箱',modelScope:'模型范围',monthlyBudget:'月预算',status:'状态'},requiredFields:['name','type','modelScope'],numberFields:['monthlyBudget'],optionSources:{modelScope:{path:'/api/platform-models',label:'displayName',value:'platformModelName',multiple:true}},fieldOptions:{type:opts([['内部租户','INTERNAL'],['外部客户','EXTERNAL']]),status:tenantStatus},fieldTypes:{type:'select',modelScope:'multiselect',status:'select'},statusInForm:true,defaultFormValues:{type:'INTERNAL',status:'DRAFT'},activationStatus:'ACTIVE',activationPath:'activate',builtinActions:['启用并生成默认 Key'],builtinActionMap:{'启用并生成默认 Key':':id/activate'},statePath:'status',stateLabel:'变更租户状态'}},
     {path:'projects',component:DataPage,meta:admin,props:{title:'项目',desc:'按租户管理项目成本预算与负责人。',apiPath:'/api/projects',fields:['tenantId','name','ownerName','monthlyBudget','status'],labels:{tenantId:'所属租户',name:'项目名称',ownerName:'负责人',monthlyBudget:'月预算',status:'状态'},requiredFields:['tenantId','name'],numberFields:['monthlyBudget'],optionSources:{tenantId:{path:'/api/tenants',label:'name',value:'id'}},fieldOptions:{status:tenantStatus},fieldTypes:{tenantId:'select',status:'select'},statePath:'status'}},
     {path:'apps',component:DataPage,meta:admin,props:{title:'应用',desc:'维护真实业务应用与项目归属。',apiPath:'/api/apps',fields:['tenantId','projectId','name','ownerName','environment','status'],labels:{tenantId:'所属租户',projectId:'所属项目',name:'应用名称',ownerName:'负责人',environment:'环境',status:'状态'},requiredFields:['tenantId','projectId','name'],optionSources:{tenantId:{path:'/api/tenants',label:'name',value:'id'},projectId:{path:'/api/projects',label:'name',value:'id'}},fieldOptions:{environment:opts([['开发','DEV'],['测试','TEST'],['生产','PROD']]),status:tenantStatus},fieldTypes:{tenantId:'select',projectId:'select',environment:'select',status:'select'},statePath:'status'}},
     ...managedResources,
@@ -46,5 +47,5 @@ const routes=[
   ]}
 ]
 const router=createRouter({history:createWebHistory(),routes})
-router.beforeEach(to=>{if(to.path==='/login')return localStorage.getItem('tokensea_token')?(isAdmin()?'/dashboard':'/workspace'):true;if(!localStorage.getItem('tokensea_token'))return{path:'/login',query:{redirect:to.fullPath}};if(to.meta.requiresAdmin&&!identity().roles.includes('ADMIN'))return'/workspace';return true})
+router.beforeEach(to=>{if(to.path==='/')return true;if(to.path==='/login')return localStorage.getItem('tokensea_token')?(isAdmin()?'/dashboard':'/workspace'):true;if(!localStorage.getItem('tokensea_token'))return{path:'/login',query:{redirect:to.fullPath}};if(to.meta.requiresAdmin&&!identity().roles.includes('ADMIN'))return'/workspace';return true})
 export default router

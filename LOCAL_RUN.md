@@ -69,6 +69,17 @@ docker compose -p tokensea --env-file ./.env config --quiet
 docker compose -p tokensea --env-file ./.env down
 ```
 
+### 开发热更新前端
+```powershell
+cd "D:\12_其他项目\30_APIGateway\tokensea\deploy\compose"
+docker compose -p tokensea --env-file ./.env stop tokensea-console
+cd "D:\12_其他项目\30_APIGateway\tokensea\apps\console"
+npm install   # 仅首次需要
+npm run dev
+然后访问 http://localhost:39210/。之后修改 Vue、CSS、路由等前端文件会自动热更新，通常秒级生效。
+```
+
+
 ## 注意事项
 
 - 控制台 API 地址和网关地址会在 Vite 构建时写入前端静态资源。

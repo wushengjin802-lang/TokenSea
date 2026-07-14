@@ -19,14 +19,17 @@ api.interceptors.response.use((response) => response, (error) => {
   // 仍保留 403，不强制清除会话。
   if (status === 401 || (status === 403 && identity().roles.length === 0)) {
     localStorage.removeItem('tokensea_token')
-    if (location.pathname !== '/login') location.assign('/login')
+    if (location.pathname !== '/' && location.pathname !== '/login') location.assign('/login')
   }
   return Promise.reject(error)
 })
 
 export function errorMessage(error: unknown): string {
   const value = error as any
-  if (value?.response?.status === 403) return value?.response?.data?.message || value?.response?.data?.detail || '当前账号无权访问该租户范围'
+  if (value?.response?.status === 403) {
+    if (!identity().roles.includes('ADMIN')) return '当前登录会话未包含平台管理员权限，请退出后重新登录'
+    return value?.response?.data?.message || value?.response?.data?.detail || '当前账号无权访问该租户范围'
+  }
   return value?.response?.data?.message || value?.response?.data?.detail || value?.message || '请求失败，请稍后重试'
 }
 function camelKey(key:string){return key.replace(/_([a-z])/g,(_,letter:string)=>letter.toUpperCase())}

@@ -500,6 +500,10 @@ const props = defineProps<{
   statePath?: string;
   stateLabel?: string;
   stateMethod?: "post" | "patch";
+  statusInForm?: boolean;
+  defaultFormValues?: Record<string, any>;
+  activationStatus?: any;
+  activationPath?: string;
   exportPath?: string;
   emptyTitle?: string;
   emptyDescription?: string;
@@ -575,7 +579,7 @@ const canCreate = computed(
       (field) =>
         ![
           "id",
-          "status",
+          ...(props.statusInForm ? [] : ["status"]),
           "approvalStatus",
           "createdAt",
           "updatedAt",
@@ -833,7 +837,9 @@ async function openCreate() {
   formError.value = "";
   formFields.value.forEach(
     (field) =>
-      (form[field] = selectMode(field) === "multiple" ? [] : undefined),
+      (form[field] =
+        props.defaultFormValues?.[field] ??
+        (selectMode(field) === "multiple" ? [] : undefined)),
   );
   formVisible.value = true;
   await loadOptions();
@@ -911,6 +917,12 @@ async function save() {
   formError.value = "";
   try {
     const payload = { ...form };
+    const requestedStatus = props.statusInForm ? payload.status : undefined;
+    if (!editing.value && requestedStatus === "SUSPENDED") {
+      formError.value = "新建租户不能直接设为暂停状态";
+      return;
+    }
+    if (props.statusInForm) delete payload.status;
     for (const field of formFields.value.filter(
       (item) => fieldType(item) === "json" && typeof payload[item] === "string",
     )) {
@@ -928,16 +940,34 @@ async function save() {
       )
         payload[field] = JSON.stringify(payload[field] || []);
     });
-    if (editing.value)
-      await update(
+    const saved = editing.value
+      ? await update(
         activePath.value,
         String(editing.value[props.updateKey || "id"]),
         payload,
         builtin.value
           ? props.builtinUpdateMethod || "put"
           : props.updateMethod || "put",
-      );
-    else await create(activePath.value, payload);
+      )
+      : await create(activePath.value, payload);
+    if (
+      props.statusInForm &&
+      requestedStatus &&
+      requestedStatus !== saved?.status
+    ) {
+      const id = String(saved?.[props.updateKey || "id"] || "");
+      if (!id) throw new Error("保存后未返回租户标识");
+      const result =
+        requestedStatus === props.activationStatus && props.activationPath
+          ? await postAction(`${activePath.value}/${id}/${props.activationPath}`)
+          : await patchAction(`${activePath.value}/${id}/${statePath.value}`, {
+              status: requestedStatus,
+            });
+      if ((result as any)?.plainTextKey) {
+        generatedSecret.value = (result as any).plainTextKey;
+        secretVisible.value = true;
+      }
+    }
     formVisible.value = false;
     message.success("保存成功");
     await load();
