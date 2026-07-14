@@ -27,13 +27,16 @@ public class ModelDiscoveryController {
     private final ObjectMapper json;
     private final TransactionTemplate transactions;
     private final AuditService audits;
+    private final ProviderPriceCatalogService prices;
 
     public ModelDiscoveryController(ProviderInstanceMapper instances, ProviderConnectionService connections,
-                                    JdbcTemplate jdbc, ObjectMapper json, TransactionTemplate transactions, AuditService audits) {
-        this.instances=instances;this.connections=connections;this.jdbc=jdbc;this.json=json;this.transactions=transactions;this.audits=audits;
+                                    JdbcTemplate jdbc, ObjectMapper json, TransactionTemplate transactions,
+                                    AuditService audits, ProviderPriceCatalogService prices) {
+        this.instances=instances;this.connections=connections;this.jdbc=jdbc;this.json=json;this.transactions=transactions;this.audits=audits;this.prices=prices;
     }
 
-    public record DiscoverySummary(String snapshotId,int discovered,int deploymentsCreated,int diffsCreated,int missingCount) {}
+    public record DiscoverySummary(String snapshotId,int discovered,int deploymentsCreated,int diffsCreated,
+                                   int missingCount,int pricesMatched,int pricesCreated,int pricesMissing) {}
 
     @PostMapping("/{id}/discover-models")
     public ApiResponse<DiscoverySummary> discover(@PathVariable("id") String id) {
@@ -60,22 +63,25 @@ public class ModelDiscoveryController {
         String snapshotId=id(),raw=result.rawPayload(),checksum=sha256(raw);
         jdbc.update("insert into provider_model_snapshot(id,provider_instance_id,source_endpoint,http_status,checksum,raw_payload) values(?,?,?,?,?,cast(? as jsonb))",
                 snapshotId,instance.getId(),result.sourceEndpoint(),result.httpStatus(),checksum,raw);
-        Set<String> seen=new HashSet<>();int created=0,diffs=0;
+        Set<String> seen=new HashSet<>();int created=0,diffs=0,pricesMatched=0,pricesCreated=0,pricesMissing=0;
         for(Map<String,Object> model:models){
-            String name=modelName(model);seen.add(name);String rawModel=write(model);
+            String name=modelName(model);seen.add(name);String rawModel=write(model);String deploymentId;
             List<Map<String,Object>> existing=jdbc.queryForList("select id,raw_model from channel_model_deployment where provider_instance_id=? and provider_model_name=?",instance.getId(),name);
             if(existing.isEmpty()){
-                String deploymentId=id();Map<String,Object> sources=new LinkedHashMap<>();model.keySet().forEach(k->sources.put(k,Map.of("source",result.sourceEndpoint(),"snapshotId",snapshotId,"confidence",1)));
+                deploymentId=id();Map<String,Object> sources=new LinkedHashMap<>();model.keySet().forEach(k->sources.put(k,Map.of("source",result.sourceEndpoint(),"snapshotId",snapshotId,"confidence",1)));
                 jdbc.update("insert into channel_model_deployment(id,provider_instance_id,provider_model_name,display_name,raw_model,field_sources,source_snapshot_id) values(?,?,?,?,cast(? as jsonb),cast(? as jsonb),?)",
                         deploymentId,instance.getId(),name,String.valueOf(model.getOrDefault("display_name",name)),rawModel,write(sources),snapshotId);created++;
             }else{
-                String deploymentId=String.valueOf(existing.get(0).get("id"));Map<String,Object> old=readMap(existing.get(0).get("raw_model"));
+                deploymentId=String.valueOf(existing.get(0).get("id"));Map<String,Object> old=readMap(existing.get(0).get("raw_model"));
                 for(String field:union(old.keySet(),model.keySet())) if(!Objects.equals(old.get(field),model.get(field))){
                     jdbc.update("insert into model_discovery_diff(id,deployment_id,snapshot_id,field_name,old_value,new_value,source,confidence) values(?,?,?,?,cast(? as jsonb),cast(? as jsonb),?,?)",
                             id(),deploymentId,snapshotId,field,writeValue(old.get(field)),writeValue(model.get(field)),result.sourceEndpoint(),1);diffs++;
                 }
                 jdbc.update("update channel_model_deployment set last_seen_at=now(),missing_at=null,review_status=case when review_status='MISSING' then 'PENDING_REVIEW' else review_status end,source_snapshot_id=?,updated_at=now() where id=?",snapshotId,deploymentId);
             }
+            ProviderPriceCatalogService.MatchResult price=prices.autoFill(instance,deploymentId,name);
+            if(price.matched())pricesMatched++;else pricesMissing++;
+            if(price.created())pricesCreated++;
         }
         List<String> known=jdbc.queryForList("select provider_model_name from channel_model_deployment where provider_instance_id=? and missing_at is null",String.class,instance.getId());
         int missing=0;for(String name:known)if(!seen.contains(name)){
@@ -83,7 +89,7 @@ public class ModelDiscoveryController {
             jdbc.update("update channel_model_deployment set missing_at=now(),review_status='MISSING',routing_status='SUSPENDED',updated_at=now() where id=?",deploymentId);
             jdbc.update("insert into alert_event(id,alert_type,severity,resource_type,resource_id,title,detail) values(?,?,?,?,?,?,cast(? as jsonb))",id(),"MODEL_DISAPPEARED","HIGH","MODEL_DEPLOYMENT",deploymentId,"供应商模型已从发现列表消失",write(Map.of("providerInstanceId",instance.getId(),"providerModelName",name,"snapshotId",snapshotId)));missing++;
         }
-        DiscoverySummary summary=new DiscoverySummary(snapshotId,models.size(),created,diffs,missing);
+        DiscoverySummary summary=new DiscoverySummary(snapshotId,models.size(),created,diffs,missing,pricesMatched,pricesCreated,pricesMissing);
         audits.record("PROVIDER_MODEL_DISCOVERY","ProviderInstance",instance.getId(),null,summary);
         return summary;
     }

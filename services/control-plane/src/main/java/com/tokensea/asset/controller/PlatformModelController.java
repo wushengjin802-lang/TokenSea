@@ -10,8 +10,6 @@ import com.tokensea.asset.mapper.ProviderInstanceMapper;
 import com.tokensea.asset.service.ProviderConnectionService;
 import com.tokensea.audit.entity.AuditLog;
 import com.tokensea.audit.mapper.AuditLogMapper;
-import com.tokensea.price.entity.ModelPrice;
-import com.tokensea.price.mapper.ModelPriceMapper;
 import com.tokensea.route.entity.RoutePolicy;
 import com.tokensea.route.mapper.RoutePolicyMapper;
 import com.tokensea.route.service.RouteCandidateValidator;
@@ -20,7 +18,6 @@ import org.springframework.http.HttpStatus;
 import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.server.ResponseStatusException;
-import org.springframework.beans.factory.annotation.Value;
 import com.tokensea.governance.GovernanceApprovalService;
 import com.tokensea.security.JwtService;
 import org.springframework.security.core.Authentication;
@@ -36,26 +33,22 @@ public class PlatformModelController {
     private final PlatformModelMapper mapper;
     private final ProviderInstanceMapper instances;
     private final AuditLogMapper audits;
-    private final ModelPriceMapper prices;
     private final RoutePolicyMapper routes;
     private final ProviderConnectionService connections;
-    private final String budgetCurrency;
     private final RouteCandidateValidator candidateValidator;
     private final ObjectMapper json;
     private final TransactionTemplate transactions;
     private final GovernanceApprovalService approvals;
 
     public PlatformModelController(PlatformModelMapper mapper, ProviderInstanceMapper instances,
-                                   AuditLogMapper audits, ModelPriceMapper prices, RoutePolicyMapper routes,
+                                   AuditLogMapper audits, RoutePolicyMapper routes,
                                    ProviderConnectionService connections,
                                    RouteCandidateValidator candidateValidator,
                                    ObjectMapper json, TransactionTemplate transactions,
-                                   @Value("${tokensea.budget-currency:CNY}") String budgetCurrency,GovernanceApprovalService approvals) {
+                                   GovernanceApprovalService approvals) {
         this.mapper = mapper; this.instances = instances; this.audits = audits;
-        this.prices = prices; this.routes = routes;
-        this.connections = connections;
+        this.routes = routes; this.connections = connections;
         this.candidateValidator = candidateValidator;
-        this.budgetCurrency = budgetCurrency.toUpperCase(java.util.Locale.ROOT);
         this.json = json; this.transactions = transactions;this.approvals=approvals;
     }
 
@@ -103,8 +96,8 @@ public class PlatformModelController {
             if (instanceIds.isEmpty() || actualModels.isEmpty() || (instanceIds.size() != 1 && instanceIds.size() != actualModels.size())) {
                 throw new ResponseStatusException(HttpStatus.CONFLICT, "真实渠道与实际模型映射不完整");
             }
-            if (blank(value.getPricePolicyId()) || blank(value.getRoutePolicyId()) || blank(value.getVisibilityScope())) {
-                throw new ResponseStatusException(HttpStatus.CONFLICT, "价格版本、路由策略和可见范围未配置");
+            if (blank(value.getRoutePolicyId()) || blank(value.getVisibilityScope())) {
+                throw new ResponseStatusException(HttpStatus.CONFLICT, "路由策略和可见范围未配置");
             }
             RoutePolicy activeRoute=validateRoute(value);
             candidateValidator.validate(value,activeRoute,true);

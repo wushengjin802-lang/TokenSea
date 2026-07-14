@@ -39,6 +39,7 @@ tokensea:
     proxy-port: ${TOKENSEA_EGRESS_PROXY_PORT:18080}
     allowed-hosts: ${TOKENSEA_ALLOWED_EGRESS_HOSTS:}
     allowed-ports: ${TOKENSEA_EGRESS_ALLOWED_PORTS:80,443}
+    policy-token: ${TOKENSEA_EGRESS_POLICY_TOKEN:}
   runtime:
     engine-url: ${TOKENSEA_RUNTIME_ENGINE_URL:http://localhost:39218}
     engine-key: ${TOKENSEA_RUNTIME_ENGINE_KEY}

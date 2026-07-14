@@ -1,9 +1,11 @@
 import asyncio
 import ipaddress
+import json
 import logging
 import os
 import socket
-from dataclasses import dataclass
+import urllib.request
+from dataclasses import dataclass, field
 from typing import Awaitable, Callable, Iterable, Optional, Sequence
 from urllib.parse import urlsplit, urlunsplit
 
@@ -120,14 +122,22 @@ def parse_host_header(value: str, default_port: int) -> tuple[str, int]:
     return normalize_hostname(host), port
 
 
-@dataclass(frozen=True)
+@dataclass
 class EgressPolicy:
     allowed_hosts: frozenset[str]
     allowed_ports: frozenset[int]
+    dynamic_hosts: frozenset[str] = field(default_factory=frozenset)
+
+    @property
+    def effective_hosts(self) -> frozenset[str]:
+        return self.allowed_hosts | self.dynamic_hosts
+
+    def replace_dynamic_hosts(self, hosts: Iterable[str]):
+        self.dynamic_hosts = frozenset(normalize_hostname(host) for host in hosts)
 
     def validate_host_port(self, host: str, port: int) -> str:
         normalized = normalize_hostname(host)
-        if not self.allowed_hosts or normalized not in self.allowed_hosts:
+        if not self.effective_hosts or normalized not in self.effective_hosts:
             raise ProxyError(403, "Forbidden", "host_not_allowlisted")
         if port not in self.allowed_ports:
             raise ProxyError(403, "Forbidden", "port_not_allowlisted")
@@ -371,6 +381,33 @@ def positive_int(name: str, default: int) -> int:
     return value
 
 
+def fetch_dynamic_policy(url: str, token: str) -> frozenset[str]:
+    request = urllib.request.Request(url, headers={
+        "Accept": "application/json",
+        "X-TokenSea-Egress-Policy-Token": token,
+        "User-Agent": "TokenSea-EgressProxy/1.0",
+    })
+    with urllib.request.urlopen(request, timeout=5) as response:
+        payload = json.loads(response.read(1_000_000).decode("utf-8"))
+    data = payload.get("data") if isinstance(payload, dict) else None
+    hosts = data.get("allowedHosts") if isinstance(data, dict) else None
+    if not isinstance(hosts, list):
+        raise RuntimeError("dynamic policy response is missing data.allowedHosts")
+    return frozenset(normalize_hostname(str(host)) for host in hosts if str(host).strip())
+
+
+async def refresh_dynamic_policy(policy: EgressPolicy, url: str, token: str, interval: int):
+    while True:
+        try:
+            hosts = await asyncio.to_thread(fetch_dynamic_policy, url, token)
+            policy.replace_dynamic_hosts(hosts)
+            LOGGER.info("dynamic_policy_refreshed hosts=%s total_hosts=%s",
+                        len(policy.dynamic_hosts), len(policy.effective_hosts))
+        except Exception as exc:
+            LOGGER.warning("dynamic_policy_refresh_failed error=%s", type(exc).__name__)
+        await asyncio.sleep(interval)
+
+
 async def run():
     policy = EgressPolicy(parse_allowed_hosts(os.getenv("TOKENSEA_ALLOWED_EGRESS_HOSTS", "")),
                           parse_allowed_ports(os.getenv("TOKENSEA_EGRESS_ALLOWED_PORTS", "80,443")))
@@ -385,9 +422,22 @@ async def run():
     host = os.getenv("TOKENSEA_EGRESS_LISTEN_HOST", "0.0.0.0")
     port = positive_int("TOKENSEA_EGRESS_LISTEN_PORT", 18080)
     server = await asyncio.start_server(proxy.handle_client, host, port, limit=proxy.max_header_bytes + 1)
-    LOGGER.info("proxy_started host=%s port=%s allowlisted_hosts=%s", host, port, len(policy.allowed_hosts))
-    async with server:
-        await server.serve_forever()
+    policy_url = os.getenv("TOKENSEA_EGRESS_POLICY_URL", "").strip()
+    policy_token = os.getenv("TOKENSEA_EGRESS_POLICY_TOKEN", "").strip()
+    refresh_task = None
+    if policy_url and policy_token:
+        refresh_task = asyncio.create_task(refresh_dynamic_policy(
+            policy, policy_url, policy_token,
+            positive_int("TOKENSEA_EGRESS_POLICY_REFRESH_SECONDS", 15)))
+    LOGGER.info("proxy_started host=%s port=%s baseline_hosts=%s dynamic_policy=%s",
+                host, port, len(policy.allowed_hosts), bool(refresh_task))
+    try:
+        async with server:
+            await server.serve_forever()
+    finally:
+        if refresh_task:
+            refresh_task.cancel()
+            await asyncio.gather(refresh_task, return_exceptions=True)
 
 
 if __name__ == "__main__":

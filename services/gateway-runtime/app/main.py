@@ -752,20 +752,24 @@ async def select_routes(model_alias: str, key_ctx: Dict[str, Any]) -> List[Dict[
 
 
 async def load_price(price_id: Any, platform_model_id: str, provider_instance_id: str, actual_model: str) -> Dict[str, Any]:
-    if not isinstance(price_id, str) or not price_id:
-        raise gateway_error(503, "TOKENSEA_PRICE_NOT_CONFIGURED", "模型未绑定价格版本")
     assert pool is not None
     governed = await pool.fetchrow("""
-      SELECT actual.id,actual.currency,actual.input_amount_per_1k input_cost_per_1k,
+      SELECT actual.id,actual.price_layer,actual.currency,d.id channel_deployment_id,
+             actual.input_amount_per_1k input_cost_per_1k,
              actual.output_amount_per_1k output_cost_per_1k,
+             internal.id internal_price_id,
              COALESCE(internal.input_amount_per_1k,actual.input_amount_per_1k) input_price_per_1k,
              COALESCE(internal.output_amount_per_1k,actual.output_amount_per_1k) output_price_per_1k,
-             'price_version:'||actual.id source_ref
+             COALESCE(actual.source_ref,'price_version:'||actual.id) source_ref,
+             actual.price_components,actual.evidence_hash,actual.region,actual.request_mode,
+             actual.service_tier,actual.context_tier
       FROM channel_model_deployment d
       JOIN LATERAL (
-        SELECT * FROM price_version p WHERE p.deployment_id=d.id AND p.price_layer='CHANNEL_ACTUAL'
+        SELECT * FROM price_version p WHERE p.deployment_id=d.id
+          AND p.price_layer IN ('PROVIDER_OFFICIAL','CHANNEL_ACTUAL')
           AND p.status='ACTIVE' AND p.effective_from<=now() AND (p.effective_to IS NULL OR p.effective_to>now())
-        ORDER BY p.effective_from DESC,p.version DESC LIMIT 1
+        ORDER BY CASE WHEN p.price_layer='PROVIDER_OFFICIAL' THEN 0 ELSE 1 END,
+                 p.effective_from DESC,p.version DESC LIMIT 1
       ) actual ON true
       LEFT JOIN LATERAL (
         SELECT * FROM price_version p WHERE p.platform_model_id=$1 AND p.price_layer='INTERNAL_ACCOUNTING'
@@ -775,15 +779,22 @@ async def load_price(price_id: Any, platform_model_id: str, provider_instance_id
       WHERE d.provider_instance_id=$2 AND d.provider_model_name=$3 AND d.review_status='APPROVED'
         AND d.routing_status='ELIGIBLE'
     """, platform_model_id, provider_instance_id, actual_model)
-    row = governed or await pool.fetchrow("""
-      SELECT id,currency,input_cost_per_1k,output_cost_per_1k,input_price_per_1k,output_price_per_1k
-      FROM model_price WHERE id=$1 AND platform_model_id=$2
-        AND (provider_instance_id IS NULL OR provider_instance_id=$3)
-        AND status='ACTIVE' AND effective_from<=now() AND (effective_to IS NULL OR effective_to>now())
-    """, price_id, platform_model_id, provider_instance_id)
+    row = governed
+    if row is None and isinstance(price_id, str) and price_id:
+        row = await pool.fetchrow("""
+          SELECT id,'LEGACY_MODEL_PRICE' price_layer,currency,NULL::varchar channel_deployment_id,
+                 input_cost_per_1k,output_cost_per_1k,NULL::varchar internal_price_id,
+                 input_price_per_1k,output_price_per_1k,'model_price:'||id source_ref,'{}'::jsonb price_components,NULL::varchar evidence_hash,
+                 'global'::varchar region,'STANDARD'::varchar request_mode,
+                 'DEFAULT'::varchar service_tier,'DEFAULT'::varchar context_tier
+          FROM model_price WHERE id=$1 AND platform_model_id=$2
+            AND (provider_instance_id IS NULL OR provider_instance_id=$3)
+            AND status='ACTIVE' AND effective_from<=now() AND (effective_to IS NULL OR effective_to>now())
+        """, price_id, platform_model_id, provider_instance_id)
     if not row:
-        raise gateway_error(503, "TOKENSEA_PRICE_NOT_EFFECTIVE", "价格版本未生效或不适用于该路由")
+        raise gateway_error(503, "TOKENSEA_PRICE_NOT_CONFIGURED", "模型未匹配当前生效的供应商官方价格")
     price = dict(row)
+    price["price_components"] = parse_json_object(price.get("price_components"))
     fields = ("input_cost_per_1k", "output_cost_per_1k", "input_price_per_1k", "output_price_per_1k")
     if price["currency"] != BUDGET_CURRENCY or any(price[name] is None or Decimal(str(price[name])) < 0 for name in fields):
         raise gateway_error(503, "TOKENSEA_PRICE_INVALID", "价格版本币种不一致或存在负数价格")
@@ -970,7 +981,7 @@ async def safe_record_attempt(request_id, attempt_no, route, status, http_status
     usage = normalize_usage(usage)
     latency_ms = int((time.monotonic() - started) * 1000)
     completed_at = datetime.now(timezone.utc)
-    attempt_cost, _ = calculate_amounts(route.get("price") or {}, usage["prompt_tokens"], usage["completion_tokens"])
+    attempt_cost, _, cost_components = calculate_amounts(route.get("price") or {}, usage)
     if status != "SUCCESS":
         attempt_cost = Decimal("0")
     price = route.get("price") or {}
@@ -979,9 +990,16 @@ async def safe_record_attempt(request_id, attempt_no, route, status, http_status
                "runtime_model_name": route.get("runtime_model_name"), "price_version_id": route.get("price", {}).get("id"),
                "status": status, "http_status": http_status, "error_code": error_code,
                **usage, "latency_ms": latency_ms, "actual_cost_amount": str(attempt_cost),
-               "cost_snapshot": {"priceVersionId": price.get("id"), "currency": price.get("currency"),
+               "cost_snapshot": {"priceVersionId": price.get("id"), "priceLayer": price.get("price_layer"),
+                                 "currency": price.get("currency"), "sourceRef": price.get("source_ref"),
+                                 "evidenceHash": price.get("evidence_hash"),
                                  "inputCostPer1k": str(price.get("input_cost_per_1k", "0")),
-                                 "outputCostPer1k": str(price.get("output_cost_per_1k", "0"))},
+                                 "outputCostPer1k": str(price.get("output_cost_per_1k", "0")),
+                                 "priceComponents": price.get("price_components") or {},
+                                 "costComponents": cost_components,
+                                 "cacheReadTokens": usage.get("cache_read_tokens", 0),
+                                 "cacheWriteTokens": usage.get("cache_write_tokens", 0),
+                                 "reasoningTokens": usage.get("reasoning_tokens", 0)},
                "started_at": (completed_at - timedelta(milliseconds=latency_ms)).isoformat(),
                "completed_at": completed_at.isoformat()}
     try:
@@ -1015,20 +1033,26 @@ async def persist_usage(payload: Dict[str, Any]):
        payload.get("budget_status", "NOT_APPLICABLE"), payload.get("accounting_status", "COMMITTED"))
     await pool.execute("""
       INSERT INTO usage_cost_snapshot(id,request_id,usage_record_id,price_version_id,price_layer,currency,
-        input_amount_per_1k,output_amount_per_1k,prompt_tokens,completion_tokens,actual_cost_amount,source_ref)
-      VALUES($1,$2,$3,$4,'CHANNEL_ACTUAL',$5,$6,$7,$8,$9,$10,$11)
-      ON CONFLICT(request_id) DO UPDATE SET prompt_tokens=EXCLUDED.prompt_tokens,
-        completion_tokens=EXCLUDED.completion_tokens,actual_cost_amount=EXCLUDED.actual_cost_amount
+        input_amount_per_1k,output_amount_per_1k,prompt_tokens,completion_tokens,actual_cost_amount,source_ref,
+        cache_read_tokens,cache_write_tokens,reasoning_tokens,price_components,cost_components,pricing_model,
+        response_model,provider_instance_id,model_deployment_id,calculator_version,evidence_hash)
+      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16::jsonb,$17::jsonb,$18,$19,$20,$21,$22,$23)
+      ON CONFLICT(request_id) DO NOTHING
     """, hashlib.sha256(f"cost:{payload['request_id']}".encode()).hexdigest()[:32], payload["request_id"], payload["id"],
-       payload["price_version_id"], payload["currency"], Decimal(payload.get("input_cost_per_1k") or "0"),
-       Decimal(payload.get("output_cost_per_1k") or "0"), payload["prompt_tokens"], payload["completion_tokens"],
-       Decimal(payload["cost_amount"]), payload.get("price_source_ref"))
+       payload["price_version_id"], payload.get("price_layer") or "PROVIDER_OFFICIAL", payload["currency"],
+       Decimal(payload.get("input_cost_per_1k") or "0"), Decimal(payload.get("output_cost_per_1k") or "0"),
+       payload["prompt_tokens"], payload["completion_tokens"], Decimal(payload["cost_amount"]),
+       payload.get("price_source_ref"), payload.get("cache_read_tokens", 0), payload.get("cache_write_tokens", 0),
+       payload.get("reasoning_tokens", 0), json.dumps(payload.get("price_components") or {}, ensure_ascii=False),
+       json.dumps(payload.get("cost_components") or {}, ensure_ascii=False), payload.get("pricing_model"),
+       payload.get("response_model"), payload.get("provider_instance_id"), payload.get("model_deployment_id"),
+       "2.0.0", payload.get("evidence_hash"))
 
 
 async def finalize_request(request_id, key_ctx, route, model_alias, usage, status, error_code,
                            started, fallback_chain, budget):
     usage = normalize_usage(usage)
-    cost, sales = calculate_amounts(route["price"], usage["prompt_tokens"], usage["completion_tokens"])
+    cost, sales, cost_components = calculate_amounts(route["price"], usage)
     if status != "SUCCESS":
         cost = sales = Decimal("0")
     budget_status = "SETTLED"
@@ -1054,9 +1078,17 @@ async def finalize_request(request_id, key_ctx, route, model_alias, usage, statu
                "status": status, "error_code": error_code, "latency_ms": int((time.monotonic() - started) * 1000),
                "fallback_chain": json.dumps(fallback_chain, ensure_ascii=False),
                "price_version_id": route["price"]["id"],
+               "price_layer": route["price"].get("price_layer") or "PROVIDER_OFFICIAL",
                "input_cost_per_1k": str(route["price"]["input_cost_per_1k"]),
                "output_cost_per_1k": str(route["price"]["output_cost_per_1k"]),
-               "price_source_ref": "model_price:"+str(route["price"]["id"]),
+               "price_source_ref": route["price"].get("source_ref") or "price_version:"+str(route["price"]["id"]),
+               "price_components": route["price"].get("price_components") or {},
+               "cost_components": cost_components,
+               "evidence_hash": route["price"].get("evidence_hash"),
+               "pricing_model": route.get("runtime_model_name"),
+               "response_model": usage.get("response_model"),
+               "provider_instance_id": route.get("provider_id"),
+               "model_deployment_id": route["price"].get("channel_deployment_id"),
                "budget_reserved_amount": str(budget.get("amount") or Decimal("0")),
                "budget_status": budget_status, "accounting_status": "COMMITTED"}
     try:
@@ -1546,28 +1578,71 @@ def estimate_reserved_tokens(body: Dict[str, Any]) -> int:
     return input_upper_bound + output
 
 
-def calculate_amounts(price: Dict[str, Any], prompt_tokens: int, completion_tokens: int):
-    cost = (Decimal(prompt_tokens) * Decimal(str(price["input_cost_per_1k"])) +
-            Decimal(completion_tokens) * Decimal(str(price["output_cost_per_1k"]))) / Decimal(1000)
-    sales = (Decimal(prompt_tokens) * Decimal(str(price["input_price_per_1k"])) +
-             Decimal(completion_tokens) * Decimal(str(price["output_price_per_1k"]))) / Decimal(1000)
-    return cost, sales
+def calculate_amounts(price: Dict[str, Any], usage: Dict[str, Any]):
+    usage = normalize_usage(usage)
+    components = parse_json_object(price.get("price_components"))
+    if not components:
+        components = {
+            "INPUT_TOKEN": {"unitPrice": price.get("input_cost_per_1k", "0"), "unitBasis": "PER_1K_TOKENS"},
+            "OUTPUT_TOKEN": {"unitPrice": price.get("output_cost_per_1k", "0"), "unitBasis": "PER_1K_TOKENS"},
+        }
+    prompt_tokens = usage["prompt_tokens"]
+    completion_tokens = usage["completion_tokens"]
+    cache_read_tokens = usage.get("cache_read_tokens", 0)
+    cache_write_tokens = usage.get("cache_write_tokens", 0)
+    reasoning_tokens = usage.get("reasoning_tokens", 0)
+    input_tokens = prompt_tokens
+    output_tokens = completion_tokens
+    if "CACHE_READ_TOKEN" in components and usage.get("cache_read_in_prompt"):
+        input_tokens = max(0, input_tokens - cache_read_tokens)
+    if "CACHE_WRITE_TOKEN" in components and usage.get("cache_write_in_prompt"):
+        input_tokens = max(0, input_tokens - cache_write_tokens)
+    if "REASONING_TOKEN" in components and usage.get("reasoning_in_completion"):
+        output_tokens = max(0, output_tokens - reasoning_tokens)
+    token_counts = {
+        "INPUT_TOKEN": input_tokens,
+        "OUTPUT_TOKEN": output_tokens,
+        "CACHE_READ_TOKEN": cache_read_tokens,
+        "CACHE_WRITE_TOKEN": cache_write_tokens,
+        "REASONING_TOKEN": reasoning_tokens,
+    }
+    cost_components: Dict[str, str] = {}
+    cost = Decimal("0")
+    for component_type, count in token_counts.items():
+        spec = components.get(component_type)
+        if not isinstance(spec, dict) or count <= 0:
+            continue
+        basis = str(spec.get("unitBasis") or "PER_1K_TOKENS")
+        if basis != "PER_1K_TOKENS":
+            continue
+        amount = Decimal(count) * Decimal(str(spec.get("unitPrice") or "0")) / Decimal(1000)
+        cost += amount
+        cost_components[component_type] = str(amount)
+    if not price.get("internal_price_id"):
+        sales = cost
+    else:
+        sales = (Decimal(prompt_tokens) * Decimal(str(price["input_price_per_1k"])) +
+                 Decimal(completion_tokens) * Decimal(str(price["output_price_per_1k"]))) / Decimal(1000)
+    return cost, sales, cost_components
 
 
 def money_micro(value: Decimal) -> int:
     return int((value * Decimal(1_000_000)).to_integral_value(rounding=ROUND_CEILING))
 
 
-def extract_usage(data: Any) -> Dict[str, int]:
+def extract_usage(data: Any) -> Dict[str, Any]:
     if isinstance(data, dict):
-        if isinstance(data.get("usage"), dict):
-            return normalize_usage(data["usage"])
-        if isinstance(data.get("response"), dict):
-            return extract_usage(data["response"])
+        response = data.get("response") if isinstance(data.get("response"), dict) else data
+        if isinstance(response.get("usage"), dict):
+            normalized = normalize_usage(response["usage"])
+            normalized["response_model"] = response.get("model") or data.get("model")
+            return normalized
+        if response is not data:
+            return extract_usage(response)
     return empty_usage()
 
 
-def usage_from_sse_line(line: bytes) -> Dict[str, int]:
+def usage_from_sse_line(line: bytes) -> Dict[str, Any]:
     if not line.startswith(b"data:"):
         return empty_usage()
     raw = line[5:].strip()
@@ -1580,20 +1655,66 @@ def usage_from_sse_line(line: bytes) -> Dict[str, int]:
 
 
 def merge_usage(target, incoming):
-    if incoming.get("total_tokens", 0) > 0:
+    if incoming.get("response_model"):
+        target["response_model"] = incoming["response_model"]
+    if incoming.get("total_tokens", 0) >= target.get("total_tokens", 0) and incoming.get("total_tokens", 0) > 0:
         target.update(incoming)
 
 
-def normalize_usage(usage: Any) -> Dict[str, int]:
+def normalize_usage(usage: Any) -> Dict[str, Any]:
     usage = usage if isinstance(usage, dict) else {}
+    prompt_details = usage.get("prompt_tokens_details") if isinstance(usage.get("prompt_tokens_details"), dict) else {}
+    completion_details = usage.get("completion_tokens_details") if isinstance(usage.get("completion_tokens_details"), dict) else {}
     prompt = nonnegative_int(usage.get("prompt_tokens", usage.get("input_tokens", 0)))
     completion = nonnegative_int(usage.get("completion_tokens", usage.get("output_tokens", 0)))
-    total = nonnegative_int(usage.get("total_tokens", prompt + completion))
-    return {"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": total or prompt + completion}
+    cache_read_nested = prompt_details.get("cached_tokens")
+    cache_read = nonnegative_int(cache_read_nested if cache_read_nested is not None else
+                                 usage.get("cache_read_input_tokens", usage.get("cache_read_tokens", usage.get("cached_tokens", 0))))
+    cache_write = nonnegative_int(usage.get("cache_creation_input_tokens",
+                                           usage.get("cache_write_input_tokens", usage.get("cache_write_tokens", 0))))
+    reasoning_nested = completion_details.get("reasoning_tokens")
+    reasoning = nonnegative_int(reasoning_nested if reasoning_nested is not None else usage.get("reasoning_tokens", 0))
+    total = nonnegative_int(usage.get("total_tokens", prompt + completion +
+                                      (0 if cache_read_nested is not None else cache_read) + cache_write))
+    return {
+        "prompt_tokens": prompt,
+        "completion_tokens": completion,
+        "total_tokens": total or prompt + completion,
+        "cache_read_tokens": cache_read,
+        "cache_write_tokens": cache_write,
+        "reasoning_tokens": reasoning,
+        "cache_read_in_prompt": cache_read_nested is not None or bool(usage.get("cache_read_in_prompt")),
+        "cache_write_in_prompt": bool(usage.get("cache_write_in_prompt")),
+        "reasoning_in_completion": reasoning_nested is not None or bool(usage.get("reasoning_in_completion", reasoning > 0)),
+        "response_model": usage.get("response_model"),
+    }
 
 
 def empty_usage():
-    return {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    return {
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": 0,
+        "cache_read_in_prompt": False,
+        "cache_write_in_prompt": False,
+        "reasoning_in_completion": False,
+        "response_model": None,
+    }
+
+
+def parse_json_object(value: Any) -> Dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if not value:
+        return {}
+    try:
+        parsed = json.loads(str(value))
+        return parsed if isinstance(parsed, dict) else {}
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
 
 
 def bounded_int(value: Any, minimum: int, maximum: int) -> int:

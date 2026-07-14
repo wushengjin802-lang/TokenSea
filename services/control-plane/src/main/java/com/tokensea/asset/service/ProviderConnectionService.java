@@ -115,6 +115,8 @@ public class ProviderConnectionService {
         if(!allowedHosts.contains(host)||!allowedPorts.contains(port))throw new IllegalArgumentException();
         return new Target(URI.create(baseValue.replaceAll("/+$","")+"/models"),host,port);
     }
+    public String resolveManagedApiKey(ProviderInstance instance){return resolveApiKey(instance);}
+    public void applyManagedAuthentication(HttpRequest.Builder request,ProviderInstance instance,String apiKey){applyAuthentication(request,instance.getApiStyle(),apiKey);}
     private String resolveApiKey(ProviderInstance instance){
         ProviderSecret secret=null;String ref=instance.getCredentialRef();
         if(ref!=null&&!ref.isBlank()){String id=ref.startsWith("secret:")?ref.substring(7):ref;secret=secrets.selectById(id);if(secret==null||!instance.getId().equals(secret.getProviderInstanceId())||!"ACTIVE".equals(secret.getStatus()))throw new IllegalStateException();}

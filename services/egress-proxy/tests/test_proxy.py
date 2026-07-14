@@ -74,6 +74,17 @@ def test_wildcard_allowlist_is_rejected():
         parse_allowed_hosts("*.example.com")
 
 
+def test_dynamic_allowlist_is_merged_without_changing_baseline():
+    policy = EgressPolicy(frozenset({"api.example.com"}), frozenset({443}))
+    policy.replace_dynamic_hosts(["prices.example.com"])
+    assert policy.validate_host_port("api.example.com", 443) == "api.example.com"
+    assert policy.validate_host_port("prices.example.com", 443) == "prices.example.com"
+    assert policy.allowed_hosts == frozenset({"api.example.com"})
+    policy.replace_dynamic_hosts([])
+    with pytest.raises(ProxyError):
+        policy.validate_host_port("prices.example.com", 443)
+
+
 def test_connect_authority_parsing():
     assert parse_authority("api.example.com:443") == ("api.example.com", 443)
     assert parse_authority("[2606:4700:4700::1111]:443") == ("2606:4700:4700::1111", 443)

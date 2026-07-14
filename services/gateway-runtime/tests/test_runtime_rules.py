@@ -73,18 +73,42 @@ class RuntimeRulesTest(unittest.TestCase):
         gateway.validate_visibility('["t1"]', {"tenant_id": "t1", "tenant_type": "INTERNAL"})
         with self.assertRaises(HTTPException):
             gateway.validate_visibility('["t2"]', {"tenant_id": "t1", "tenant_type": "INTERNAL"})
-        cost, sales = gateway.calculate_amounts({
+        usage = {"prompt_tokens": 1000, "completion_tokens": 500, "total_tokens": 1500}
+        cost, sales, components = gateway.calculate_amounts({
             "input_cost_per_1k": "1", "output_cost_per_1k": "2",
-            "input_price_per_1k": "3", "output_price_per_1k": "4"
-        }, 1000, 500)
+            "input_price_per_1k": "3", "output_price_per_1k": "4",
+            "internal_price_id": "internal-1"
+        }, usage)
         self.assertEqual(gateway.Decimal("2"), cost)
         self.assertEqual(gateway.Decimal("5"), sales)
-        zero_cost, zero_sales = gateway.calculate_amounts({
+        self.assertEqual("1", components["INPUT_TOKEN"])
+        zero_cost, zero_sales, _ = gateway.calculate_amounts({
             "input_cost_per_1k": "0", "output_cost_per_1k": "0",
             "input_price_per_1k": "0", "output_price_per_1k": "0"
-        }, 1000, 500)
+        }, usage)
         self.assertEqual(Decimal("0"), zero_cost)
         self.assertEqual(Decimal("0"), zero_sales)
+
+    def test_cache_tokens_use_component_price_without_double_counting(self):
+        usage = gateway.normalize_usage({
+            "prompt_tokens": 1000,
+            "completion_tokens": 100,
+            "prompt_tokens_details": {"cached_tokens": 400},
+        })
+        cost, sales, components = gateway.calculate_amounts({
+            "input_cost_per_1k": "1",
+            "output_cost_per_1k": "2",
+            "input_price_per_1k": "1",
+            "output_price_per_1k": "2",
+            "price_components": {
+                "INPUT_TOKEN": {"unitPrice": "1", "unitBasis": "PER_1K_TOKENS"},
+                "OUTPUT_TOKEN": {"unitPrice": "2", "unitBasis": "PER_1K_TOKENS"},
+                "CACHE_READ_TOKEN": {"unitPrice": "0.1", "unitBasis": "PER_1K_TOKENS"},
+            },
+        }, usage)
+        self.assertEqual(Decimal("0.84"), cost)
+        self.assertEqual(cost, sales)
+        self.assertEqual("0.04", components["CACHE_READ_TOKEN"])
 
     def test_java_crypto_fixed_vectors_v2_and_legacy(self):
         previous = gateway.CRYPTO_KEY
