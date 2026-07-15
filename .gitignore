@@ -7,10 +7,15 @@
 # Build and runtime output
 **/target/
 **/__pycache__/
+**/.venv/
 *.py[cod]
 configs/gateway/runtime.generated.yaml
+services/gateway-runtime/runtime-data/outbox/
 
 # Local generated reports and frontend artifacts
 docs/assessment/
 **/dist/
 node_modules/
+
+# Local development launch overrides may contain credentials.
+scripts/dev/*.local.ps1
