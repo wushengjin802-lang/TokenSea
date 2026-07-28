@@ -3,11 +3,14 @@ package com.tokensea.asset.controller;
 import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.tokensea.asset.entity.ProviderInstance;
+import com.tokensea.asset.entity.ProviderTemplate;
 import com.tokensea.asset.mapper.ProviderInstanceMapper;
+import com.tokensea.asset.mapper.ProviderTemplateMapper;
 import com.tokensea.asset.service.ProviderConnectionService;
 import com.tokensea.audit.entity.AuditLog;
 import com.tokensea.audit.mapper.AuditLogMapper;
 import com.tokensea.common.ApiResponse;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpStatus;
 import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.web.bind.annotation.*;
@@ -22,16 +25,19 @@ import java.util.UUID;
 @RequestMapping("/api/provider-instances")
 public class ProviderInstanceController {
     private static final Set<String> STATUSES = Set.of("启用", "暂停", "停用");
-    private static final long TEST_VALID_MINUTES = 30;
+    @Value("${tokensea.provider.connection-test-valid-minutes:10080}")
+    private long testValidMinutes = 10080;
     private final ProviderInstanceMapper mapper;
+    private final ProviderTemplateMapper templates;
     private final ProviderConnectionService connections;
     private final AuditLogMapper audits;
     private final ObjectMapper json;
     private final TransactionTemplate transactions;
 
-    public ProviderInstanceController(ProviderInstanceMapper mapper, ProviderConnectionService connections,
+    public ProviderInstanceController(ProviderInstanceMapper mapper, ProviderTemplateMapper templates,
+                                      ProviderConnectionService connections,
                                       AuditLogMapper audits, ObjectMapper json, TransactionTemplate transactions) {
-        this.mapper = mapper; this.connections = connections; this.audits = audits;
+        this.mapper = mapper; this.templates = templates; this.connections = connections; this.audits = audits;
         this.json = json; this.transactions = transactions;
     }
 
@@ -47,8 +53,19 @@ public class ProviderInstanceController {
 
     @PostMapping
     public ApiResponse<ProviderInstance> create(@RequestBody CreateRequest req) {
-        if (blank(req.instanceName()) || blank(req.providerType()) || blank(req.apiStyle())) {
-            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "实例名称、来源模板和协议不能为空");
+        if (req == null || blank(req.instanceName()) || blank(req.providerTemplateId())) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "渠道名称和供应商模板不能为空");
+        }
+        ProviderTemplate template = templates.selectById(req.providerTemplateId());
+        if (template == null || blank(template.getProviderType())) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "所选供应商模板不存在或未配置供应商类型");
+        }
+        String apiStyle = blank(req.apiStyle())
+                ? blank(template.getProtocol()) ? null : protocolToApiStyle(template.getProtocol())
+                : req.apiStyle();
+        String apiBase = blank(req.apiBase()) ? template.getDefaultApiBase() : req.apiBase();
+        if (blank(apiStyle) || blank(apiBase)) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "所选供应商模板未配置协议或默认 API 地址");
         }
         if (mapper.selectCount(new QueryWrapper<ProviderInstance>().eq("instance_name", req.instanceName())) > 0) {
             throw new ResponseStatusException(HttpStatus.CONFLICT, "供应商渠道名称已存在");
@@ -56,7 +73,7 @@ public class ProviderInstanceController {
         return ApiResponse.ok(transactions.execute(status -> {
             ProviderInstance value = new ProviderInstance();
             value.setProviderTemplateId(req.providerTemplateId()); value.setInstanceName(req.instanceName());
-            value.setProviderType(req.providerType()); value.setApiStyle(req.apiStyle()); value.setApiBase(req.apiBase());
+            value.setProviderType(template.getProviderType()); value.setApiStyle(apiStyle); value.setApiBase(apiBase);
             value.setRegion(req.region()); value.setEnvironment(blank(req.environment()) ? "生产" : req.environment());
             value.setOwner(req.owner()); value.setRateLimitRpm(req.rateLimitRpm()); value.setRateLimitTpm(req.rateLimitTpm());
             value.setCredentialRef(null); value.setKeyStatus("未配置"); value.setHealthStatus("观察");
@@ -93,9 +110,9 @@ public class ProviderInstanceController {
             ProviderInstance before = require(id);
             current.setLastConnectionTestAt(OffsetDateTime.now());
             current.setLastConnectionTestStatus(result.success() ? "成功" : "失败");
-            current.setLastConnectionTestError(result.error());
+            current.setLastConnectionTestError(result.success() ? null : result.errorCode() + ": " + result.error());
             current.setLastConnectionTestHost(result.targetHost());
-            current.setLastConnectionTestAddresses(result.targetHost());
+            current.setLastConnectionTestAddresses(result.resolvedAddresses());
             current.setLastConnectionTestPort(result.targetPort());
             current.setHealthStatus(result.success() ? "健康" : "异常");
             mapper.updateById(current); audit("TEST_CONNECTION", current, before); return current;
@@ -110,7 +127,8 @@ public class ProviderInstanceController {
         return ApiResponse.ok(transactions.execute(tx -> {
             ProviderInstance value = require(id); ProviderInstance before = require(id);
             if ("启用".equals(req.status()) && !recentlyVerified(value)) {
-                throw new ResponseStatusException(HttpStatus.CONFLICT, "渠道必须在最近 30 分钟内通过连接测试后才能启用");
+                throw new ResponseStatusException(HttpStatus.CONFLICT,
+                        "渠道必须在最近 " + testValidMinutes + " 分钟内通过连接测试后才能启用");
             }
             value.setStatus(req.status()); mapper.updateById(value); audit("STATE_CHANGE", value, before); return value;
         }));
@@ -122,7 +140,7 @@ public class ProviderInstanceController {
 
     private boolean recentlyVerified(ProviderInstance value) {
         return "成功".equals(value.getLastConnectionTestStatus()) && value.getLastConnectionTestAt() != null
-                && value.getLastConnectionTestAt().isAfter(OffsetDateTime.now().minusMinutes(TEST_VALID_MINUTES))
+                && value.getLastConnectionTestAt().isAfter(OffsetDateTime.now().minusMinutes(testValidMinutes))
                 && ("无需 Key".equals(value.getKeyStatus()) || "已托管".equals(value.getKeyStatus()) || "已配置".equals(value.getKeyStatus()));
     }
     private static void clearConnectionResult(ProviderInstance value) {
@@ -143,6 +161,14 @@ public class ProviderInstanceController {
             log.setBeforeValue(before == null ? null : json.writeValueAsString(before)); log.setAfterValue(json.writeValueAsString(after));
             audits.insert(log);
         } catch (Exception e) { throw new IllegalStateException("关键操作审计写入失败", e); }
+    }
+    private static String protocolToApiStyle(String protocol) {
+        String value = protocol == null ? "" : protocol.toLowerCase();
+        if (value.contains("azure")) return "azure";
+        if (value.contains("anthropic")) return "anthropic";
+        if (value.contains("gemini")) return "gemini";
+        if (value.contains("vllm")) return "vllm";
+        return "openai_compatible";
     }
     private static boolean blank(String value) { return value == null || value.isBlank(); }
 }

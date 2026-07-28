@@ -3,6 +3,7 @@ import base64
 import hashlib
 import ipaddress
 import json
+import logging
 import os
 import random
 import re
@@ -22,6 +23,7 @@ import httpx
 import redis.asyncio as redis
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
 
@@ -36,20 +38,45 @@ REDIS_PASSWORD = os.getenv("TOKENSEA_REDIS_PASSWORD")
 ENGINE_URL = os.getenv("TOKENSEA_RUNTIME_ENGINE_URL", "http://localhost:39218").rstrip("/")
 ENGINE_KEY = os.getenv("TOKENSEA_RUNTIME_ENGINE_KEY")
 CRYPTO_KEY = os.getenv("TOKENSEA_CRYPTO_KEY")
-BUDGET_CURRENCY = os.getenv("TOKENSEA_BUDGET_CURRENCY", "CNY")
+BUDGET_CURRENCY = os.getenv("TOKENSEA_BUDGET_CURRENCY", "CNY").strip().upper()
+if BUDGET_CURRENCY != "CNY":
+    raise RuntimeError("TOKENSEA_BUDGET_CURRENCY 必须配置为 CNY")
 REGISTRATION_TTL = max(5, int(os.getenv("TOKENSEA_REGISTRATION_TTL_SECONDS", "60")))
 DEFAULT_OUTPUT_RESERVATION = max(1, int(os.getenv("TOKENSEA_DEFAULT_OUTPUT_RESERVATION_TOKENS", "1024")))
 TRUSTED_PROXY_CIDRS = os.getenv("TOKENSEA_TRUSTED_PROXY_CIDRS", "")
 RETRYABLE_STATUS = {408, 425, 429, 500, 502, 503, 504}
 ACTIVE_VALUES = {"ACTIVE", "启用", "已启用"}
 REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$")
-DNS_RECHECK_TTL = max(1, int(os.getenv("TOKENSEA_DNS_RECHECK_TTL_SECONDS", "10")))
+DNS_RECHECK_TTL = max(30, int(os.getenv("TOKENSEA_DNS_RECHECK_TTL_SECONDS", "300")))
+CONNECTION_TEST_MAX_AGE_SECONDS = max(
+    3600, int(os.getenv("TOKENSEA_CONNECTION_TEST_MAX_AGE_SECONDS", "604800"))
+)
+LOCAL_TEST_UPSTREAM_ENABLED = os.getenv("TOKENSEA_LOCAL_TEST_UPSTREAM_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
+LOCAL_TEST_UPSTREAM_HOSTS = {
+    value.strip().lower().rstrip(".")
+    for value in os.getenv("TOKENSEA_LOCAL_TEST_UPSTREAM_HOSTS", "").split(",")
+    if value.strip()
+}
 WAL_DIR = Path(os.getenv("TOKENSEA_OUTBOX_DIR", "/var/lib/tokensea-gateway/outbox"))
 WAL_MAX_BYTES = max(1_048_576, min(int(os.getenv("TOKENSEA_OUTBOX_MAX_BYTES", "67108864")), 1_073_741_824))
 WAL_FILE_NAME = "gateway-outbox.wal"
 WAL_DEAD_FILE_NAME = "gateway-outbox.dead.wal"
 OUTBOX_MAX_ATTEMPTS = max(1, int(os.getenv("TOKENSEA_OUTBOX_MAX_ATTEMPTS", "12")))
 INTENT_RECOVERY_SECONDS = max(300, int(os.getenv("TOKENSEA_INTENT_RECOVERY_SECONDS", "86400")))
+def configured_cors_origins() -> list[str]:
+    raw = (
+        os.getenv("TOKENSEA_CORS_ORIGINS")
+        or os.getenv("TOKENSEA_CORS_ALLOWED_ORIGINS")
+        or "http://localhost:39210,http://127.0.0.1:39210"
+    )
+    return [origin.strip().rstrip("/") for origin in raw.split(",") if origin.strip()]
+
+
+CORS_ORIGINS = configured_cors_origins()
+CORS_ORIGIN_REGEX = os.getenv(
+    "TOKENSEA_CORS_ORIGIN_REGEX",
+    r"^https?://(?:(?:localhost|127\.0\.0\.1|\[::1\])|(?:10(?:\.\d{1,3}){3})|(?:192\.168(?:\.\d{1,3}){2})|(?:172\.(?:1[6-9]|2\d|3[01])(?:\.\d{1,3}){2}))(?::39210)?$",
+).strip()
 
 REQUESTS = Counter("tokensea_gateway_requests_total", "Gateway requests", ["endpoint", "status"])
 LATENCY = Histogram("tokensea_gateway_latency_seconds", "Gateway latency", ["endpoint"])
@@ -61,6 +88,8 @@ runtime_model_lock = asyncio.Lock()
 outbox_task: Optional[asyncio.Task] = None
 wal_lock = threading.Lock()
 wal_pending: Dict[str, Dict[str, Any]] = {}
+dns_validation_cache: Dict[str, Dict[str, Any]] = {}
+LOGGER = logging.getLogger("tokensea.gateway")
 
 RATE_LIMIT_LUA = """
 for i=1,#KEYS do
@@ -304,7 +333,15 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="TokenSea Gateway Runtime", version="0.3.0", lifespan=lifespan)
-
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=CORS_ORIGINS,
+    allow_origin_regex=CORS_ORIGIN_REGEX or None,
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-Request-ID"],
+    expose_headers=["X-Request-ID"],
+)
 
 
 @app.get("/health")
@@ -321,18 +358,31 @@ async def readiness():
         database_missing = True
     missing = (["database"] if database_missing else []) + [name for name, value in
         (("runtimeKey", ENGINE_KEY), ("cryptoKey", CRYPTO_KEY), ("redisPassword", REDIS_PASSWORD)) if not value]
-    if missing or pool is None or cache is None:
-        return JSONResponse({"status": "not_ready", "missing": missing}, status_code=503)
+    if pool is None:
+        missing.append("databasePool")
+    if cache is None:
+        missing.append("redisClient")
+    if missing:
+        return JSONResponse({"status": "not_ready", "failed": "configuration", "missing": sorted(set(missing))}, status_code=503)
     try:
         await pool.fetchval("SELECT 1")
+    except Exception as exc:
+        LOGGER.exception("gateway_readiness_failed dependency=database")
+        return JSONResponse({"status": "not_ready", "failed": "database", "errorType": type(exc).__name__}, status_code=503)
+    try:
         if not await cache.ping():
-            raise RuntimeError("redis unavailable")
-        async with httpx.AsyncClient(timeout=5) as client:
+            raise RuntimeError("redis ping returned false")
+    except Exception as exc:
+        LOGGER.exception("gateway_readiness_failed dependency=redis")
+        return JSONResponse({"status": "not_ready", "failed": "redis", "errorType": type(exc).__name__}, status_code=503)
+    try:
+        async with httpx.AsyncClient(timeout=5, trust_env=False) as client:
             response = await client.get(f"{ENGINE_URL}/health/liveliness")
         if response.status_code >= 300:
-            raise RuntimeError("runtime unavailable")
-    except Exception:
-        return JSONResponse({"status": "not_ready"}, status_code=503)
+            raise RuntimeError(f"runtime status {response.status_code}")
+    except Exception as exc:
+        LOGGER.exception("gateway_readiness_failed dependency=runtime-core url=%s", ENGINE_URL)
+        return JSONResponse({"status": "not_ready", "failed": "runtime-core", "errorType": type(exc).__name__}, status_code=503)
     return {"status": "ready", "service": "tokensea-gateway-runtime"}
 
 
@@ -361,15 +411,21 @@ async def models(request: Request):
     require_runtime_settings()
     key_ctx = await validate_key(extract_bearer(request), request_ip(request))
     assert pool is not None
-    rows = await pool.fetch("SELECT platform_model_name FROM platform_model WHERE status='已发布' ORDER BY platform_model_name")
+    rows = await pool.fetch("""
+      SELECT pm.platform_model_name,pm.visibility_scope
+      FROM platform_model pm
+      JOIN route_policy rp ON rp.id=pm.route_policy_id
+      WHERE pm.status='已发布' AND UPPER(rp.status)='ACTIVE'
+        AND rp.model_alias=pm.platform_model_name
+      ORDER BY pm.platform_model_name
+    """)
     data = []
     for row in rows:
         alias = row["platform_model_name"]
         try:
             validate_model_scope(key_ctx, alias)
-            routes = await select_routes(alias, key_ctx)
-            if routes:
-                data.append({"id": alias, "object": "model", "owned_by": "tokensea"})
+            validate_visibility(row["visibility_scope"], key_ctx)
+            data.append({"id": alias, "object": "model", "owned_by": "tokensea"})
         except HTTPException:
             continue
     return {"object": "list", "data": data}
@@ -418,10 +474,20 @@ async def proxy_openai_compatible(request: Request, endpoint: str):
         return await execute_non_stream(endpoint, body, request_id, started, key_ctx, routes, budget)
     except HTTPException as exc:
         REQUESTS.labels(endpoint=endpoint, status="FAILED").inc()
+        LATENCY.labels(endpoint=endpoint).observe(time.monotonic() - started)
+        headers = dict(exc.headers or {})
+        headers.setdefault("x-request-id", request_id)
+        exc.headers = headers
         raise exc
     except Exception:
         REQUESTS.labels(endpoint=endpoint, status="FAILED").inc()
-        raise gateway_error(502, "TOKENSEA_GATEWAY_ERROR", "网关暂时无法处理请求")
+        LATENCY.labels(endpoint=endpoint).observe(time.monotonic() - started)
+        LOGGER.exception("gateway_unhandled_error request_id=%s endpoint=%s", request_id, endpoint)
+        return JSONResponse(
+            error_body("TOKENSEA_GATEWAY_ERROR", "网关内部异常，请根据请求 ID 检查 Gateway 日志"),
+            status_code=502,
+            headers={"x-request-id": request_id},
+        )
     finally:
         if budget and not deferred_budget:
             if not await release_budget_safely(budget):
@@ -471,20 +537,33 @@ async def execute_non_stream(endpoint, body, request_id, started, key_ctx, route
             attempt_started = time.monotonic()
             await reserve_provider_limits(route, estimate_reserved_tokens(body))
             try:
-                await ensure_runtime_model(route)
+                try:
+                    await ensure_runtime_model(route)
+                except HTTPException:
+                    raise
+                except Exception:
+                    LOGGER.exception(
+                        "runtime_model_prepare_failed request_id=%s provider_id=%s runtime_model=%s",
+                        request_id, route.get("provider_id"), route.get("runtime_model_name"),
+                    )
+                    raise gateway_error(
+                        503,
+                        "TOKENSEA_RUNTIME_CONFIG_FAILED",
+                        "运行时模型配置失败，请根据请求 ID 检查 Gateway 日志",
+                    )
                 payload = dict(body)
                 payload["model"] = route["runtime_alias"]
-                async with httpx.AsyncClient(timeout=request_timeout(route)) as client:
+                async with httpx.AsyncClient(timeout=request_timeout(route), trust_env=False) as client:
                     response = await client.post(f"{ENGINE_URL}{endpoint}", headers=runtime_headers(request_id), json=payload)
                 data = safe_json(response)
                 if is_runtime_model_missing(response, data):
                     invalidate_runtime_model(route)
                     await ensure_runtime_model(route, force=True)
-                    async with httpx.AsyncClient(timeout=request_timeout(route)) as client:
+                    async with httpx.AsyncClient(timeout=request_timeout(route), trust_env=False) as client:
                         payload["model"] = route["runtime_alias"]
                         response = await client.post(f"{ENGINE_URL}{endpoint}", headers=runtime_headers(request_id), json=payload)
                     data = safe_json(response)
-                usage = extract_usage(data)
+                usage = extract_usage(data, route.get("provider_name"))
                 error_code = None if response.status_code < 400 else normalize_error(response.status_code)
                 status = "SUCCESS" if response.status_code < 400 else "FAILED"
                 if status == "SUCCESS" and usage["total_tokens"] <= 0:
@@ -534,10 +613,27 @@ async def execute_stream(endpoint, body, request_id, started, key_ctx, routes, b
             client: Optional[httpx.AsyncClient] = None
             response: Optional[httpx.Response] = None
             try:
-                await ensure_runtime_model(route)
+                try:
+                    await ensure_runtime_model(route)
+                except HTTPException:
+                    raise
+                except Exception:
+                    LOGGER.exception(
+                        "runtime_model_prepare_failed request_id=%s provider_id=%s runtime_model=%s",
+                        request_id, route.get("provider_id"), route.get("runtime_model_name"),
+                    )
+                    raise gateway_error(
+                        503,
+                        "TOKENSEA_RUNTIME_CONFIG_FAILED",
+                        "运行时模型配置失败，请根据请求 ID 检查 Gateway 日志",
+                    )
                 payload = dict(body)
                 payload["model"] = route["runtime_alias"]
-                client = httpx.AsyncClient(timeout=request_timeout(route))
+                if payload.get("stream"):
+                    stream_options = dict(payload.get("stream_options") or {})
+                    stream_options["include_usage"] = True
+                    payload["stream_options"] = stream_options
+                client = httpx.AsyncClient(timeout=request_timeout(route), trust_env=False)
                 upstream_request = client.build_request("POST", f"{ENGINE_URL}{endpoint}", headers=runtime_headers(request_id), json=payload)
                 response = await client.send(upstream_request, stream=True)
                 if response.status_code >= 400:
@@ -550,7 +646,7 @@ async def execute_stream(endpoint, body, request_id, started, key_ctx, routes, b
                         invalidate_runtime_model(route)
                         await ensure_runtime_model(route, force=True)
                         payload["model"] = route["runtime_alias"]
-                        client = httpx.AsyncClient(timeout=request_timeout(route))
+                        client = httpx.AsyncClient(timeout=request_timeout(route), trust_env=False)
                         retry_request = client.build_request("POST", f"{ENGINE_URL}{endpoint}",
                                                              headers=runtime_headers(request_id), json=payload)
                         response = await client.send(retry_request, stream=True)
@@ -572,6 +668,8 @@ async def execute_stream(endpoint, body, request_id, started, key_ctx, routes, b
                         break
                     await finalize_request(request_id, key_ctx, route, body["model"], {}, "FAILED", code,
                                          started, fallback_chain, budget)
+                    REQUESTS.labels(endpoint=endpoint, status="FAILED").inc()
+                    LATENCY.labels(endpoint=endpoint).observe(time.monotonic() - started)
                     return JSONResponse(error_body(code, "上游拒绝请求"), status_code=stable_gateway_status(response.status_code),
                                         headers={"x-request-id": request_id})
                 return stream_response(response, client, endpoint, body["model"], request_id, started, key_ctx,
@@ -590,6 +688,8 @@ async def execute_stream(endpoint, body, request_id, started, key_ctx, routes, b
             break
     await finalize_request(request_id, key_ctx, routes[-1], body["model"], {}, "FAILED", last_code,
                          started, fallback_chain, budget)
+    REQUESTS.labels(endpoint=endpoint, status="FAILED").inc()
+    LATENCY.labels(endpoint=endpoint).observe(time.monotonic() - started)
     return JSONResponse(error_body(last_code, "上游服务暂不可用"), status_code=stable_gateway_status(last_status),
                         headers={"x-request-id": request_id})
 
@@ -605,7 +705,7 @@ def stream_response(response, client, endpoint, model_alias, request_id, started
                 buffer += chunk
                 while b"\n" in buffer:
                     line, buffer = buffer.split(b"\n", 1)
-                    merge_usage(usage, usage_from_sse_line(line))
+                    merge_usage(usage, usage_from_sse_line(line, route.get("provider_name")))
                 yield chunk
         except asyncio.CancelledError:
             status, code = "FAILED", "TOKENSEA_CLIENT_DISCONNECTED"
@@ -722,7 +822,7 @@ async def select_routes(model_alias: str, key_ctx: Dict[str, Any]) -> List[Dict[
     rows = await pool.fetch("""
       SELECT id,provider_type,api_style,api_base,credential_ref,key_status,status,health_status,
              last_connection_test_status,last_connection_test_at,last_connection_test_host,
-             last_connection_test_addresses,rate_limit_rpm,rate_limit_tpm,updated_at
+             last_connection_test_addresses,last_connection_test_port,rate_limit_rpm,rate_limit_tpm,updated_at
       FROM provider_instance WHERE id=ANY($1::varchar[])
     """, list({m["provider_instance_id"] for m in mappings}))
     providers = {row["id"]: row for row in rows}
@@ -743,6 +843,7 @@ async def select_routes(model_alias: str, key_ctx: Dict[str, Any]) -> List[Dict[
                       "provider_rpm": instance["rate_limit_rpm"], "provider_tpm": instance["rate_limit_tpm"],
                       "verified_host": instance["last_connection_test_host"],
                       "verified_addresses": instance["last_connection_test_addresses"],
+                      "verified_port": instance["last_connection_test_port"],
                       "secret_version": secret_version, "price": price,
                       "fallback_enabled": bool(model["fallback_enabled"]),
                       "retry_backoff_ms": bounded_int(config.get("retryBackoffMs", 100), 0, 5000)})
@@ -751,24 +852,32 @@ async def select_routes(model_alias: str, key_ctx: Dict[str, Any]) -> List[Dict[
     return ordered_routes(routes, model["strategy"])
 
 
-async def load_price(price_id: Any, platform_model_id: str, provider_instance_id: str, actual_model: str) -> Dict[str, Any]:
+async def load_price(_price_id: Any, platform_model_id: str, provider_instance_id: str, actual_model: str) -> Dict[str, Any]:
     assert pool is not None
-    governed = await pool.fetchrow("""
+    row = await pool.fetchrow("""
       SELECT actual.id,actual.price_layer,actual.currency,d.id channel_deployment_id,
-             actual.input_amount_per_1k input_cost_per_1k,
-             actual.output_amount_per_1k output_cost_per_1k,
+             actual.billing_basis cost_billing_basis,
+             actual.billing_quantity cost_billing_quantity,
+             actual.input_unit_price input_cost_unit_price,
+             actual.cache_read_unit_price cache_read_cost_unit_price,
+             actual.cache_write_unit_price cache_write_cost_unit_price,
+             actual.cache_read_mode,actual.cache_write_mode,
+             actual.component_schema_version,actual.price_completeness_status,
+             actual.output_unit_price output_cost_unit_price,
              internal.id internal_price_id,
-             COALESCE(internal.input_amount_per_1k,actual.input_amount_per_1k) input_price_per_1k,
-             COALESCE(internal.output_amount_per_1k,actual.output_amount_per_1k) output_price_per_1k,
+             COALESCE(internal.billing_basis,actual.billing_basis) price_billing_basis,
+             COALESCE(internal.billing_quantity,actual.billing_quantity) price_billing_quantity,
+             COALESCE(internal.input_unit_price,actual.input_unit_price) input_price_unit_price,
+             COALESCE(internal.output_unit_price,actual.output_unit_price) output_price_unit_price,
              COALESCE(actual.source_ref,'price_version:'||actual.id) source_ref,
              actual.price_components,actual.evidence_hash,actual.region,actual.request_mode,
              actual.service_tier,actual.context_tier
       FROM channel_model_deployment d
       JOIN LATERAL (
         SELECT * FROM price_version p WHERE p.deployment_id=d.id
-          AND p.price_layer IN ('PROVIDER_OFFICIAL','CHANNEL_ACTUAL')
+          AND p.price_layer IN ('CONTRACT_PRICE','CHANNEL_ACTUAL','PROVIDER_OFFICIAL')
           AND p.status='ACTIVE' AND p.effective_from<=now() AND (p.effective_to IS NULL OR p.effective_to>now())
-        ORDER BY CASE WHEN p.price_layer='PROVIDER_OFFICIAL' THEN 0 ELSE 1 END,
+        ORDER BY CASE p.price_layer WHEN 'CONTRACT_PRICE' THEN 0 WHEN 'CHANNEL_ACTUAL' THEN 1 ELSE 2 END,
                  p.effective_from DESC,p.version DESC LIMIT 1
       ) actual ON true
       LEFT JOIN LATERAL (
@@ -776,28 +885,54 @@ async def load_price(price_id: Any, platform_model_id: str, provider_instance_id
           AND p.status='ACTIVE' AND p.currency=actual.currency AND p.effective_from<=now()
           AND (p.effective_to IS NULL OR p.effective_to>now()) ORDER BY p.effective_from DESC,p.version DESC LIMIT 1
       ) internal ON true
-      WHERE d.provider_instance_id=$2 AND d.provider_model_name=$3 AND d.review_status='APPROVED'
-        AND d.routing_status='ELIGIBLE'
+      WHERE d.provider_instance_id=$2 AND d.provider_model_name=$3
+        AND d.production_status='APPROVED' AND d.health_status='HEALTHY'
+        AND d.discovery_status<>'MISSING_CONFIRMED' AND d.routing_status='ELIGIBLE'
+        AND (SELECT v.status FROM capability_validation v WHERE v.deployment_id=d.id
+          AND v.test_type='LIVE_PROBE' ORDER BY v.validated_at DESC LIMIT 1)='PASSED'
     """, platform_model_id, provider_instance_id, actual_model)
-    row = governed
-    if row is None and isinstance(price_id, str) and price_id:
-        row = await pool.fetchrow("""
-          SELECT id,'LEGACY_MODEL_PRICE' price_layer,currency,NULL::varchar channel_deployment_id,
-                 input_cost_per_1k,output_cost_per_1k,NULL::varchar internal_price_id,
-                 input_price_per_1k,output_price_per_1k,'model_price:'||id source_ref,'{}'::jsonb price_components,NULL::varchar evidence_hash,
-                 'global'::varchar region,'STANDARD'::varchar request_mode,
-                 'DEFAULT'::varchar service_tier,'DEFAULT'::varchar context_tier
-          FROM model_price WHERE id=$1 AND platform_model_id=$2
-            AND (provider_instance_id IS NULL OR provider_instance_id=$3)
-            AND status='ACTIVE' AND effective_from<=now() AND (effective_to IS NULL OR effective_to>now())
-        """, price_id, platform_model_id, provider_instance_id)
     if not row:
         raise gateway_error(503, "TOKENSEA_PRICE_NOT_CONFIGURED", "模型未匹配当前生效的供应商官方价格")
     price = dict(row)
-    price["price_components"] = parse_json_object(price.get("price_components"))
-    fields = ("input_cost_per_1k", "output_cost_per_1k", "input_price_per_1k", "output_price_per_1k")
-    if price["currency"] != BUDGET_CURRENCY or any(price[name] is None or Decimal(str(price[name])) < 0 for name in fields):
-        raise gateway_error(503, "TOKENSEA_PRICE_INVALID", "价格版本币种不一致或存在负数价格")
+    price["price_components"] = parse_json_array(price.get("price_components"))
+    amount_fields = ("input_cost_unit_price", "output_cost_unit_price",
+                     "input_price_unit_price", "output_price_unit_price")
+    quantity_fields = ("cost_billing_quantity", "price_billing_quantity")
+    bases = {"TOKEN", "REQUEST", "IMAGE", "SECOND", "MINUTE", "CHARACTER", "AUDIO_MINUTE", "TOKEN_SECOND"}
+    if (any(price[name] is None or Decimal(str(price[name])) < 0 for name in amount_fields) \
+            or any(price[name] is None or int(price[name]) <= 0 for name in quantity_fields) \
+            or price.get("cost_billing_basis") not in bases \
+            or price.get("price_billing_basis") not in bases):
+        raise gateway_error(503, "TOKENSEA_PRICE_INVALID", "价格版本的计费对象、计费基数或金额无效")
+    if int(price.get("component_schema_version") or 0) < 2:
+        raise gateway_error(503, "TOKENSEA_PRICE_INVALID", "价格版本组件结构不是 V2，请重新同步并激活价格")
+    completeness = str(price.get("price_completeness_status") or "PARTIAL")
+    if completeness in {"PARTIAL", "UNKNOWN_CACHE_PRICE"}:
+        raise gateway_error(503, "TOKENSEA_CACHE_PRICE_MISSING", "模型缓存价格尚未完整确认，不能用于生产计费")
+    if not price["price_components"]:
+        raise gateway_error(503, "TOKENSEA_PRICE_INVALID", "价格版本缺少价格组件")
+    if price["currency"] == BUDGET_CURRENCY:
+        price["budget_fx_rate"] = Decimal("1")
+        price["budget_currency"] = BUDGET_CURRENCY
+        price["budget_fx_rate_id"] = None
+        price["budget_fx_source_date"] = None
+    else:
+        fx = await pool.fetchrow("""
+          SELECT id,rate,source_date,source_type,source_ref
+          FROM fx_rate
+          WHERE rate_month=date_trunc('month',now() AT TIME ZONE 'Asia/Shanghai')::date
+            AND from_currency=$1 AND to_currency=$2 AND status='ACTIVE'
+          ORDER BY version DESC LIMIT 1
+        """, price["currency"], BUDGET_CURRENCY)
+        if not fx:
+            raise gateway_error(503, "TOKENSEA_FX_RATE_MISSING",
+                                f"缺少当前月份 {price['currency']} 到 {BUDGET_CURRENCY} 的汇率")
+        price["budget_fx_rate"] = Decimal(str(fx["rate"]))
+        price["budget_currency"] = BUDGET_CURRENCY
+        price["budget_fx_rate_id"] = fx["id"]
+        price["budget_fx_source_date"] = fx["source_date"]
+        price["budget_fx_source_type"] = fx["source_type"]
+        price["budget_fx_source_ref"] = fx["source_ref"]
     return price
 
 
@@ -823,15 +958,34 @@ async def reserve_provider_limits(route: Dict[str, Any], tokens: int):
     await reserve_rate_limits("provider", route["provider_id"], route, tokens)
 
 
+def estimate_price_reservation(price: Dict[str, Any], reserved_tokens: int) -> Decimal:
+    token_components = [component for component in parse_json_array(price.get("price_components"))
+                        if str(component.get("unitBasis") or "TOKEN").upper() == "TOKEN"
+                        and str(component.get("mode") or "EXPLICIT").upper()
+                        not in {"UNKNOWN", "NOT_APPLICABLE"}
+                        and component.get("unitPrice") is not None]
+    if token_components:
+        estimates = [Decimal(reserved_tokens) * Decimal(str(component["unitPrice"]))
+                     / Decimal(int(component.get("unitQuantity") or 1))
+                     for component in token_components]
+        original_amount = max(estimates)
+    else:
+        basis = str(price.get("cost_billing_basis") or "TOKEN")
+        quantity = Decimal(int(price.get("cost_billing_quantity") or 1))
+        count = Decimal(reserved_tokens if basis == "TOKEN" else 1)
+        unit_price = max(Decimal(str(price.get("input_cost_unit_price") or "0")),
+                         Decimal(str(price.get("output_cost_unit_price") or "0")))
+        original_amount = count * unit_price / quantity
+    return original_amount * Decimal(str(price.get("budget_fx_rate") or "1"))
+
+
 async def reserve_budget(key_ctx: Dict[str, Any], routes: List[Dict[str, Any]], reserved_tokens: int,
                          request_id: str, reservation_token: Optional[str] = None,
                          allow_degrade: bool = True) -> Dict[str, Any]:
     # Budgets use actual provider cost in BUDGET_CURRENCY. Reserving every estimated
     # token at the route's higher input/output cost rate is conservative, so the
     # later settlement can only release capacity under normal provider accounting.
-    amount = max(Decimal(reserved_tokens) * max(Decimal(str(route["price"]["input_cost_per_1k"])),
-                                                 Decimal(str(route["price"]["output_cost_per_1k"]))) / Decimal(1000)
-                 for route in routes)
+    amount = max(estimate_price_reservation(route["price"], reserved_tokens) for route in routes)
     amount_micro = money_micro(amount)
     scopes = [("API_KEY", "key", key_ctx["id"], key_ctx.get("budget_amount")),
               ("APP", "app", key_ctx.get("app_id"), None),
@@ -853,7 +1007,7 @@ async def reserve_budget(key_ctx: Dict[str, Any], routes: List[Dict[str, Any]], 
         rule = None
         if hasattr(pool, "fetchrow"):
             rule = await pool.fetchrow("""
-              SELECT id,amount_limit,warning_threshold_percent,over_limit_action,degrade_model_alias
+              SELECT id,currency,amount_limit,warning_threshold_percent,over_limit_action,degrade_model_alias
               FROM budget_rule WHERE scope_type=$1 AND scope_id=$2 AND status='ACTIVE' AND approval_status='APPROVED'
                 AND effective_from<=now() AND (effective_to IS NULL OR effective_to>now())
               ORDER BY version DESC LIMIT 1
@@ -861,11 +1015,26 @@ async def reserve_budget(key_ctx: Dict[str, Any], routes: List[Dict[str, Any]], 
         limit = rule["amount_limit"] if rule else legacy_limit
         if limit is None:
             continue
+        if rule and str(rule["currency"]).upper() != BUDGET_CURRENCY:
+            raise gateway_error(503, "TOKENSEA_BUDGET_CURRENCY_INVALID", "预算规则币种必须统一为 CNY")
         limit_micro = money_micro(Decimal(str(limit)))
         if limit_micro <= 0:
             raise gateway_error(402, "TOKENSEA_BUDGET_EXCEEDED", "预算额度不可用")
         column = {"key": "api_key_id", "app": "app_id", "project": "project_id", "tenant": "tenant_id"}[kind]
-        committed = await pool.fetchval(f"SELECT COALESCE(SUM(cost_amount),0) FROM usage_record WHERE {column}=$1 AND status='SUCCESS' AND created_at>=date_trunc('month',now())", subject_id)
+        missing_fx = await pool.fetchval(f"""
+          SELECT count(*) FROM usage_record
+          WHERE {column}=$1 AND status='SUCCESS'
+            AND created_at>=date_trunc('month',now() AT TIME ZONE 'Asia/Shanghai') AT TIME ZONE 'Asia/Shanghai'
+            AND currency<>$2 AND tokensea_fx_rate(created_at,currency,$2) IS NULL
+        """, subject_id, BUDGET_CURRENCY)
+        if int(missing_fx or 0) > 0:
+            raise gateway_error(503, "TOKENSEA_FX_RATE_MISSING", "本月历史用量存在缺失汇率，无法执行预算核算")
+        committed = await pool.fetchval(f"""
+          SELECT COALESCE(SUM(COALESCE(tokensea_fx_amount(cost_amount,currency,created_at,$2),0)),0)
+          FROM usage_record
+          WHERE {column}=$1 AND status='SUCCESS'
+            AND created_at>=date_trunc('month',now() AT TIME ZONE 'Asia/Shanghai') AT TIME ZONE 'Asia/Shanghai'
+        """, subject_id, BUDGET_CURRENCY)
         committed_amount = Decimal(str(committed))
         threshold_percent = Decimal(str(rule["warning_threshold_percent"] if rule else 100))
         threshold = Decimal(str(limit)) * threshold_percent / Decimal(100)
@@ -959,6 +1128,42 @@ async def release_budget_safely(reservation: Dict[str, Any]):
             return False
 
 
+CACHE_PRICING_ALERT_CODES = {
+    "TOKENSEA_CACHE_PRICE_MISSING": ("CACHE_PRICE_MISSING", "模型缓存价格缺失或尚未确认"),
+    "TOKENSEA_CACHE_USAGE_UNRECOGNIZED": ("CACHE_USAGE_UNRECOGNIZED", "上游缓存 Usage 无法可靠识别"),
+    "TOKENSEA_CACHE_USAGE_INCONSISTENT": ("CACHE_USAGE_INCONSISTENT", "上游缓存 Usage 互斥关系异常"),
+    "TOKENSEA_CACHE_COMPONENT_AMBIGUOUS": ("CACHE_COMPONENT_AMBIGUOUS", "缓存价格组件作用域匹配歧义"),
+}
+
+
+async def record_runtime_pricing_alert(request_id: str, route: Dict[str, Any], error: HTTPException):
+    if pool is None or not isinstance(error.detail, dict):
+        return
+    error_code = str(error.detail.get("error_code") or "")
+    definition = CACHE_PRICING_ALERT_CODES.get(error_code)
+    if definition is None:
+        return
+    alert_type, title = definition
+    alert_id = hashlib.sha256(f"cache-alert:{request_id}:{error_code}".encode()).hexdigest()[:32]
+    detail = {
+        "requestId": request_id,
+        "errorCode": error_code,
+        "message": error.detail.get("message"),
+        "providerInstanceId": route.get("provider_id"),
+        "providerType": route.get("provider_name"),
+        "runtimeModelName": route.get("runtime_model_name"),
+        "priceVersionId": (route.get("price") or {}).get("id"),
+    }
+    try:
+        await pool.execute("""
+          INSERT INTO alert_event(id,alert_type,severity,resource_type,resource_id,title,detail)
+          VALUES($1,$2,'HIGH','REQUEST',$3,$4,$5::jsonb)
+          ON CONFLICT(id) DO UPDATE SET detail=EXCLUDED.detail,status='OPEN',updated_at=now()
+        """, alert_id, alert_type, request_id, title, json.dumps(detail, ensure_ascii=False))
+    except Exception:
+        return
+
+
 async def persist_attempt(payload: Dict[str, Any]):
     assert pool is not None
     await pool.execute("""
@@ -978,10 +1183,20 @@ async def persist_attempt(payload: Dict[str, Any]):
 
 
 async def safe_record_attempt(request_id, attempt_no, route, status, http_status, error_code, usage, started):
-    usage = normalize_usage(usage)
+    usage = normalize_usage(usage, route.get("provider_name"))
     latency_ms = int((time.monotonic() - started) * 1000)
     completed_at = datetime.now(timezone.utc)
-    attempt_cost, _, cost_components = calculate_amounts(route.get("price") or {}, usage)
+    if status == "SUCCESS" or usage.get("total_tokens", 0) > 0:
+        try:
+            attempt_cost, _, cost_components, cache_metrics = calculate_amounts(route.get("price") or {}, usage)
+        except HTTPException as exc:
+            await record_runtime_pricing_alert(request_id, route, exc)
+            raise
+    else:
+        attempt_cost, cost_components = Decimal("0"), []
+        cache_metrics = {"cacheGrossSavings": "0", "cacheWritePremium": "0",
+                         "cacheStorageCost": "0", "cacheNetSavings": "0",
+                         "cacheHitRate": "0", "costStatus": "COMPLETE"}
     if status != "SUCCESS":
         attempt_cost = Decimal("0")
     price = route.get("price") or {}
@@ -993,13 +1208,25 @@ async def safe_record_attempt(request_id, attempt_no, route, status, http_status
                "cost_snapshot": {"priceVersionId": price.get("id"), "priceLayer": price.get("price_layer"),
                                  "currency": price.get("currency"), "sourceRef": price.get("source_ref"),
                                  "evidenceHash": price.get("evidence_hash"),
-                                 "inputCostPer1k": str(price.get("input_cost_per_1k", "0")),
-                                 "outputCostPer1k": str(price.get("output_cost_per_1k", "0")),
-                                 "priceComponents": price.get("price_components") or {},
+                                 "billingBasis": price.get("cost_billing_basis", "TOKEN"),
+                                 "billingQuantity": int(price.get("cost_billing_quantity") or 1_000_000),
+                                 "inputUnitPrice": str(price.get("input_cost_unit_price", "0")),
+                                 "cacheReadUnitPrice": None if price.get("cache_read_cost_unit_price") is None else str(price.get("cache_read_cost_unit_price")),
+                                 "cacheReadMode": price.get("cache_read_mode"),
+                                 "cacheWriteUnitPrice": None if price.get("cache_write_cost_unit_price") is None else str(price.get("cache_write_cost_unit_price")),
+                                 "cacheWriteMode": price.get("cache_write_mode"),
+                                 "outputUnitPrice": str(price.get("output_cost_unit_price", "0")),
+                                 "priceComponents": price.get("price_components") or [],
                                  "costComponents": cost_components,
+                                 "inputUncachedTokens": usage.get("input_uncached_tokens", 0),
+                                 "inputTokensTotal": usage.get("input_tokens_total", 0),
                                  "cacheReadTokens": usage.get("cache_read_tokens", 0),
                                  "cacheWriteTokens": usage.get("cache_write_tokens", 0),
-                                 "reasoningTokens": usage.get("reasoning_tokens", 0)},
+                                 "outputTokens": usage.get("output_tokens", 0),
+                                 "reasoningTokens": usage.get("reasoning_tokens", 0),
+                                 "usageSource": usage.get("usage_source"),
+                                 "usageEvidence": usage.get("usage_evidence") or {},
+                                 **cache_metrics},
                "started_at": (completed_at - timedelta(milliseconds=latency_ms)).isoformat(),
                "completed_at": completed_at.isoformat()}
     try:
@@ -1018,47 +1245,78 @@ async def persist_usage(payload: Dict[str, Any]):
     await pool.execute("""
       INSERT INTO usage_record(id,request_id,tenant_id,project_id,app_id,api_key_id,model_alias,runtime_model_name,
         provider_id,prompt_tokens,completion_tokens,total_tokens,cost_amount,sales_amount,currency,status,error_code,
-        latency_ms,fallback_chain,price_version_id,budget_reserved_amount,budget_status,accounting_status)
-      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)
+        latency_ms,fallback_chain,price_version_id,budget_reserved_amount,budget_currency,budget_status,accounting_status)
+      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)
       ON CONFLICT(id) DO UPDATE SET status=EXCLUDED.status,error_code=EXCLUDED.error_code,
         prompt_tokens=EXCLUDED.prompt_tokens,completion_tokens=EXCLUDED.completion_tokens,total_tokens=EXCLUDED.total_tokens,
         cost_amount=EXCLUDED.cost_amount,sales_amount=EXCLUDED.sales_amount,latency_ms=EXCLUDED.latency_ms,
-        fallback_chain=EXCLUDED.fallback_chain,budget_status=EXCLUDED.budget_status,
-        accounting_status=EXCLUDED.accounting_status
+        fallback_chain=EXCLUDED.fallback_chain,budget_currency=EXCLUDED.budget_currency,
+        budget_status=EXCLUDED.budget_status,accounting_status=EXCLUDED.accounting_status
     """, payload["id"], payload["request_id"], payload.get("tenant_id"), payload.get("project_id"), payload.get("app_id"),
        payload.get("api_key_id"), payload["model_alias"], payload.get("runtime_model_name"), payload.get("provider_id"),
        payload["prompt_tokens"], payload["completion_tokens"], payload["total_tokens"], Decimal(payload["cost_amount"]),
        Decimal(payload["sales_amount"]), payload["currency"], payload["status"], payload.get("error_code"),
        payload["latency_ms"], payload["fallback_chain"], payload["price_version_id"], Decimal(payload["budget_reserved_amount"]),
-       payload.get("budget_status", "NOT_APPLICABLE"), payload.get("accounting_status", "COMMITTED"))
+       payload.get("budget_currency", BUDGET_CURRENCY), payload.get("budget_status", "NOT_APPLICABLE"),
+       payload.get("accounting_status", "COMMITTED"))
     await pool.execute("""
       INSERT INTO usage_cost_snapshot(id,request_id,usage_record_id,price_version_id,price_layer,currency,
-        input_amount_per_1k,output_amount_per_1k,prompt_tokens,completion_tokens,actual_cost_amount,source_ref,
-        cache_read_tokens,cache_write_tokens,reasoning_tokens,price_components,cost_components,pricing_model,
-        response_model,provider_instance_id,model_deployment_id,calculator_version,evidence_hash)
-      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16::jsonb,$17::jsonb,$18,$19,$20,$21,$22,$23)
+        billing_basis,billing_quantity,input_unit_price,cache_read_unit_price,cache_read_mode,
+        cache_write_unit_price,cache_write_mode,output_unit_price,prompt_tokens,completion_tokens,
+        actual_cost_amount,source_ref,cache_read_tokens,cache_write_tokens,reasoning_tokens,price_components,
+        cost_components,pricing_model,response_model,provider_instance_id,model_deployment_id,calculator_version,evidence_hash,
+        input_uncached_tokens,input_tokens_total,output_tokens,cache_storage_token_seconds,usage_schema_version,
+        usage_source,usage_evidence,cache_gross_savings,cache_write_premium,cache_storage_cost,cache_net_savings,
+        cache_hit_rate,cost_status)
+      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22::jsonb,$23::jsonb,
+        $24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36::jsonb,$37,$38,$39,$40,$41,$42)
       ON CONFLICT(request_id) DO NOTHING
     """, hashlib.sha256(f"cost:{payload['request_id']}".encode()).hexdigest()[:32], payload["request_id"], payload["id"],
        payload["price_version_id"], payload.get("price_layer") or "PROVIDER_OFFICIAL", payload["currency"],
-       Decimal(payload.get("input_cost_per_1k") or "0"), Decimal(payload.get("output_cost_per_1k") or "0"),
-       payload["prompt_tokens"], payload["completion_tokens"], Decimal(payload["cost_amount"]),
-       payload.get("price_source_ref"), payload.get("cache_read_tokens", 0), payload.get("cache_write_tokens", 0),
-       payload.get("reasoning_tokens", 0), json.dumps(payload.get("price_components") or {}, ensure_ascii=False),
-       json.dumps(payload.get("cost_components") or {}, ensure_ascii=False), payload.get("pricing_model"),
+       payload.get("cost_billing_basis") or "TOKEN", int(payload.get("cost_billing_quantity") or 1_000_000),
+       Decimal(payload.get("input_cost_unit_price") or "0"),
+       None if payload.get("cache_read_cost_unit_price") is None else Decimal(payload["cache_read_cost_unit_price"]),
+       payload.get("cache_read_mode") or "UNKNOWN",
+       None if payload.get("cache_write_cost_unit_price") is None else Decimal(payload["cache_write_cost_unit_price"]),
+       payload.get("cache_write_mode") or "UNKNOWN",
+       Decimal(payload.get("output_cost_unit_price") or "0"), payload["prompt_tokens"], payload["completion_tokens"],
+       Decimal(payload["cost_amount"]), payload.get("price_source_ref"), payload.get("cache_read_tokens", 0),
+       payload.get("cache_write_tokens", 0), payload.get("reasoning_tokens", 0),
+       json.dumps(parse_json_array(payload.get("price_components")), ensure_ascii=False),
+       json.dumps(parse_json_array(payload.get("cost_components")), ensure_ascii=False), payload.get("pricing_model"),
        payload.get("response_model"), payload.get("provider_instance_id"), payload.get("model_deployment_id"),
-       "2.0.0", payload.get("evidence_hash"))
+       "3.0.0", payload.get("evidence_hash"), payload.get("input_uncached_tokens", 0),
+       payload.get("input_tokens_total", 0), payload.get("output_tokens", 0),
+       Decimal(str(payload.get("cache_storage_token_seconds", 0) or 0)),
+       int(payload.get("usage_schema_version") or 2), payload.get("usage_source") or "UNKNOWN",
+       json.dumps(payload.get("usage_evidence") or {}, ensure_ascii=False),
+       Decimal(payload.get("cache_gross_savings") or "0"), Decimal(payload.get("cache_write_premium") or "0"),
+       Decimal(payload.get("cache_storage_cost") or "0"), Decimal(payload.get("cache_net_savings") or "0"),
+       Decimal(payload.get("cache_hit_rate") or "0"), payload.get("cost_status") or "COMPLETE")
 
 
 async def finalize_request(request_id, key_ctx, route, model_alias, usage, status, error_code,
                            started, fallback_chain, budget):
-    usage = normalize_usage(usage)
-    cost, sales, cost_components = calculate_amounts(route["price"], usage)
+    usage = normalize_usage(usage, route.get("provider_name"))
+    if status == "SUCCESS" or usage.get("total_tokens", 0) > 0:
+        try:
+            cost, sales, cost_components, cache_metrics = calculate_amounts(route["price"], usage)
+        except HTTPException as exc:
+            await record_runtime_pricing_alert(request_id, route, exc)
+            raise
+    else:
+        cost = sales = Decimal("0")
+        cost_components = []
+        cache_metrics = {"cacheGrossSavings": "0", "cacheWritePremium": "0",
+                         "cacheStorageCost": "0", "cacheNetSavings": "0",
+                         "cacheHitRate": "0", "costStatus": "COMPLETE"}
     if status != "SUCCESS":
         cost = sales = Decimal("0")
+    budget_cost = cost * Decimal(str(route["price"].get("budget_fx_rate") or "1"))
     budget_status = "SETTLED"
     budget_durable = True
     try:
-        budget_status = await settle_budget(budget, cost)
+        budget_status = await settle_budget(budget, budget_cost)
         if budget_status == "OVERRUN" and status == "SUCCESS":
             error_code = "TOKENSEA_BUDGET_OVERRUN"
     except Exception:
@@ -1067,7 +1325,7 @@ async def finalize_request(request_id, key_ctx, route, model_alias, usage, statu
             error_code = "TOKENSEA_BUDGET_SETTLEMENT_PENDING"
         budget["deferred_accounting"] = True
         try:
-            await enqueue_outbox("budget_settle", {"reservation": serializable_reservation(budget), "actual": str(cost)})
+            await enqueue_outbox("budget_settle", {"reservation": serializable_reservation(budget), "actual": str(budget_cost)})
         except Exception:
             budget_durable = False
     payload = {"id": hashlib.sha256(f"usage:{request_id}".encode()).hexdigest()[:32], "request_id": request_id,
@@ -1079,17 +1337,30 @@ async def finalize_request(request_id, key_ctx, route, model_alias, usage, statu
                "fallback_chain": json.dumps(fallback_chain, ensure_ascii=False),
                "price_version_id": route["price"]["id"],
                "price_layer": route["price"].get("price_layer") or "PROVIDER_OFFICIAL",
-               "input_cost_per_1k": str(route["price"]["input_cost_per_1k"]),
-               "output_cost_per_1k": str(route["price"]["output_cost_per_1k"]),
+               "cost_billing_basis": route["price"]["cost_billing_basis"],
+               "cost_billing_quantity": int(route["price"]["cost_billing_quantity"]),
+               "input_cost_unit_price": str(route["price"]["input_cost_unit_price"]),
+               "cache_read_cost_unit_price": None if route["price"].get("cache_read_cost_unit_price") is None else str(route["price"]["cache_read_cost_unit_price"]),
+               "cache_read_mode": route["price"].get("cache_read_mode") or "UNKNOWN",
+               "cache_write_cost_unit_price": None if route["price"].get("cache_write_cost_unit_price") is None else str(route["price"]["cache_write_cost_unit_price"]),
+               "cache_write_mode": route["price"].get("cache_write_mode") or "UNKNOWN",
+               "output_cost_unit_price": str(route["price"]["output_cost_unit_price"]),
                "price_source_ref": route["price"].get("source_ref") or "price_version:"+str(route["price"]["id"]),
-               "price_components": route["price"].get("price_components") or {},
+               "price_components": route["price"].get("price_components") or [],
                "cost_components": cost_components,
+               "cache_gross_savings": cache_metrics["cacheGrossSavings"],
+               "cache_write_premium": cache_metrics["cacheWritePremium"],
+               "cache_storage_cost": cache_metrics["cacheStorageCost"],
+               "cache_net_savings": cache_metrics["cacheNetSavings"],
+               "cache_hit_rate": cache_metrics["cacheHitRate"],
+               "cost_status": cache_metrics["costStatus"],
                "evidence_hash": route["price"].get("evidence_hash"),
                "pricing_model": route.get("runtime_model_name"),
                "response_model": usage.get("response_model"),
                "provider_instance_id": route.get("provider_id"),
                "model_deployment_id": route["price"].get("channel_deployment_id"),
                "budget_reserved_amount": str(budget.get("amount") or Decimal("0")),
+               "budget_currency": BUDGET_CURRENCY,
                "budget_status": budget_status, "accounting_status": "COMMITTED"}
     try:
         await persist_usage(payload)
@@ -1330,6 +1601,10 @@ def snapshot_addresses(raw: Any) -> set[str]:
     return {value.strip() for value in raw.split(",") if value.strip()}
 
 
+def is_local_test_upstream(host: str) -> bool:
+    return LOCAL_TEST_UPSTREAM_ENABLED and host.lower().rstrip(".") in LOCAL_TEST_UPSTREAM_HOSTS
+
+
 def validate_public_addresses(addresses: set[str]):
     if not addresses:
         raise gateway_error(503, "TOKENSEA_DNS_SNAPSHOT_MISSING", "供应商 DNS 快照缺失")
@@ -1351,22 +1626,40 @@ async def resolve_dns_addresses(host: str) -> set[str]:
 
 
 async def validate_route_dns(route: Dict[str, Any], force: bool = False):
-    if not force and route.get("dns_valid_until", 0) > time.monotonic():
-        return
     parsed = urlparse(route.get("api_base") or "")
     if parsed.scheme.lower() not in ("http", "https") or not parsed.hostname or parsed.username or parsed.password:
         raise gateway_error(503, "TOKENSEA_SSRF_TARGET_REJECTED", "供应商 API Base 格式不安全")
     host = parsed.hostname.lower().rstrip(".")
+    port = parsed.port or (443 if parsed.scheme.lower() == "https" else 80)
     verified_host = str(route.get("verified_host") or "").lower().rstrip(".")
     if not verified_host or host != verified_host:
-        raise gateway_error(503, "TOKENSEA_DNS_HOST_CHANGED", "供应商主机与发布快照不一致")
+        raise gateway_error(503, "TOKENSEA_DNS_HOST_CHANGED", "供应商主机与最近连接测试不一致，请重新连接测试")
+    verified_port = route.get("verified_port")
+    if verified_port is not None and int(verified_port) != port:
+        raise gateway_error(503, "TOKENSEA_DNS_PORT_CHANGED", "供应商端口与最近连接测试不一致，请重新连接测试")
+    cache_key = f"{route.get('provider_id') or host}:{host}:{port}"
+    cached = dns_validation_cache.get(cache_key)
+    if not force and cached and cached.get("expires_at", 0) > time.monotonic():
+        return
     expected = snapshot_addresses(route.get("verified_addresses"))
+    if is_local_test_upstream(host):
+        if not expected:
+            raise gateway_error(503, "TOKENSEA_DNS_SNAPSHOT_MISSING", "本地测试上游地址快照缺失")
+        expires_at = time.monotonic() + DNS_RECHECK_TTL
+        dns_validation_cache[cache_key] = {"addresses": expected, "expires_at": expires_at}
+        route["dns_valid_until"] = expires_at
+        return
     validate_public_addresses(expected)
     current = await resolve_dns_addresses(host)
     validate_public_addresses(current)
     if current != expected:
-        raise gateway_error(503, "TOKENSEA_DNS_SNAPSHOT_CHANGED", "供应商 DNS 地址已变化，需重新连接测试并发布")
-    route["dns_valid_until"] = time.monotonic() + DNS_RECHECK_TTL
+        LOGGER.info(
+            "dns_public_rotation_accepted provider_id=%s host=%s previous=%s current=%s",
+            route.get("provider_id"), host, sorted(expected), sorted(current),
+        )
+    expires_at = time.monotonic() + DNS_RECHECK_TTL
+    dns_validation_cache[cache_key] = {"addresses": current, "expires_at": expires_at}
+    route["dns_valid_until"] = expires_at
 
 
 async def ensure_runtime_model(route: Dict[str, Any], force: bool = False):
@@ -1390,12 +1683,13 @@ async def ensure_runtime_model(route: Dict[str, Any], force: bool = False):
                    "model_info": {"id": runtime_alias}}
         if route.get("api_key"):
             payload["litellm_params"]["api_key"] = route["api_key"]
-        async with httpx.AsyncClient(timeout=20) as client:
+        async with httpx.AsyncClient(timeout=20, trust_env=False) as client:
             response = await client.post(f"{ENGINE_URL}/model/new", headers=runtime_headers(), json=payload)
-            if response.status_code == 409 and not await runtime_model_exists(client, runtime_alias):
-                raise gateway_error(503, "TOKENSEA_RUNTIME_CONFLICT", "运行时模型注册冲突")
-            if response.status_code not in (200, 201, 409):
-                raise gateway_error(503, "TOKENSEA_RUNTIME_CONFIG_FAILED", "运行时拒绝模型配置")
+            if response.status_code not in (200, 201):
+                if not await runtime_model_exists(client, runtime_alias):
+                    if response.status_code == 409:
+                        raise gateway_error(503, "TOKENSEA_RUNTIME_CONFLICT", "运行时模型注册冲突")
+                    raise gateway_error(503, "TOKENSEA_RUNTIME_CONFIG_FAILED", "运行时拒绝模型配置")
             if current and current.get("runtime_alias") != runtime_alias:
                 await client.post(f"{ENGINE_URL}/model/delete", headers=runtime_headers(), json={"id": current["runtime_alias"]})
         runtime_models[route["deployment_id"]] = {"fingerprint": fingerprint, "runtime_alias": runtime_alias,
@@ -1403,10 +1697,42 @@ async def ensure_runtime_model(route: Dict[str, Any], force: bool = False):
 
 
 async def runtime_model_exists(client: httpx.AsyncClient, alias: str) -> bool:
+    def contains(value: Any) -> bool:
+        if not isinstance(value, dict):
+            return False
+        for item in value.get("data", []):
+            if not isinstance(item, dict):
+                continue
+            model_info = item.get("model_info") if isinstance(item.get("model_info"), dict) else {}
+            if item.get("model_name") == alias or item.get("id") == alias or model_info.get("id") == alias:
+                return True
+        return False
+
     try:
-        response = await client.get(f"{ENGINE_URL}/v2/model/info", headers=runtime_headers(), params={"model": alias, "size": 10})
-        data = response.json()
-        return response.status_code == 200 and any(item.get("model_name") == alias for item in data.get("data", []))
+        for params in ({"modelId": alias, "size": 10}, {"search": alias, "size": 100}):
+            response = await client.get(f"{ENGINE_URL}/v2/model/info", headers=runtime_headers(), params=params)
+            if response.status_code != 200:
+                continue
+            value = response.json()
+            if contains(value):
+                return True
+            if "modelId" in params and isinstance(value, dict) and isinstance(value.get("data"), list) and value["data"]:
+                return True
+        page = 1
+        while page <= 100:
+            response = await client.get(
+                f"{ENGINE_URL}/v2/model/info", headers=runtime_headers(), params={"page": page, "size": 100}
+            )
+            if response.status_code != 200:
+                return False
+            value = response.json()
+            if contains(value):
+                return True
+            total_pages = int(value.get("total_pages") or 1) if isinstance(value, dict) else 1
+            if page >= total_pages:
+                return False
+            page += 1
+        return False
     except Exception:
         return False
 
@@ -1460,7 +1786,7 @@ def provider_is_routable(instance: Any) -> bool:
         return False
     tested_at = instance.get("last_connection_test_at") if isinstance(instance, dict) else instance["last_connection_test_at"]
     return bool(instance["health_status"] == "健康" and instance["last_connection_test_status"] == "成功"
-                and tested_at and tested_at.timestamp() > time.time() - 1800
+                and tested_at and tested_at.timestamp() > time.time() - CONNECTION_TEST_MAX_AGE_SECONDS
                 and instance["last_connection_test_host"] and instance["last_connection_test_addresses"]
                 and instance["key_status"] in ("已托管", "无需 Key"))
 
@@ -1474,8 +1800,13 @@ def validate_visibility(raw: Any, ctx: Dict[str, Any]):
         values = json.loads(raw) if isinstance(raw, str) and raw.strip().startswith("[") else [raw]
     except Exception:
         values = []
-    if isinstance(values, list) and (ctx["tenant_id"] in values or ctx.get("tenant_type") in values):
-        return
+    if isinstance(values, list):
+        if any(value in ("全部租户", "ALL", "*") for value in values):
+            return
+        if "内部租户" in values and str(ctx.get("tenant_type")).upper() == "INTERNAL":
+            return
+        if ctx["tenant_id"] in values or ctx.get("tenant_type") in values:
+            return
     raise gateway_error(403, "TOKENSEA_MODEL_NOT_VISIBLE", "模型对当前租户不可见")
 
 
@@ -1578,78 +1909,221 @@ def estimate_reserved_tokens(body: Dict[str, Any]) -> int:
     return input_upper_bound + output
 
 
+def component_usage_count(component_type: str, basis: str,
+                          token_counts: Dict[str, int], usage: Dict[str, Any]) -> Decimal:
+    if basis == "TOKEN":
+        return Decimal(token_counts.get(component_type, 0))
+    if basis == "TOKEN_SECOND":
+        return Decimal(str(usage.get("cache_storage_token_seconds", 0) or 0))
+    if basis == "REQUEST":
+        return Decimal(1)
+    if basis == "IMAGE":
+        field = "output_images" if "OUTPUT" in component_type else "input_images"
+        return Decimal(usage.get(field, usage.get("image_count", 0)) or 0)
+    if basis == "SECOND":
+        field = "video_seconds" if "VIDEO" in component_type else "audio_seconds" if "AUDIO" in component_type else "duration_seconds"
+        return Decimal(str(usage.get(field, 0) or 0))
+    if basis == "MINUTE":
+        return Decimal(str(usage.get("duration_minutes", 0) or 0))
+    if basis == "CHARACTER":
+        field = "output_characters" if "OUTPUT" in component_type else "input_characters"
+        return Decimal(usage.get(field, 0) or 0)
+    if basis == "AUDIO_MINUTE":
+        return Decimal(str(usage.get("audio_minutes", 0) or 0))
+    raise gateway_error(503, "TOKENSEA_PRICE_INVALID", f"不支持的计费对象：{basis}")
+
+
+def primary_usage_counts(basis: str, usage: Dict[str, Any]) -> tuple[Decimal, Decimal]:
+    if basis == "TOKEN":
+        return Decimal(usage["input_tokens_total"]), Decimal(usage["completion_tokens"])
+    if basis == "REQUEST":
+        return Decimal(1), Decimal(1)
+    if basis == "IMAGE":
+        return Decimal(usage.get("input_images", usage.get("image_count", 0)) or 0), \
+               Decimal(usage.get("output_images", 0) or 0)
+    if basis == "SECOND":
+        return Decimal(str(usage.get("input_seconds", usage.get("duration_seconds", 0)) or 0)), \
+               Decimal(str(usage.get("output_seconds", 0) or 0))
+    if basis == "MINUTE":
+        return Decimal(str(usage.get("input_minutes", usage.get("duration_minutes", 0)) or 0)), \
+               Decimal(str(usage.get("output_minutes", 0) or 0))
+    if basis == "CHARACTER":
+        return Decimal(usage.get("input_characters", 0) or 0), Decimal(usage.get("output_characters", 0) or 0)
+    if basis == "AUDIO_MINUTE":
+        return Decimal(str(usage.get("audio_minutes", 0) or 0)), Decimal(0)
+    raise gateway_error(503, "TOKENSEA_PRICE_INVALID", f"不支持的计费对象：{basis}")
+
+
+def component_scope_matches(component: Dict[str, Any], price: Dict[str, Any], usage: Dict[str, Any]) -> bool:
+    scope = component.get("scope") if isinstance(component.get("scope"), dict) else {}
+    context_tokens = int(usage.get("input_tokens_total", 0) or 0)
+    if scope.get("minContextTokens") is not None and context_tokens < int(scope["minContextTokens"]):
+        return False
+    if scope.get("maxContextTokens") is not None and context_tokens > int(scope["maxContextTokens"]):
+        return False
+    if scope.get("cacheTtlSeconds") is not None and int(usage.get("cache_ttl_seconds", 0) or 0) != int(scope["cacheTtlSeconds"]):
+        return False
+    for scope_key, price_key in (("serviceTier", "service_tier"), ("requestMode", "request_mode"),
+                                 ("contextTier", "context_tier")):
+        expected = scope.get(scope_key)
+        if expected is not None and str(expected).upper() != str(price.get(price_key) or "DEFAULT").upper():
+            return False
+    return True
+
+
+def select_price_component(component_type: str, components: List[Dict[str, Any]],
+                           price: Dict[str, Any], usage: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    matches = [component for component in components
+               if str(component.get("componentType") or "").upper() == component_type
+               and component_scope_matches(component, price, usage)]
+    if not matches:
+        return None
+    ranked = sorted(matches, key=lambda item: (-len(item.get("scope") or {}), int(item.get("priority") or 100),
+                                                str(item.get("variant") or "DEFAULT")))
+    best = ranked[0]
+    if len(ranked) > 1:
+        best_rank = (len(best.get("scope") or {}), int(best.get("priority") or 100))
+        next_rank = (len(ranked[1].get("scope") or {}), int(ranked[1].get("priority") or 100))
+        if best_rank == next_rank:
+            raise gateway_error(503, "TOKENSEA_CACHE_COMPONENT_AMBIGUOUS",
+                                f"价格组件 {component_type} 在当前请求作用域匹配到多个同优先级变体")
+    return best
+
+
+def component_price(component: Dict[str, Any], input_component: Optional[Dict[str, Any]] = None) -> Decimal:
+    mode = str(component.get("mode") or component.get("componentMode") or "EXPLICIT").upper()
+    if mode == "INHERIT_INPUT":
+        if not input_component or input_component.get("unitPrice") is None:
+            raise gateway_error(503, "TOKENSEA_PRICE_INVALID", "沿用普通输入价的组件缺少输入价格")
+        return Decimal(str(input_component["unitPrice"]))
+    if mode == "EXPLICIT_ZERO":
+        return Decimal("0")
+    if component.get("unitPrice") is None:
+        raise gateway_error(503, "TOKENSEA_PRICE_INVALID", "明确价格组件缺少单价")
+    return Decimal(str(component["unitPrice"]))
+
+
 def calculate_amounts(price: Dict[str, Any], usage: Dict[str, Any]):
     usage = normalize_usage(usage)
-    components = parse_json_object(price.get("price_components"))
+    if usage.get("cost_status") in {"INVALID_USAGE", "INCOMPLETE_USAGE"}:
+        code = "TOKENSEA_CACHE_USAGE_INCONSISTENT" if usage.get("cost_status") == "INVALID_USAGE" \
+            else "TOKENSEA_CACHE_USAGE_UNRECOGNIZED"
+        raise gateway_error(503, code, "上游缓存 Usage 无法形成可靠的互斥计费数量")
+    components = parse_json_array(price.get("price_components"))
     if not components:
-        components = {
-            "INPUT_TOKEN": {"unitPrice": price.get("input_cost_per_1k", "0"), "unitBasis": "PER_1K_TOKENS"},
-            "OUTPUT_TOKEN": {"unitPrice": price.get("output_cost_per_1k", "0"), "unitBasis": "PER_1K_TOKENS"},
-        }
-    prompt_tokens = usage["prompt_tokens"]
-    completion_tokens = usage["completion_tokens"]
-    cache_read_tokens = usage.get("cache_read_tokens", 0)
-    cache_write_tokens = usage.get("cache_write_tokens", 0)
-    reasoning_tokens = usage.get("reasoning_tokens", 0)
-    input_tokens = prompt_tokens
-    output_tokens = completion_tokens
-    if "CACHE_READ_TOKEN" in components and usage.get("cache_read_in_prompt"):
-        input_tokens = max(0, input_tokens - cache_read_tokens)
-    if "CACHE_WRITE_TOKEN" in components and usage.get("cache_write_in_prompt"):
-        input_tokens = max(0, input_tokens - cache_write_tokens)
-    if "REASONING_TOKEN" in components and usage.get("reasoning_in_completion"):
-        output_tokens = max(0, output_tokens - reasoning_tokens)
+        raise gateway_error(503, "TOKENSEA_PRICE_INVALID", "价格版本缺少组件数组")
     token_counts = {
-        "INPUT_TOKEN": input_tokens,
-        "OUTPUT_TOKEN": output_tokens,
-        "CACHE_READ_TOKEN": cache_read_tokens,
-        "CACHE_WRITE_TOKEN": cache_write_tokens,
-        "REASONING_TOKEN": reasoning_tokens,
+        "INPUT_TOKEN": usage["input_uncached_tokens"],
+        "OUTPUT_TOKEN": usage["output_tokens"],
+        "CACHE_READ_TOKEN": usage.get("cache_read_tokens", 0),
+        "CACHE_WRITE_TOKEN": usage.get("cache_write_tokens", 0),
+        "CACHE_STORAGE_TOKEN_SECOND": usage.get("cache_storage_token_seconds", 0),
+        "REASONING_TOKEN": usage.get("reasoning_tokens", 0),
     }
-    cost_components: Dict[str, str] = {}
+    input_component = select_price_component("INPUT_TOKEN", components, price, usage)
+    input_related_tokens = (usage["input_uncached_tokens"] + usage.get("cache_read_tokens", 0)
+                            + usage.get("cache_write_tokens", 0))
+    if input_component is None and input_related_tokens > 0:
+        raise gateway_error(503, "TOKENSEA_PRICE_INVALID", "价格版本缺少普通输入组件")
+    component_types = sorted({str(item.get("componentType") or "").upper() for item in components})
+    cost_components: List[Dict[str, Any]] = []
+    component_amounts: Dict[str, Decimal] = {}
     cost = Decimal("0")
-    for component_type, count in token_counts.items():
-        spec = components.get(component_type)
-        if not isinstance(spec, dict) or count <= 0:
+    for component_type in component_types:
+        component = select_price_component(component_type, components, price, usage)
+        if component is None:
             continue
-        basis = str(spec.get("unitBasis") or "PER_1K_TOKENS")
-        if basis != "PER_1K_TOKENS":
+        basis = str(component.get("unitBasis") or "TOKEN").upper()
+        quantity = int(component.get("unitQuantity") or 1)
+        if quantity <= 0:
+            raise gateway_error(503, "TOKENSEA_PRICE_INVALID", "计费基数必须大于零")
+        count = component_usage_count(component_type, basis, token_counts, usage)
+        if count <= 0:
             continue
-        amount = Decimal(count) * Decimal(str(spec.get("unitPrice") or "0")) / Decimal(1000)
+        mode = str(component.get("mode") or component.get("componentMode") or "EXPLICIT").upper()
+        if mode == "UNKNOWN":
+            raise gateway_error(503, "TOKENSEA_CACHE_PRICE_MISSING", f"价格组件 {component_type} 尚未确认")
+        if mode == "NOT_APPLICABLE":
+            raise gateway_error(503, "TOKENSEA_CACHE_USAGE_UNRECOGNIZED",
+                                f"上游返回了 {component_type} 用量，但价格版本标记为不适用")
+        unit_price = component_price(component, input_component)
+        amount = count * unit_price / Decimal(quantity)
         cost += amount
-        cost_components[component_type] = str(amount)
+        component_amounts[component_type] = amount
+        cost_components.append({
+            "componentType": component_type,
+            "variant": str(component.get("variant") or "DEFAULT"),
+            "mode": mode,
+            "usageQuantity": str(count),
+            "unitPrice": str(unit_price),
+            "unitBasis": basis,
+            "unitQuantity": quantity,
+            "amount": str(amount),
+            "scope": component.get("scope") or {},
+            "sourceRef": component.get("sourceRef") or price.get("source_ref"),
+        })
+    for required_type in ("CACHE_READ_TOKEN", "CACHE_WRITE_TOKEN"):
+        if Decimal(token_counts.get(required_type, 0)) > 0 and required_type not in component_amounts:
+            raise gateway_error(503, "TOKENSEA_CACHE_PRICE_MISSING", f"价格版本缺少 {required_type} 组件")
+    input_price = component_price(input_component) if input_component else Decimal("0")
+    input_quantity = Decimal(int(input_component.get("unitQuantity") or 1)) if input_component else Decimal("1")
+    hypothetical_cache_read = Decimal(usage.get("cache_read_tokens", 0)) * input_price / input_quantity
+    cache_read_cost = component_amounts.get("CACHE_READ_TOKEN", Decimal("0"))
+    cache_write_cost = component_amounts.get("CACHE_WRITE_TOKEN", Decimal("0"))
+    hypothetical_cache_write = Decimal(usage.get("cache_write_tokens", 0)) * input_price / input_quantity
+    cache_gross_savings = hypothetical_cache_read - cache_read_cost
+    cache_write_premium = max(Decimal("0"), cache_write_cost - hypothetical_cache_write)
+    cache_storage_cost = component_amounts.get("CACHE_STORAGE_TOKEN_SECOND", Decimal("0"))
+    cache_net_savings = cache_gross_savings - cache_write_premium - cache_storage_cost
+    cache_denominator = usage["input_uncached_tokens"] + usage.get("cache_read_tokens", 0)
+    cache_hit_rate = (Decimal(usage.get("cache_read_tokens", 0)) / Decimal(cache_denominator)) \
+        if cache_denominator > 0 else Decimal("0")
+    cache_metrics = {
+        "cacheGrossSavings": str(cache_gross_savings),
+        "cacheWritePremium": str(cache_write_premium),
+        "cacheStorageCost": str(cache_storage_cost),
+        "cacheNetSavings": str(cache_net_savings),
+        "cacheHitRate": str(cache_hit_rate),
+        "costStatus": "COMPLETE",
+    }
     if not price.get("internal_price_id"):
         sales = cost
     else:
-        sales = (Decimal(prompt_tokens) * Decimal(str(price["input_price_per_1k"])) +
-                 Decimal(completion_tokens) * Decimal(str(price["output_price_per_1k"]))) / Decimal(1000)
-    return cost, sales, cost_components
+        price_basis = str(price["price_billing_basis"])
+        price_quantity = Decimal(int(price["price_billing_quantity"]))
+        input_count, output_count = primary_usage_counts(price_basis, usage)
+        sales = (input_count * Decimal(str(price["input_price_unit_price"])) +
+                 output_count * Decimal(str(price["output_price_unit_price"]))) / price_quantity
+    return cost, sales, cost_components, cache_metrics
 
 
 def money_micro(value: Decimal) -> int:
     return int((value * Decimal(1_000_000)).to_integral_value(rounding=ROUND_CEILING))
 
 
-def extract_usage(data: Any) -> Dict[str, Any]:
+def extract_usage(data: Any, provider_type: Optional[str] = None) -> Dict[str, Any]:
     if isinstance(data, dict):
         response = data.get("response") if isinstance(data.get("response"), dict) else data
-        if isinstance(response.get("usage"), dict):
-            normalized = normalize_usage(response["usage"])
+        raw_usage = response.get("usage") if isinstance(response.get("usage"), dict) else None
+        if raw_usage is None and isinstance(response.get("usageMetadata"), dict):
+            raw_usage = response["usageMetadata"]
+        if raw_usage is not None:
+            normalized = normalize_usage(raw_usage, provider_type)
             normalized["response_model"] = response.get("model") or data.get("model")
             return normalized
         if response is not data:
-            return extract_usage(response)
+            return extract_usage(response, provider_type)
     return empty_usage()
 
 
-def usage_from_sse_line(line: bytes) -> Dict[str, Any]:
+def usage_from_sse_line(line: bytes, provider_type: Optional[str] = None) -> Dict[str, Any]:
     if not line.startswith(b"data:"):
         return empty_usage()
     raw = line[5:].strip()
     if not raw or raw == b"[DONE]":
         return empty_usage()
     try:
-        return extract_usage(json.loads(raw))
+        return extract_usage(json.loads(raw), provider_type)
     except Exception:
         return empty_usage()
 
@@ -1661,46 +2135,236 @@ def merge_usage(target, incoming):
         target.update(incoming)
 
 
-def normalize_usage(usage: Any) -> Dict[str, Any]:
-    usage = usage if isinstance(usage, dict) else {}
-    prompt_details = usage.get("prompt_tokens_details") if isinstance(usage.get("prompt_tokens_details"), dict) else {}
-    completion_details = usage.get("completion_tokens_details") if isinstance(usage.get("completion_tokens_details"), dict) else {}
-    prompt = nonnegative_int(usage.get("prompt_tokens", usage.get("input_tokens", 0)))
-    completion = nonnegative_int(usage.get("completion_tokens", usage.get("output_tokens", 0)))
-    cache_read_nested = prompt_details.get("cached_tokens")
-    cache_read = nonnegative_int(cache_read_nested if cache_read_nested is not None else
-                                 usage.get("cache_read_input_tokens", usage.get("cache_read_tokens", usage.get("cached_tokens", 0))))
-    cache_write = nonnegative_int(usage.get("cache_creation_input_tokens",
-                                           usage.get("cache_write_input_tokens", usage.get("cache_write_tokens", 0))))
-    reasoning_nested = completion_details.get("reasoning_tokens")
-    reasoning = nonnegative_int(reasoning_nested if reasoning_nested is not None else usage.get("reasoning_tokens", 0))
-    total = nonnegative_int(usage.get("total_tokens", prompt + completion +
-                                      (0 if cache_read_nested is not None else cache_read) + cache_write))
+def usage_value(usage: Dict[str, Any], *names: str, default: Any = 0) -> Any:
+    for name in names:
+        if name in usage and usage[name] is not None:
+            return usage[name]
+    return default
+
+
+def usage_has_negative(usage: Dict[str, Any], names: List[str]) -> bool:
+    for name in names:
+        if name not in usage or usage[name] is None:
+            continue
+        try:
+            if Decimal(str(usage[name])) < 0:
+                return True
+        except Exception:
+            return True
+    return False
+
+
+def usage_evidence(usage: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        return json.loads(json.dumps(usage, ensure_ascii=False, default=str))
+    except Exception:
+        return {"unserializable": True}
+
+
+def complete_standard_usage(usage: Dict[str, Any], source: str,
+                            input_uncached: int, cache_read: int, cache_write: int,
+                            completion_total: int, reasoning: int,
+                            input_total: Optional[int] = None,
+                            raw_total: Optional[int] = None,
+                            invalid: bool = False,
+                            incomplete: bool = False) -> Dict[str, Any]:
+    input_total = input_uncached + cache_read + cache_write if input_total is None else input_total
+    output_tokens = max(0, completion_total - reasoning)
+    expected_input = input_uncached + cache_read + cache_write
+    invalid = invalid or input_total != expected_input or reasoning > completion_total
+    computed_total = input_total + completion_total
+    total_tokens = raw_total if raw_total is not None and raw_total > 0 else computed_total
+    if total_tokens < computed_total:
+        invalid = True
+    image_count = nonnegative_int(usage_value(usage, "image_count", "images"))
+    input_images = nonnegative_int(usage_value(usage, "input_images", default=image_count))
+    output_images = nonnegative_int(usage_value(usage, "output_images"))
+    duration_seconds = nonnegative_number(usage_value(usage, "duration_seconds"))
+    audio_seconds = nonnegative_number(usage_value(usage, "audio_seconds", default=duration_seconds))
+    video_seconds = nonnegative_number(usage_value(usage, "video_seconds", default=duration_seconds))
+    duration_minutes = nonnegative_number(usage_value(usage, "duration_minutes", default=duration_seconds / 60))
+    audio_minutes = nonnegative_number(usage_value(usage, "audio_minutes", default=audio_seconds / 60))
+    cost_status = "INVALID_USAGE" if invalid else "INCOMPLETE_USAGE" if incomplete else "COMPLETE"
     return {
-        "prompt_tokens": prompt,
-        "completion_tokens": completion,
-        "total_tokens": total or prompt + completion,
+        "usage_schema_version": 2,
+        "usage_source": source,
+        "usage_evidence": usage_evidence(usage),
+        "cost_status": cost_status,
+        "input_uncached_tokens": input_uncached,
+        "input_tokens_total": input_total,
+        "prompt_tokens": input_total,
         "cache_read_tokens": cache_read,
         "cache_write_tokens": cache_write,
+        "completion_tokens": completion_total,
+        "output_tokens": output_tokens,
         "reasoning_tokens": reasoning,
-        "cache_read_in_prompt": cache_read_nested is not None or bool(usage.get("cache_read_in_prompt")),
-        "cache_write_in_prompt": bool(usage.get("cache_write_in_prompt")),
-        "reasoning_in_completion": reasoning_nested is not None or bool(usage.get("reasoning_in_completion", reasoning > 0)),
+        "total_tokens": total_tokens,
+        "cache_storage_token_seconds": nonnegative_number(
+            usage_value(usage, "cache_storage_token_seconds", "cacheStorageTokenSeconds")),
+        "cache_ttl_seconds": nonnegative_int(usage_value(usage, "cache_ttl_seconds", "cacheTtlSeconds")),
+        "cache_read_in_prompt": False,
+        "cache_write_in_prompt": False,
+        "reasoning_in_completion": False,
+        "image_count": image_count,
+        "input_images": input_images,
+        "output_images": output_images,
+        "duration_seconds": duration_seconds,
+        "input_seconds": nonnegative_number(usage_value(usage, "input_seconds", default=duration_seconds)),
+        "output_seconds": nonnegative_number(usage_value(usage, "output_seconds")),
+        "audio_seconds": audio_seconds,
+        "video_seconds": video_seconds,
+        "duration_minutes": duration_minutes,
+        "input_minutes": nonnegative_number(usage_value(usage, "input_minutes", default=duration_minutes)),
+        "output_minutes": nonnegative_number(usage_value(usage, "output_minutes")),
+        "audio_minutes": audio_minutes,
+        "input_characters": nonnegative_int(usage_value(usage, "input_characters")),
+        "output_characters": nonnegative_int(usage_value(usage, "output_characters")),
         "response_model": usage.get("response_model"),
     }
 
 
+def normalize_existing_usage(usage: Dict[str, Any]) -> Dict[str, Any]:
+    result = empty_usage()
+    result.update(usage)
+    result["usage_schema_version"] = 2
+    result["input_uncached_tokens"] = nonnegative_int(result.get("input_uncached_tokens"))
+    result["cache_read_tokens"] = nonnegative_int(result.get("cache_read_tokens"))
+    result["cache_write_tokens"] = nonnegative_int(result.get("cache_write_tokens"))
+    expected = result["input_uncached_tokens"] + result["cache_read_tokens"] + result["cache_write_tokens"]
+    result["input_tokens_total"] = nonnegative_int(result.get("input_tokens_total", expected))
+    result["prompt_tokens"] = result["input_tokens_total"]
+    result["completion_tokens"] = nonnegative_int(result.get("completion_tokens"))
+    result["reasoning_tokens"] = nonnegative_int(result.get("reasoning_tokens"))
+    result["output_tokens"] = nonnegative_int(result.get("output_tokens",
+                                                          result["completion_tokens"] - result["reasoning_tokens"]))
+    result["total_tokens"] = nonnegative_int(result.get("total_tokens",
+                                                        result["input_tokens_total"] + result["completion_tokens"]))
+    if result["input_tokens_total"] != expected or result["reasoning_tokens"] > result["completion_tokens"]:
+        result["cost_status"] = "INVALID_USAGE"
+    result.setdefault("usage_source", "TOKENSea_NORMALIZED")
+    result.setdefault("usage_evidence", {})
+    result.setdefault("cost_status", "COMPLETE")
+    return result
+
+
+def normalize_usage(usage: Any, provider_type: Optional[str] = None) -> Dict[str, Any]:
+    usage = usage if isinstance(usage, dict) else {}
+    if int(usage.get("usage_schema_version") or 0) >= 2:
+        return normalize_existing_usage(usage)
+    if isinstance(usage.get("usageMetadata"), dict):
+        usage = usage["usageMetadata"]
+    provider = str(provider_type or "").lower()
+    completion_details = usage.get("completion_tokens_details") if isinstance(usage.get("completion_tokens_details"), dict) else {}
+    reasoning = nonnegative_int(usage_value(completion_details, "reasoning_tokens",
+                                            default=usage_value(usage, "reasoning_tokens", "thoughtsTokenCount")))
+    negative_fields = ["prompt_tokens", "input_tokens", "completion_tokens", "output_tokens",
+                       "prompt_cache_hit_tokens", "prompt_cache_miss_tokens", "cache_read_input_tokens",
+                       "cache_creation_input_tokens", "cachedContentTokenCount", "cached_content_token_count"]
+    invalid = usage_has_negative(usage, negative_fields)
+
+    if "prompt_cache_hit_tokens" in usage or "prompt_cache_miss_tokens" in usage:
+        cache_read = nonnegative_int(usage_value(usage, "prompt_cache_hit_tokens"))
+        input_uncached = nonnegative_int(usage_value(usage, "prompt_cache_miss_tokens"))
+        prompt = nonnegative_int(usage_value(usage, "prompt_tokens", "input_tokens",
+                                             default=input_uncached + cache_read))
+        invalid = invalid or (prompt > 0 and prompt != input_uncached + cache_read)
+        completion = nonnegative_int(usage_value(usage, "completion_tokens", "output_tokens"))
+        total = nonnegative_int(usage_value(usage, "total_tokens", default=prompt + completion))
+        return complete_standard_usage(usage, "DEEPSEEK", input_uncached, cache_read, 0,
+                                       completion, reasoning, prompt, total, invalid)
+
+    if "cache_read_input_tokens" in usage or "cache_creation_input_tokens" in usage:
+        input_uncached = nonnegative_int(usage_value(usage, "input_tokens", "prompt_tokens"))
+        cache_read = nonnegative_int(usage_value(usage, "cache_read_input_tokens"))
+        cache_write = nonnegative_int(usage_value(usage, "cache_creation_input_tokens"))
+        completion = nonnegative_int(usage_value(usage, "output_tokens", "completion_tokens"))
+        input_total = input_uncached + cache_read + cache_write
+        total = nonnegative_int(usage_value(usage, "total_tokens", default=input_total + completion))
+        return complete_standard_usage(usage, "ANTHROPIC", input_uncached, cache_read, cache_write,
+                                       completion, reasoning, input_total, total, invalid)
+
+    gemini_fields = {"promptTokenCount", "candidatesTokenCount", "cachedContentTokenCount",
+                     "prompt_token_count", "candidates_token_count", "cached_content_token_count"}
+    if provider in {"gemini", "google", "vertex_ai", "vertex"} or gemini_fields.intersection(usage.keys()):
+        prompt = nonnegative_int(usage_value(usage, "promptTokenCount", "prompt_token_count", "prompt_tokens"))
+        cache_read = nonnegative_int(usage_value(usage, "cachedContentTokenCount", "cached_content_token_count"))
+        input_uncached = max(0, prompt - cache_read)
+        invalid = invalid or cache_read > prompt
+        completion = nonnegative_int(usage_value(usage, "candidatesTokenCount", "candidates_token_count",
+                                                 "completion_tokens", "output_tokens"))
+        total = nonnegative_int(usage_value(usage, "totalTokenCount", "total_token_count", "total_tokens",
+                                            default=prompt + completion))
+        return complete_standard_usage(usage, "GEMINI", input_uncached, cache_read, 0,
+                                       completion, reasoning, prompt, total, invalid)
+
+    prompt_details = usage.get("prompt_tokens_details") if isinstance(usage.get("prompt_tokens_details"), dict) else {}
+    if "cached_tokens" in prompt_details:
+        prompt = nonnegative_int(usage_value(usage, "prompt_tokens", "input_tokens"))
+        cache_read = nonnegative_int(prompt_details.get("cached_tokens"))
+        input_uncached = max(0, prompt - cache_read)
+        invalid = invalid or cache_read > prompt
+        completion = nonnegative_int(usage_value(usage, "completion_tokens", "output_tokens"))
+        total = nonnegative_int(usage_value(usage, "total_tokens", default=prompt + completion))
+        return complete_standard_usage(usage, "OPENAI", input_uncached, cache_read, 0,
+                                       completion, reasoning, prompt, total, invalid)
+
+    if "input_uncached_tokens" in usage:
+        input_uncached = nonnegative_int(usage.get("input_uncached_tokens"))
+        cache_read = nonnegative_int(usage_value(usage, "cache_read_tokens", "cached_tokens"))
+        cache_write = nonnegative_int(usage_value(usage, "cache_write_tokens"))
+        input_total = nonnegative_int(usage_value(usage, "input_tokens_total",
+                                                  default=input_uncached + cache_read + cache_write))
+        completion = nonnegative_int(usage_value(usage, "completion_tokens", "output_tokens"))
+        total = nonnegative_int(usage_value(usage, "total_tokens", default=input_total + completion))
+        return complete_standard_usage(usage, "LITELLM_NORMALIZED", input_uncached, cache_read, cache_write,
+                                       completion, reasoning, input_total, total, invalid)
+
+    prompt = nonnegative_int(usage_value(usage, "prompt_tokens", "input_tokens"))
+    completion = nonnegative_int(usage_value(usage, "completion_tokens", "output_tokens"))
+    cache_keys = [key for key, value in usage.items()
+                  if "cache" in str(key).lower() and key not in {"cache_ttl_seconds", "cacheTtlSeconds"}
+                  and value not in {None, 0, "0", False}]
+    incomplete = bool(cache_keys)
+    total = nonnegative_int(usage_value(usage, "total_tokens", default=prompt + completion))
+    source = "OPENAI" if provider in {"openai", "azure", "azure_openai"} else "LITELLM_GENERIC"
+    return complete_standard_usage(usage, source, prompt, 0, 0, completion, reasoning,
+                                   prompt, total, invalid, incomplete)
+
+
 def empty_usage():
     return {
+        "usage_schema_version": 2,
+        "usage_source": "EMPTY",
+        "usage_evidence": {},
+        "cost_status": "COMPLETE",
+        "input_uncached_tokens": 0,
+        "input_tokens_total": 0,
         "prompt_tokens": 0,
-        "completion_tokens": 0,
-        "total_tokens": 0,
         "cache_read_tokens": 0,
         "cache_write_tokens": 0,
+        "completion_tokens": 0,
+        "output_tokens": 0,
         "reasoning_tokens": 0,
+        "total_tokens": 0,
+        "cache_storage_token_seconds": 0,
+        "cache_ttl_seconds": 0,
         "cache_read_in_prompt": False,
         "cache_write_in_prompt": False,
         "reasoning_in_completion": False,
+        "image_count": 0,
+        "input_images": 0,
+        "output_images": 0,
+        "duration_seconds": 0,
+        "input_seconds": 0,
+        "output_seconds": 0,
+        "audio_seconds": 0,
+        "video_seconds": 0,
+        "duration_minutes": 0,
+        "input_minutes": 0,
+        "output_minutes": 0,
+        "audio_minutes": 0,
+        "input_characters": 0,
+        "output_characters": 0,
         "response_model": None,
     }
 
@@ -1715,6 +2379,36 @@ def parse_json_object(value: Any) -> Dict[str, Any]:
         return parsed if isinstance(parsed, dict) else {}
     except (TypeError, ValueError, json.JSONDecodeError):
         return {}
+
+
+def parse_json_array(value: Any) -> List[Dict[str, Any]]:
+    parsed: Any = value
+    if not value:
+        return []
+    if not isinstance(value, (list, dict)):
+        try:
+            parsed = json.loads(str(value))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return []
+    if isinstance(parsed, list):
+        return [dict(item) for item in parsed if isinstance(item, dict)]
+    if isinstance(parsed, dict):
+        result: List[Dict[str, Any]] = []
+        for component_type, raw in parsed.items():
+            variants = raw if isinstance(raw, list) else [raw]
+            for spec in variants:
+                if not isinstance(spec, dict):
+                    continue
+                item = dict(spec)
+                item.setdefault("componentType", str(component_type).upper())
+                item.setdefault("variant", "DEFAULT")
+                item.setdefault("mode", item.pop("componentMode", "EXPLICIT"))
+                item.setdefault("scope", {})
+                item.setdefault("priority", 100)
+                item.setdefault("metadata", {})
+                result.append(item)
+        return result
+    return []
 
 
 def bounded_int(value: Any, minimum: int, maximum: int) -> int:
@@ -1732,6 +2426,13 @@ def nonnegative_int(value: Any) -> int:
         return max(0, int(value or 0))
     except (TypeError, ValueError):
         return 0
+
+
+def nonnegative_number(value: Any) -> float:
+    try:
+        return max(0.0, float(value or 0))
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def extract_bearer(request: Request) -> str:

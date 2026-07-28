@@ -9,6 +9,8 @@ import org.springframework.stereotype.Service;
 import javax.crypto.SecretKey;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Date;
 import java.util.List;
 
@@ -27,11 +29,25 @@ public class JwtService {
     }
     public Identity identity(String token) {
         Claims claims = Jwts.parser().verifyWith(key).build().parseSignedClaims(token).getPayload();
-        Object raw = claims.get("roles");
-        List<String> roles = raw instanceof List<?> list ? list.stream().map(String::valueOf).toList() : List.of();
-        Object rawTenants = claims.get("tenant_ids");
-        List<String> tenantIds = rawTenants instanceof List<?> list ? list.stream().map(String::valueOf).toList() : List.of();
+        List<String> roles = claimList(claims.get("roles"));
+        List<String> tenantIds = claimList(claims.get("tenant_ids"));
         return new Identity(claims.getSubject(), roles, tenantIds);
+    }
+    private static List<String> claimList(Object value) {
+        if (value instanceof Collection<?> values) {
+            return values.stream().map(String::valueOf).map(String::trim).filter(item -> !item.isBlank()).toList();
+        }
+        if (!(value instanceof String text) || text.isBlank()) return List.of();
+        String normalized = text.trim();
+        if (normalized.startsWith("[") && normalized.endsWith("]")) {
+            normalized = normalized.substring(1, normalized.length() - 1);
+        }
+        List<String> result = new ArrayList<>();
+        for (String item : normalized.split(",")) {
+            String candidate = item.trim().replaceAll("^\"|\"$", "");
+            if (!candidate.isBlank()) result.add(candidate);
+        }
+        return result;
     }
     public record Identity(String userId, List<String> roles, List<String> tenantIds) {}
 }

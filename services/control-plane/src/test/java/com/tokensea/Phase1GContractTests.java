@@ -3,29 +3,36 @@ package com.tokensea;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.sun.net.httpserver.HttpServer;
 import com.tokensea.apikey.mapper.ApiKeyEntityMapper;
+import com.tokensea.asset.controller.PlatformModelController;
 import com.tokensea.asset.controller.ProviderTemplateController;
 import com.tokensea.asset.entity.PlatformModel;
 import com.tokensea.asset.entity.ProviderInstance;
 import com.tokensea.asset.mapper.PlatformModelMapper;
 import com.tokensea.asset.mapper.ProviderInstanceMapper;
 import com.tokensea.asset.service.ProviderConnectionService;
+import com.tokensea.audit.mapper.AuditLogMapper;
 import com.tokensea.dashboard.DashboardController;
+import com.tokensea.governance.EffectiveCostPriceResolver;
+import com.tokensea.governance.GovernanceApprovalService;
 import com.tokensea.price.entity.ModelPrice;
 import com.tokensea.price.mapper.ModelPriceMapper;
 import com.tokensea.provider.mapper.ProviderMapper;
 import com.tokensea.provider.mapper.ProviderSecretMapper;
 import com.tokensea.provider.service.CryptoService;
 import com.tokensea.route.entity.RoutePolicy;
+import com.tokensea.route.mapper.RoutePolicyMapper;
 import com.tokensea.route.service.RouteCandidateValidator;
 import com.tokensea.security.JwtService;
 import com.tokensea.tenant.controller.TenantWorkspaceController;
 import com.tokensea.tenant.mapper.TenantMapper;
 import com.tokensea.usage.mapper.UsageRecordMapper;
 import org.junit.jupiter.api.Test;
+import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.namedparam.MapSqlParameterSource;
 import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate;
 import org.springframework.security.access.AccessDeniedException;
 import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
+import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.web.server.ResponseStatusException;
 
 import java.net.InetSocketAddress;
@@ -103,6 +110,33 @@ class Phase1GContractTests {
     }
 
     @Test
+    void routeCandidateAcceptsApprovedDeploymentWithEffectiveOfficialPrice() {
+        JdbcTemplate jdbc = mock(JdbcTemplate.class);
+        EffectiveCostPriceResolver effectivePrices = mock(EffectiveCostPriceResolver.class);
+        RouteCandidateValidator validator = new RouteCandidateValidator(
+                mock(ModelPriceMapper.class), new ObjectMapper(), "CNY", jdbc, effectivePrices);
+        PlatformModel model = new PlatformModel();
+        model.setPlatformModelName("chat");
+        model.setProviderInstanceIds("[\"pi-1\"]"); model.setActualModels("[\"model-a\"]");
+        RoutePolicy route = new RoutePolicy();
+        route.setModelAlias("chat"); route.setStatus("ACTIVE");
+        route.setConfig("{\"candidates\":[{\"providerInstanceId\":\"pi-1\",\"actualModel\":\"model-a\"}]}");
+        when(jdbc.queryForList(anyString(), eq("pi-1"), eq("model-a")))
+                .thenReturn(List.of(Map.of("id", "deployment-1", "region", "cn")));
+        when(effectivePrices.resolve(eq("deployment-1"), any(OffsetDateTime.class), eq("cn"),
+                eq("STANDARD"), eq("DEFAULT"), eq("DEFAULT")))
+                .thenReturn(new EffectiveCostPriceResolver.ResolvedPrice(
+                        "price-1", "deployment-1", "PROVIDER_OFFICIAL", "USD", "TOKEN", 1_000_000L,
+                        1, 0, "EXPLICIT_ZERO", null, "NOT_APPLICABLE", 2, List.of(),
+                        "cn", "STANDARD", "DEFAULT", "DEFAULT",
+                        "https://official.example/pricing", "evidence", "使用供应商官方价", Map.of()));
+
+        assertDoesNotThrow(() -> validator.validate(model, route, true));
+        verify(effectivePrices).resolve(eq("deployment-1"), any(OffsetDateTime.class), eq("cn"),
+                eq("STANDARD"), eq("DEFAULT"), eq("DEFAULT"));
+    }
+
+    @Test
     void proxyDenialHasStableBusinessError() throws Exception {
         HttpServer proxy = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
         proxy.createContext("/", exchange -> { exchange.sendResponseHeaders(403, -1); exchange.close(); });
@@ -110,13 +144,65 @@ class Phase1GContractTests {
         try {
             ProviderConnectionService service = new ProviderConnectionService(
                     mock(ProviderSecretMapper.class), mock(CryptoService.class),
-                    "provider.example", "80", "127.0.0.1", proxy.getAddress().getPort());
+                    "example.com", "80", "127.0.0.1", proxy.getAddress().getPort(), false, "");
             ProviderInstance instance = new ProviderInstance();
-            instance.setApiBase("http://provider.example"); instance.setKeyStatus("无需 Key");
+            instance.setApiBase("http://example.com"); instance.setKeyStatus("无需 Key");
             var result = service.test(instance);
             assertFalse(result.success());
             assertEquals("PROVIDER_EGRESS_DENIED", result.errorCode());
         } finally { proxy.stop(0); }
+    }
+
+    @Test
+    void explicitLocalTestUpstreamBypassesProxyWithoutChangingProductionDefault() throws Exception {
+        HttpServer upstream = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        upstream.createContext("/v1/models", exchange -> {
+            byte[] body = "{\"object\":\"list\",\"data\":[{\"id\":\"deepseek-v4-flash\"}]}".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            exchange.getResponseHeaders().add("Content-Type", "application/json");
+            exchange.sendResponseHeaders(200, body.length);
+            exchange.getResponseBody().write(body);
+            exchange.close();
+        });
+        upstream.start();
+        try {
+            int port = upstream.getAddress().getPort();
+            ProviderConnectionService service = new ProviderConnectionService(
+                    mock(ProviderSecretMapper.class), mock(CryptoService.class),
+                    "host.docker.internal", String.valueOf(port), "127.0.0.1", 18080,
+                    true, "host.docker.internal");
+            ProviderInstance instance = new ProviderInstance();
+            instance.setApiBase("http://host.docker.internal:" + port + "/v1");
+            instance.setKeyStatus("无需 Key");
+
+            var result = service.test(instance);
+
+            assertTrue(result.success());
+            assertEquals("host.docker.internal", result.targetHost());
+            assertEquals("127.0.0.1", result.resolvedAddresses());
+        } finally { upstream.stop(0); }
+    }
+
+    @Test
+    void platformModelListIncludesAssociatedRouteStatus() {
+        PlatformModelMapper models = mock(PlatformModelMapper.class);
+        RoutePolicyMapper routes = mock(RoutePolicyMapper.class);
+        PlatformModel model = new PlatformModel();
+        model.setId("model-1");
+        model.setRoutePolicyId("route-1");
+        RoutePolicy route = new RoutePolicy();
+        route.setId("route-1");
+        route.setStatus("DRAFT");
+        when(models.selectList(any())).thenReturn(List.of(model));
+        when(routes.selectById("route-1")).thenReturn(route);
+        PlatformModelController controller = new PlatformModelController(
+                models, mock(ProviderInstanceMapper.class), mock(AuditLogMapper.class), routes,
+                mock(ProviderConnectionService.class), mock(RouteCandidateValidator.class),
+                new ObjectMapper(), mock(TransactionTemplate.class),
+                mock(GovernanceApprovalService.class), mock(JdbcTemplate.class));
+
+        List<PlatformModel> result = controller.list().data();
+
+        assertEquals("DRAFT", result.getFirst().getRouteStatus());
     }
 
     @Test

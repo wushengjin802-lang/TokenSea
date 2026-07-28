@@ -3,6 +3,8 @@ package com.tokensea.governance;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.tokensea.audit.service.AuditService;
 import com.tokensea.common.ApiResponse;
+import com.tokensea.common.PageQuery;
+import com.tokensea.common.PageResult;
 import com.tokensea.security.JwtService;
 import org.springframework.http.HttpStatus;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -50,7 +52,10 @@ public class ProviderPriceSyncController {
             Integer confirmationRuns,
             Map<String,Object> config,
             String status,
-            String parserVersion
+            String parserVersion,
+            String fetchMode,
+            Integer sourcePriority,
+            String priceNature
     ) {}
 
     public record DiffDecisionRequest(String reason) {}
@@ -74,13 +79,20 @@ public class ProviderPriceSyncController {
     }
 
     @GetMapping("/provider-price-sources")
-    public ApiResponse<List<Map<String,Object>>> sources() {
+    public ApiResponse<List<Map<String,Object>>> sources(@RequestParam(required=false) String status) {
         return ApiResponse.ok(jdbc.queryForList("""
             select s.*,
               (select count(*) from provider_price_sync_run r where r.price_source_id=s.id) sync_run_count,
-              (select count(*) from provider_price_diff d where d.price_source_id=s.id and d.status='PENDING') pending_diff_count
-            from provider_price_source s order by s.created_at desc
-            """));
+              (select count(*) from provider_price_diff d where d.price_source_id=s.id and d.status='PENDING') pending_diff_count,
+              (select r.parse_status from provider_price_sync_run r where r.price_source_id=s.id
+                order by r.created_at desc limit 1) parse_status,
+              (select r.diagnostic_snapshot from provider_price_sync_run r where r.price_source_id=s.id
+                order by r.created_at desc limit 1) source_evidence
+            from provider_price_source s
+            where (?::text is null and s.status<>'DISABLED')
+               or (?::text is not null and s.status=?)
+            order by s.created_at desc
+            """, status, status, status));
     }
 
     @PostMapping("/provider-price-sources")
@@ -96,13 +108,14 @@ public class ProviderPriceSyncController {
             insert into provider_price_source(
               id,name,source_class,adapter_code,provider_type,provider_instance_id,auth_mode,endpoint,official_hosts,
               region,default_currency,schedule_expression,auto_publish,max_auto_change_ratio,confirmation_runs,config,
-              status,next_run_at,parser_version,created_by,updated_by)
-            values(?,?,?,?,?,?,?,?,cast(? as jsonb),?,?,?,?,?,?,cast(? as jsonb),?,?,?,?,?)
+              status,next_run_at,parser_version,fetch_mode,source_priority,price_nature,created_by,updated_by)
+            values(?,?,?,?,?,?,?,?,cast(? as jsonb),?,?,?,?,?,?,cast(? as jsonb),?,?,?,?,?,?,?,?)
             """, id, value.name(), value.sourceClass(), value.adapterCode(), value.providerType(),
                 value.providerInstanceId(), value.authMode(), value.endpoint(), write(value.officialHosts()),
                 value.region(), value.defaultCurrency(), value.scheduleExpression(),
                 value.autoPublish(), value.maxAutoChangeRatio(), value.confirmationRuns(), write(value.config()),
-                value.status(), nextRun, value.parserVersion(), actor, actor);
+                value.status(), nextRun, value.parserVersion(), value.fetchMode(), value.sourcePriority(),
+                value.priceNature(), actor, actor);
         Map<String,Object> created = one("provider_price_source", id, "价格来源不存在");
         audits.record("PROVIDER_PRICE_SOURCE_CREATE", "ProviderPriceSource", id, null, created);
         return ApiResponse.ok(created);
@@ -124,12 +137,14 @@ public class ProviderPriceSyncController {
             update provider_price_source set name=?,source_class=?,adapter_code=?,provider_type=?,
               provider_instance_id=?,auth_mode=?,endpoint=?,official_hosts=cast(? as jsonb),region=?,default_currency=?,
               schedule_expression=?,auto_publish=?,max_auto_change_ratio=?,confirmation_runs=?,config=cast(? as jsonb),
-              status=?,next_run_at=?,parser_version=?,updated_by=?,updated_at=now() where id=?
+              status=?,next_run_at=?,parser_version=?,fetch_mode=?,source_priority=?,price_nature=?,
+              updated_by=?,updated_at=now() where id=?
             """, value.name(), value.sourceClass(), value.adapterCode(), value.providerType(),
                 value.providerInstanceId(), value.authMode(), value.endpoint(), write(value.officialHosts()),
                 value.region(), value.defaultCurrency(), value.scheduleExpression(),
                 value.autoPublish(), value.maxAutoChangeRatio(), value.confirmationRuns(), write(value.config()),
-                value.status(), nextRun, value.parserVersion(), actor, id);
+                value.status(), nextRun, value.parserVersion(), value.fetchMode(), value.sourcePriority(),
+                value.priceNature(), actor, id);
         Map<String,Object> after = one("provider_price_source", id, "价格来源不存在");
         audits.record("PROVIDER_PRICE_SOURCE_UPDATE", "ProviderPriceSource", id, before, after);
         return ApiResponse.ok(after);
@@ -137,6 +152,11 @@ public class ProviderPriceSyncController {
 
     @PostMapping("/provider-price-sources/{id}/test")
     public ApiResponse<ProviderPriceSyncService.FetchPreview> testSource(@PathVariable("id") String id) {
+        return ApiResponse.ok(sync.preview(id));
+    }
+
+    @PostMapping("/provider-price-sources/{id}/test-parse")
+    public ApiResponse<ProviderPriceSyncService.FetchPreview> testParse(@PathVariable("id") String id) {
         return ApiResponse.ok(sync.preview(id));
     }
 
@@ -216,28 +236,100 @@ public class ProviderPriceSyncController {
     }
 
     @GetMapping("/provider-price-diffs")
-    public ApiResponse<List<Map<String,Object>>> diffs(@RequestParam(required=false) String status,
-                                                        @RequestParam(required=false) String riskLevel,
-                                                        @RequestParam(required=false) String sourceId) {
-        return ApiResponse.ok(jdbc.queryForList("""
-            select d.*,s.name source_name,s.adapter_code
-            from provider_price_diff d join provider_price_source s on s.id=d.price_source_id
+    public ApiResponse<PageResult<Map<String,Object>>> diffs(@RequestParam(required=false) String status,
+                                                               @RequestParam(required=false) String riskLevel,
+                                                               @RequestParam(required=false) String sourceId,
+                                                               @RequestParam(required=false) Integer page,
+                                                               @RequestParam(required=false) Integer size,
+                                                               @RequestParam(required=false) String keyword,
+                                                               @RequestParam(required=false) String sort,
+                                                               @RequestParam(required=false) String order) {
+        PageQuery paging = PageQuery.of(page, size, sort, order, Map.ofEntries(
+                Map.entry("id", "d.id"),
+                Map.entry("sourceName", "s.name"),
+                Map.entry("providerType", "d.provider_type"),
+                Map.entry("providerModelName", "d.provider_model_name"),
+                Map.entry("region", "d.region"),
+                Map.entry("requestMode", "d.request_mode"),
+                Map.entry("serviceTier", "d.service_tier"),
+                Map.entry("contextTier", "d.context_tier"),
+                Map.entry("diffType", "d.diff_type"),
+                Map.entry("changeRatio", "d.change_ratio"),
+                Map.entry("riskLevel", "d.risk_level"),
+                Map.entry("confirmationProgress", "d.confirmation_count"),
+                Map.entry("status", "d.status"),
+                Map.entry("decidedByName", "decided_by_name"),
+                Map.entry("decidedAt", "d.decided_at"),
+                Map.entry("createdAt", "d.created_at")
+        ), "createdAt", "desc");
+        String normalizedStatus = blank(status) ? null : status.trim().toUpperCase(Locale.ROOT);
+        String normalizedRisk = blank(riskLevel) ? null : riskLevel.trim().toUpperCase(Locale.ROOT);
+        String q = blank(keyword) ? null : "%" + keyword.trim().toLowerCase(Locale.ROOT) + "%";
+        String filter = """
             where (?::text is null or d.status=?) and (?::text is null or d.risk_level=?)
               and (?::text is null or d.price_source_id=?)
-            order by case d.risk_level when 'CRITICAL' then 0 when 'HIGH' then 1 when 'MEDIUM' then 2 else 3 end,
-              d.created_at desc
-            """, status, status, riskLevel, riskLevel, sourceId, sourceId));
+              and (?::text is null or lower(concat_ws(' ',s.name,d.provider_type,d.provider_model_name,
+                    d.region,d.request_mode,d.service_tier,d.context_tier,d.diff_type,d.risk_level,d.status)) like ?)
+            """;
+        Object[] filters = {normalizedStatus, normalizedStatus, normalizedRisk, normalizedRisk,
+                sourceId, sourceId, q, q};
+        String projection = """
+            select d.*,s.name source_name,s.adapter_code,s.confirmation_runs confirmation_required,
+              concat(d.confirmation_count,'/',s.confirmation_runs) confirmation_progress,
+              case
+                when d.decided_by is null then null
+                when d.decided_by='SYSTEM' then chr(31995)||chr(32479)
+                when u.display_name is null
+                  or btrim(u.display_name)=''
+                  or translate(btrim(u.display_name),chr(63)||chr(65311)||chr(65533),'')=''
+                  then coalesce(u.username,d.decided_by)
+                else btrim(u.display_name)
+              end decided_by_name
+            from provider_price_diff d
+            join provider_price_source s on s.id=d.price_source_id
+            left join user_account u on u.id=d.decided_by
+            """;
+        List<Map<String,Object>> rows = jdbc.queryForList(
+                projection + filter + " order by " + paging.sortColumn() + " " + paging.direction()
+                        + ("d.id".equals(paging.sortColumn()) ? "" : ", d.id " + paging.direction())
+                        + " limit ? offset ?",
+                append(filters, paging.size(), paging.offset()));
+        Long total = jdbc.queryForObject("""
+            select count(*) from provider_price_diff d
+            join provider_price_source s on s.id=d.price_source_id
+            left join user_account u on u.id=d.decided_by
+            """ + filter, Long.class, filters);
+        return ApiResponse.ok(new PageResult<>(rows, total == null ? 0 : total, paging.page(), paging.size()));
     }
 
     @GetMapping("/provider-price-diffs/{id}")
     public ApiResponse<Map<String,Object>> diff(@PathVariable("id") String id) {
-        return ApiResponse.ok(one("provider_price_diff", id, "价格差异不存在"));
+        List<Map<String,Object>> rows = jdbc.queryForList("""
+            select d.*,s.name source_name,s.adapter_code,s.confirmation_runs confirmation_required,
+              concat(d.confirmation_count,'/',s.confirmation_runs) confirmation_progress,
+              case
+                when d.decided_by is null then null
+                when d.decided_by='SYSTEM' then chr(31995)||chr(32479)
+                when u.display_name is null
+                  or btrim(u.display_name)=''
+                  or translate(btrim(u.display_name),chr(63)||chr(65311)||chr(65533),'')=''
+                  then coalesce(u.username,d.decided_by)
+                else btrim(u.display_name)
+              end decided_by_name
+            from provider_price_diff d
+            join provider_price_source s on s.id=d.price_source_id
+            left join user_account u on u.id=d.decided_by
+            where d.id=?
+            """, id);
+        if (rows.isEmpty()) throw new ResponseStatusException(HttpStatus.NOT_FOUND, "价格差异不存在");
+        return ApiResponse.ok(rows.get(0));
     }
 
     @PostMapping("/provider-price-diffs/{id}/approve")
     public ApiResponse<Map<String,Object>> approveDiff(@PathVariable("id") String id,
                                                         @RequestBody(required=false) DiffDecisionRequest request,
                                                         Authentication authentication) {
+        requirePlatformAdmin(authentication);
         return ApiResponse.ok(sync.approveDiff(id, actor(authentication), request == null ? null : request.reason()));
     }
 
@@ -245,11 +337,21 @@ public class ProviderPriceSyncController {
     public ApiResponse<Map<String,Object>> rejectDiff(@PathVariable("id") String id,
                                                        @RequestBody(required=false) DiffDecisionRequest request,
                                                        Authentication authentication) {
+        requirePlatformAdmin(authentication);
         return ApiResponse.ok(sync.rejectDiff(id, actor(authentication), request == null ? null : request.reason()));
     }
 
+    @PostMapping("/provider-price-diffs/{id}/revoke")
+    public ApiResponse<Map<String,Object>> revokeDiff(@PathVariable("id") String id,
+                                                       @RequestBody(required=false) DiffDecisionRequest request,
+                                                       Authentication authentication) {
+        requirePlatformAdmin(authentication);
+        return ApiResponse.ok(sync.revokeDiff(id, actor(authentication), request == null ? null : request.reason()));
+    }
+
     private PriceSourceRequest normalize(PriceSourceRequest request, Map<String,Object> before) {
-        if (request == null) request = new PriceSourceRequest(null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null);
+        if (request == null) request = new PriceSourceRequest(
+                null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null);
         String sourceClass = choose(request.sourceClass(), before, "source_class", "PUBLIC_REFERENCE");
         String adapter = choose(request.adapterCode(), before, "adapter_code", "LITELLM_COST_MAP");
         String endpoint = choose(request.endpoint(), before, "endpoint", "");
@@ -270,24 +372,47 @@ public class ProviderPriceSyncController {
                         : before == null ? 1 : ((Number) before.get("confirmation_runs")).intValue(),
                 request.config() != null ? request.config() : before == null ? Map.of() : readMap(before.get("config")),
                 choose(request.status(), before, "status", "DRAFT"),
-                choose(request.parserVersion(), before, "parser_version", "1.0.0"));
+                choose(request.parserVersion(), before, "parser_version", "1.0.0"),
+                choose(request.fetchMode(), before, "fetch_mode", "AUTO"),
+                request.sourcePriority() != null ? request.sourcePriority()
+                        : before == null ? 100 : ((Number) before.get("source_priority")).intValue(),
+                choose(request.priceNature(), before, "price_nature", "ORIGINAL"));
     }
 
     private void validate(PriceSourceRequest request) {
         if (blank(request.name()) || blank(request.endpoint()) || request.officialHosts().isEmpty()) bad("价格源名称、地址和官方域名不能为空");
         if (!Set.of("PUBLIC_REFERENCE","OFFICIAL").contains(request.sourceClass())) bad("价格来源类别无效");
-        if (!Set.of("LITELLM_COST_MAP","MODELS_DEV","DEEPSEEK_OFFICIAL_PAGE","OFFICIAL_JSON","OFFICIAL_CSV").contains(request.adapterCode())) bad("价格适配器无效");
+        if (!Set.of("LITELLM_COST_MAP","MODELS_DEV","AZURE_RETAIL_PRICES","AWS_PRICE_LIST_BULK",
+                "GOOGLE_CLOUD_CATALOG","GENERIC_DOCUMENT","DEEPSEEK_OFFICIAL_PAGE","QWEN_OFFICIAL_PAGE",
+                "KIMI_OFFICIAL_PAGE","XIAOMI_MIMO_OFFICIAL_PAGE","ZHIPU_OFFICIAL_PAGE",
+                "OFFICIAL_JSON","OFFICIAL_CSV").contains(request.adapterCode())) bad("价格适配器无效");
         if (Set.of("LITELLM_COST_MAP","MODELS_DEV").contains(request.adapterCode()) && !"PUBLIC_REFERENCE".equals(request.sourceClass()))
             bad("LiteLLM 与 models.dev 只能作为公共参考来源");
-        if (Set.of("DEEPSEEK_OFFICIAL_PAGE","OFFICIAL_JSON","OFFICIAL_CSV").contains(request.adapterCode()) && !"OFFICIAL".equals(request.sourceClass()))
-            bad("供应商专用或官方结构化适配器必须用于供应商官方价格来源");
+        if (Set.of("AZURE_RETAIL_PRICES","AWS_PRICE_LIST_BULK","GOOGLE_CLOUD_CATALOG","GENERIC_DOCUMENT",
+                "DEEPSEEK_OFFICIAL_PAGE","QWEN_OFFICIAL_PAGE","KIMI_OFFICIAL_PAGE",
+                "XIAOMI_MIMO_OFFICIAL_PAGE","ZHIPU_OFFICIAL_PAGE","OFFICIAL_JSON","OFFICIAL_CSV")
+                .contains(request.adapterCode()) && !"OFFICIAL".equals(request.sourceClass()))
+            bad("云价格目录、通用文档或供应商专用适配器必须用于供应商官方价格来源");
         if ("DEEPSEEK_OFFICIAL_PAGE".equals(request.adapterCode()) && !"deepseek".equalsIgnoreCase(request.providerType()))
             bad("DeepSeek 官方价格页适配器只能绑定 DeepSeek 供应商");
+        if ("QWEN_OFFICIAL_PAGE".equals(request.adapterCode()) && !"qwen".equalsIgnoreCase(request.providerType()))
+            bad("千问官方价格页适配器只能绑定 Qwen 供应商");
+        if ("KIMI_OFFICIAL_PAGE".equals(request.adapterCode()) && !"moonshot".equalsIgnoreCase(request.providerType()))
+            bad("Kimi 官方价格页适配器只能绑定 Moonshot 供应商");
+        if ("XIAOMI_MIMO_OFFICIAL_PAGE".equals(request.adapterCode()) && !"xiaomi_mimo".equalsIgnoreCase(request.providerType()))
+            bad("Xiaomi MiMo 官方价格页适配器只能绑定 Xiaomi MiMo 供应商");
+        if ("ZHIPU_OFFICIAL_PAGE".equals(request.adapterCode()) && !"zhipu".equalsIgnoreCase(request.providerType()))
+            bad("智谱官方价格页适配器只能绑定 Zhipu 供应商");
         if ("OFFICIAL".equals(request.sourceClass()) && blank(request.providerType())) bad("供应商官方价格来源必须指定供应商类型");
         if (!Set.of("NONE","PROVIDER_INSTANCE").contains(request.authMode())) bad("价格源认证方式无效");
         if ("NONE".equals(request.authMode()) && !blank(request.providerInstanceId())) bad("无认证价格源不能绑定供应商渠道");
         if ("PROVIDER_INSTANCE".equals(request.authMode()) && blank(request.providerInstanceId())) bad("渠道凭据认证必须绑定供应商渠道");
         if ("PUBLIC_REFERENCE".equals(request.sourceClass()) && !"NONE".equals(request.authMode())) bad("公共参考价格源不能使用供应商渠道凭据");
+        Object authHeader = request.config().get("authHeader");
+        if (authHeader != null && !Set.of("x-goog-api-key", "api-key", "x-api-key")
+                .contains(String.valueOf(authHeader).toLowerCase(Locale.ROOT))) {
+            bad("价格源自定义认证头仅允许 x-goog-api-key、api-key 或 x-api-key");
+        }
         if (!blank(request.providerInstanceId())) {
             if (blank(request.providerType())) bad("绑定供应商渠道前必须指定供应商类型");
             List<Map<String,Object>> channels = jdbc.queryForList("select provider_type from provider_instance where id=?", request.providerInstanceId());
@@ -299,6 +424,9 @@ public class ProviderPriceSyncController {
         if (request.maxAutoChangeRatio().signum() < 0 || request.maxAutoChangeRatio().compareTo(new BigDecimal("10")) > 0)
             bad("自动发布价格变化比例必须在0到10之间");
         if (request.confirmationRuns() < 1 || request.confirmationRuns() > 10) bad("连续确认次数必须在1到10之间");
+        if (!Set.of("AUTO","STRUCTURED_HTTP","STATIC_HTML","HEADLESS").contains(request.fetchMode())) bad("价格获取模式无效");
+        if (request.sourcePriority() < 1 || request.sourcePriority() > 10000) bad("来源优先级必须在1到10000之间");
+        if (!Set.of("ORIGINAL","PROMOTIONAL","FREE_QUOTA").contains(request.priceNature())) bad("价格性质无效");
         if (!Set.of("DRAFT","ACTIVE","PAUSED","DEGRADED","DISABLED").contains(request.status())) bad("价格源状态无效");
         try { Duration.parse(request.scheduleExpression()); } catch (Exception e) { bad("同步周期必须是 ISO-8601 Duration"); }
         URI uri;
@@ -313,6 +441,21 @@ public class ProviderPriceSyncController {
         }
         if ("OFFICIAL_CSV".equals(request.adapterCode()) && !request.config().containsKey("modelField"))
             bad("官方 CSV 适配器必须配置 modelField");
+        if (Set.of("AZURE_RETAIL_PRICES","AWS_PRICE_LIST_BULK","GOOGLE_CLOUD_CATALOG")
+                .contains(request.adapterCode())
+                && !request.config().containsKey("modelPattern")
+                && !(request.config().get("modelMappings") instanceof Map<?,?> mappings && !mappings.isEmpty())) {
+            bad("云价格目录适配器必须配置 modelPattern 或 modelMappings，避免把非模型 SKU 误识别为价格");
+        }
+        if ("GENERIC_DOCUMENT".equals(request.adapterCode())) {
+            boolean llmEnabled = Boolean.TRUE.equals(request.config().get("llmEnabled"));
+            boolean deterministic = request.config().containsKey("modelField")
+                    && (request.config().containsKey("inputField") || request.config().containsKey("outputField")
+                    || request.config().containsKey("cacheReadField") || request.config().containsKey("cacheWriteField"));
+            if (!llmEnabled && !deterministic) {
+                bad("通用文档适配器必须配置字段映射，或显式启用 llmEnabled");
+            }
+        }
     }
 
     private Map<String,Object> one(String table, String id, String message) {
@@ -370,6 +513,26 @@ public class ProviderPriceSyncController {
     }
 
     private static BigDecimal decimal(Object value) { return new BigDecimal(String.valueOf(value)); }
+    private static Object[] append(Object[] values, Object... extra) {
+        Object[] result = new Object[values.length + extra.length];
+        System.arraycopy(values, 0, result, 0, values.length);
+        System.arraycopy(extra, 0, result, values.length, extra.length);
+        return result;
+    }
+    private void requirePlatformAdmin(Authentication authentication) {
+        if (!(authentication != null && authentication.getPrincipal() instanceof JwtService.Identity identity)) {
+            throw new ResponseStatusException(HttpStatus.FORBIDDEN, "当前登录会话无效");
+        }
+        Boolean admin = jdbc.queryForObject("""
+            select exists(
+              select 1 from user_role ur join role r on r.id=ur.role_id
+              where ur.user_id=? and r.code='ADMIN'
+            )
+            """, Boolean.class, identity.userId());
+        if (!Boolean.TRUE.equals(admin)) {
+            throw new ResponseStatusException(HttpStatus.FORBIDDEN, "当前账号不是平台管理员，不能审核价格差异");
+        }
+    }
     private static String actor(Authentication authentication) { return authentication != null && authentication.getPrincipal() instanceof JwtService.Identity identity ? identity.userId() : "SYSTEM"; }
     private static String id() { return UUID.randomUUID().toString().replace("-", ""); }
     private static boolean blank(String value) { return value == null || value.isBlank(); }

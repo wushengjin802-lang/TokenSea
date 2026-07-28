@@ -9,10 +9,6 @@
           <span>Enterprise LLM Control Plane</span>
         </div>
       </router-link>
-      <label class="global-search">
-        <span class="sr-only">全局搜索</span>
-        <input v-model.trim="search" placeholder="搜索模型、渠道、Key、租户、请求 ID、同步任务" @keyup.enter="goSearch" />
-      </label>
       <div class="top-actions">
         <span :class="['pill', health === 'ok' ? 'healthy' : '']"><i class="dot"></i>{{ healthText }}</span>
         <span class="pill">{{ admin ? '全局视图' : '租户视图' }}</span>
@@ -41,32 +37,29 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { api, identity, isAdmin } from '../api/client'
+import { api, identity } from '../api/client'
 import { visibleMenuGroups } from '../config/menu'
 import IconSvg from '../components/IconSvg.vue'
 
 const router = useRouter()
 const route = useRoute()
-const session = identity()
-const admin = isAdmin()
-const home = admin ? '/dashboard' : '/workspace'
-const groups = computed(() => visibleMenuGroups(session.roles))
+const session = ref(identity())
+const admin = computed(() => session.value.roles.includes('ADMIN'))
+const home = computed(() => admin.value ? '/dashboard' : '/workspace')
+const groups = computed(() => visibleMenuGroups(session.value.roles))
 const expanded = reactive<Record<string, boolean>>({})
 const health = ref<'ok' | 'error' | 'checking'>('checking')
-const search = ref('')
-const initials = computed(() => (session.username || session.userId || 'TS').slice(0, 2).toUpperCase())
+const initials = computed(() => (session.value.username || session.value.userId || 'TS').slice(0, 2).toUpperCase())
 const healthText = computed(() => health.value === 'ok' ? '生产集群正常' : health.value === 'error' ? '控制面不可用' : '正在检查集群')
 
 function toggle(key: string) { expanded[key] = !expanded[key] }
 function expandCurrent() {
-  groups.value.forEach((group) => { if (group.items.some((item) => route.path === item.path)) expanded[group.key] = true })
+  groups.value.forEach((group) => {
+    if (!(group.key in expanded) && group.defaultExpanded) expanded[group.key] = true
+    if (group.items.some((item) => route.path === item.path)) expanded[group.key] = true
+  })
 }
-function goSearch() {
-  const keyword = search.value
-  if (!keyword) return
-  router.push({ path: '/logs', query: { keyword } })
-}
-function onAccountMenuClick({ key }: { key: string }) { if (key === 'logout') { localStorage.removeItem('tokensea_token'); router.replace('/') } }
+function onAccountMenuClick({ key }: { key: string }) { if (key === 'logout') { localStorage.removeItem('tokensea_token'); session.value = identity(); router.replace('/') } }
 onMounted(async () => { expandCurrent(); try { await api.get('/actuator/health'); health.value = 'ok' } catch { health.value = 'error' } })
-watch(() => route.path, expandCurrent)
+watch(() => route.path, () => { session.value = identity(); expandCurrent() })
 </script>

@@ -1,8 +1,17 @@
 # 研发模式覆盖：基础设施保留 Docker，业务服务在宿主机本地运行。
 # 仅与 docker-compose.yml 一起使用，不能用于测试、预发布或生产部署。
 services:
+  tokensea-headless-fetcher:
+    ports:
+      - "127.0.0.1:${TOKENSEA_HEADLESS_FETCHER_PORT:-39219}:39219"
+    networks:
+      - tokensea-internal
+      - tokensea-public
+
   tokensea-egress-proxy:
     ports:
       - "127.0.0.1:${TOKENSEA_EGRESS_PROXY_PORT:-18080}:18080"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
       TOKENSEA_EGRESS_POLICY_URL: http://host.docker.internal:${TOKENSEA_CONTROL_PORT:-39211}/internal/egress/allowed-hosts

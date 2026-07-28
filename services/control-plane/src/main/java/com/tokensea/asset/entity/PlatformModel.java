@@ -1,5 +1,6 @@
 package com.tokensea.asset.entity;
 
+import com.baomidou.mybatisplus.annotation.TableField;
 import com.baomidou.mybatisplus.annotation.TableName;
 import com.tokensea.common.BaseEntity;
 import lombok.Data;
@@ -21,4 +22,6 @@ public class PlatformModel extends BaseEntity {
     private String visibilityScope;
     private Boolean approvalRequired;
     private String status;
+    @TableField(exist = false)
+    private String routeStatus;
 }

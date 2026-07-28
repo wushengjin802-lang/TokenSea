@@ -1,0 +1,75 @@
+{
+  "steps": [
+    {
+      "step": "Mock 上游",
+      "status": "PASS",
+      "detail": "39301 健康检查通过"
+    },
+    {
+      "step": "平台健康",
+      "status": "PASS",
+      "detail": "Control Plane 与 Gateway 均正常"
+    },
+    {
+      "step": "供应商渠道",
+      "status": "PASS",
+      "detail": "E2E DeepSeek Flash Mock 已托管测试凭据、连接成功并启用"
+    },
+    {
+      "step": "模型部署与能力",
+      "status": "PASS",
+      "detail": "发现 1 个模型，deepseek-v4-flash 已审核且 LIVE_PROBE=PASSED"
+    },
+    {
+      "step": "价格生成",
+      "status": "PASS",
+      "detail": "deepseek-v4-flash PROVIDER_OFFICIAL V2，输入 0.00014，输出 0.00028 USD"
+    },
+    {
+      "step": "路由策略",
+      "status": "PASS",
+      "detail": "E2E DeepSeek V4 Flash Route 已生效，价格版本 0fc7978f91864f1bbbc2b77cb1c34b5e"
+    },
+    {
+      "step": "企业服务模型",
+      "status": "PASS",
+      "detail": "deepseek-v4-flash 已发布并绑定 ACTIVE 路由"
+    },
+    {
+      "step": "租户体系",
+      "status": "PASS",
+      "detail": "租户、项目、应用均已启用（tenant=44ba1296…）"
+    },
+    {
+      "step": "Virtual Key",
+      "status": "PASS",
+      "detail": "已审批并生成，前缀 ts_nd8RCcTE6…（明文未输出）"
+    },
+    {
+      "step": "Key 模型范围",
+      "status": "PASS",
+      "detail": "/v1/models 可见 deepseek-v4-flash"
+    },
+    {
+      "step": "真实 Gateway 调用",
+      "status": "PASS",
+      "detail": "返回成功，requestId=86f7d86fc1ef4da6a841162052f5b9ec"
+    },
+    {
+      "step": "用量与成本",
+      "status": "PASS",
+      "detail": "tokens=20，priceLayer=PROVIDER_OFFICIAL，currency=USD"
+    }
+  ],
+  "warnings": [],
+  "ids": {
+    "providerInstanceId": "1e2636250650eb4c62cf66fb0f73108c",
+    "deploymentId": "e0f70f4756c049928d19802b18d12915",
+    "priceVersionId": "0fc7978f91864f1bbbc2b77cb1c34b5e",
+    "platformModelId": "782eda9634b7073ffe59d2a51d8bfd82",
+    "routePolicyId": "e79616e133fc6e98d7eaa0f3249c0837",
+    "tenantId": "44ba129653d2f7ab1f659e8c69f8f4f8",
+    "apiKeyId": "9e2bfeb8c9764e5944ac10bdec18c1cc",
+    "requestId": "86f7d86fc1ef4da6a841162052f5b9ec"
+  }
+}

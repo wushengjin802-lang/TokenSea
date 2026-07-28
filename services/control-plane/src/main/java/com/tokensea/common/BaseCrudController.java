@@ -62,20 +62,21 @@ public abstract class BaseCrudController<T> {
         T before = mapper().selectById(id);
         if (before == null) throw new ResponseStatusException(HttpStatus.NOT_FOUND, "资源不存在");
         if (mapper().deleteById(id) != 1) throw new ResponseStatusException(HttpStatus.CONFLICT, "资源删除失败");
-        audit("DELETE", before, before);
+        audit("DELETE", null, before);
         return ApiResponse.ok(true);
     }
 
     protected void audit(String action, T after, T before) {
-        if (after == null) return;
+        T target = after == null ? before : after;
+        if (target == null) return;
         try {
             AuditLog log = new AuditLog();
             log.setId(UUID.randomUUID().toString().replace("-", ""));
             log.setAction(action);
-            log.setObjectType(after.getClass().getSimpleName());
-            log.setObjectId(readId(after));
+            log.setObjectType(target.getClass().getSimpleName());
+            log.setObjectId(readId(target));
             log.setBeforeValue(before == null ? null : objectMapper.writeValueAsString(before));
-            log.setAfterValue(objectMapper.writeValueAsString(after));
+            log.setAfterValue(after == null ? null : objectMapper.writeValueAsString(after));
             auditLogMapper.insert(log);
         } catch (Exception e) {
             // Key/model/route/provider mutations are not allowed to succeed without audit evidence.

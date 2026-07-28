@@ -6,6 +6,7 @@ import 'ant-design-vue/dist/reset.css'
 import './style.css'
 import './mvp.css'
 import './prototype.css'
+import './list-layout.css'
 import App from './App.vue'
 import router from './router'
 

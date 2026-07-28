@@ -3,6 +3,7 @@ package com.tokensea.config;
 import com.tokensea.security.JwtAuthFilter;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.http.HttpMethod;
 import org.springframework.security.authentication.AuthenticationManager;
 import org.springframework.security.config.annotation.authentication.configuration.AuthenticationConfiguration;
 import org.springframework.security.config.annotation.web.builders.HttpSecurity;
@@ -18,6 +19,7 @@ import org.springframework.web.cors.CorsConfigurationSource;
 import org.springframework.web.cors.UrlBasedCorsConfigurationSource;
 import java.util.List;
 import java.util.Arrays;
+import jakarta.servlet.DispatcherType;
 
 @Configuration
 public class SecurityConfig {
@@ -31,9 +33,15 @@ public class SecurityConfig {
             .cors(cors -> cors.configurationSource(corsConfigurationSource))
             .sessionManagement(sm -> sm.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
             .authorizeHttpRequests(auth -> auth
+                .dispatcherTypeMatchers(DispatcherType.ERROR).permitAll()
+                .requestMatchers("/error").permitAll()
                 .requestMatchers("/api/auth/login", "/api/bootstrap/admin", "/internal/egress/allowed-hosts", "/actuator/health", "/v3/api-docs/**", "/swagger-ui/**", "/swagger-ui.html").permitAll()
                 .requestMatchers("/api/tenant/**").authenticated()
                 .requestMatchers("/api/quickstart/**").authenticated()
+                // 价格差异审批使用控制器内的数据库实时平台管理员校验。
+                // 这里仅要求有效登录，避免通用 hasRole 规则因旧 JWT 角色声明
+                // 或角色格式差异在进入控制器前直接返回无正文 403。
+                .requestMatchers(HttpMethod.POST, "/api/provider-price-diffs/**").authenticated()
                 .requestMatchers("/api/**").hasRole("ADMIN")
                 .anyRequest().authenticated())
             .addFilterBefore(filter, UsernamePasswordAuthenticationFilter.class)

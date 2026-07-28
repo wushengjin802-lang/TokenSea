@@ -19,7 +19,7 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "Unable to stop Docker application services." }
 
     & docker compose -p tokensea --env-file ./.env -f docker-compose.yml -f docker-compose.dev.yml up -d `
-        tokensea-postgres tokensea-redis tokensea-egress-proxy tokensea-runtime-core
+        tokensea-postgres tokensea-redis tokensea-egress-proxy tokensea-headless-fetcher tokensea-runtime-core
     if ($LASTEXITCODE -ne 0) { throw "Unable to start Docker infrastructure." }
 } finally {
     Pop-Location

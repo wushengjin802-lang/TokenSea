@@ -29,8 +29,12 @@ public class AuthController {
         if (u == null || !"ACTIVE".equalsIgnoreCase(u.getStatus()) || !encoder.matches(req.password(), u.getPasswordHash())) {
             return ApiResponse.fail("用户名或密码错误");
         }
-        List<String> roles = jdbc.queryForList("select r.code from role r join user_role ur on ur.role_id=r.id where ur.user_id=?", String.class, u.getId());
-        List<String> tenantIds = jdbc.queryForList("select tenant_id from user_tenant where user_id=? and status='ACTIVE'", String.class, u.getId());
+        List<String> roles = jdbc.queryForList("""
+            select r.code from role r join user_role ur on ur.role_id=r.id
+            where ur.user_id=? and r.status='ACTIVE' order by r.code
+            """, String.class, u.getId());
+        List<String> tenantIds = jdbc.queryForList("select tenant_id from user_tenant where user_id=? and status='ACTIVE' order by tenant_id", String.class, u.getId());
+        jdbc.update("update user_account set last_login_at=now(),updated_at=now() where id=?",u.getId());
         return ApiResponse.ok(new LoginResponse(jwt.issue(u.getId(), u.getUsername(), roles, tenantIds), u.getId(), u.getUsername(), u.getDisplayName()));
     }
 }

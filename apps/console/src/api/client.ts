@@ -1,10 +1,26 @@
 import axios, { type AxiosRequestConfig } from 'axios'
 
 export const api = axios.create({ baseURL: import.meta.env.VITE_API_BASE || 'http://localhost:39211', timeout: 20000 })
-export const gatewayBase = import.meta.env.VITE_GATEWAY_BASE || 'http://localhost:39212'
+
+function resolveBrowserServiceBase(configured: string) {
+  const normalized = configured.replace(/\/+$/, '')
+  if (typeof window === 'undefined') return normalized
+  try {
+    const url = new URL(normalized)
+    const localHosts = new Set(['localhost', '127.0.0.1', '::1'])
+    if (localHosts.has(url.hostname) && !localHosts.has(window.location.hostname)) {
+      url.hostname = window.location.hostname
+    }
+    return url.toString().replace(/\/+$/, '')
+  } catch {
+    return normalized
+  }
+}
+
+export const gatewayBase = resolveBrowserServiceBase(import.meta.env.VITE_GATEWAY_BASE || 'http://localhost:39212')
 
 export type SessionIdentity = { userId?: string; username?: string; roles: string[]; tenantIds: string[] }
-export type PageQuery = { page?: number; size?: number; keyword?: string; status?: string; sort?: string; order?: 'asc' | 'desc' }
+export type PageQuery = { page?: number; size?: number; keyword?: string; status?: string; scope?: string; productionStatus?: string; sort?: string; order?: 'asc' | 'desc' }
 export type PageResult<T> = { items: T[]; total: number; serverPaged: boolean }
 
 api.interceptors.request.use((config) => {
@@ -24,15 +40,30 @@ api.interceptors.response.use((response) => response, (error) => {
   return Promise.reject(error)
 })
 
-export function errorMessage(error: unknown): string {
+export function errorMessage(error: unknown, location = '当前操作'): string {
   const value = error as any
-  if (value?.response?.status === 403) {
-    if (!identity().roles.includes('ADMIN')) return '当前登录会话未包含平台管理员权限，请退出后重新登录'
-    return value?.response?.data?.message || value?.response?.data?.detail || '当前账号无权访问该租户范围'
+  const responseData = value?.response?.data
+  const detail = responseData?.data ?? responseData
+  if (detail?.location || detail?.problem || detail?.action) {
+    const parts = [
+      detail.location ? `异常位置：${detail.location}` : '',
+      detail.problem ? `异常原因：${detail.problem}` : '',
+      detail.action ? `处理方式：${detail.action}` : '',
+    ].filter(Boolean)
+    return parts.join('；')
   }
-  return value?.response?.data?.message || value?.response?.data?.detail || value?.message || '请求失败，请稍后重试'
+  if (value?.response?.status === 403) {
+    if (!identity().roles.includes('ADMIN')) return '异常位置：权限校验；异常原因：当前登录会话未包含平台管理员权限；处理方式：退出后重新登录'
+    return detail?.message || detail?.detail || '异常位置：权限校验；异常原因：当前操作未获授权；处理方式：确认平台管理员角色和数据范围后重新登录'
+  }
+  const message = detail?.message || detail?.detail || detail?.error || value?.message
+  if (value?.response?.status === 409 && ['Conflict', 'Request failed with status code 409'].includes(String(message))) {
+    return `异常位置：${location}；异常原因：当前请求不满足业务状态条件，控制面未返回具体说明；处理方式：检查当前记录状态和必填配置后重新操作`
+  }
+  if (message) return message
+  return '异常位置：当前操作；异常原因：服务未返回具体错误；处理方式：刷新页面后重试，并检查控制面运行日志'
 }
-function camelKey(key:string){return key.replace(/_([a-z])/g,(_,letter:string)=>letter.toUpperCase())}
+function camelKey(key:string){return key.replace(/_([a-zA-Z0-9])/g,(_,letter:string)=>letter.toUpperCase())}
 export function normalizePayload<T=any>(value:any):T {
   if(Array.isArray(value))return value.map(item=>normalizePayload(item)) as T
   if(value&&typeof value==='object'&&Object.getPrototypeOf(value)===Object.prototype){

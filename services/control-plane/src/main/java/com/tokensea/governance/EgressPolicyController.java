@@ -11,6 +11,7 @@ import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.server.ResponseStatusException;
 
+import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.util.*;
@@ -45,9 +46,21 @@ public class EgressPolicyController {
             where status in ('ACTIVE','PAUSED','DEGRADED')
             """);
         for (Map<String,Object> row : rows) hosts.addAll(readHosts(row.get("official_hosts")));
+        List<String> fxSources = jdbc.queryForList("""
+            select setting_value from platform_setting where setting_key='FX_RATE_SOURCE_URL'
+            """, String.class);
+        String fxSource = fxSources.isEmpty()
+                ? "https://www.ecb.europa.eu/stats/eurofxref/eurofxref-daily.xml"
+                : fxSources.getFirst();
+        try {
+            String host = URI.create(fxSource).getHost();
+            if (host != null && !host.isBlank()) hosts.add(host.toLowerCase(Locale.ROOT));
+        } catch (Exception ignored) {
+            // Invalid source settings are rejected by the FX sync service and must not broaden egress policy.
+        }
         return ApiResponse.ok(Map.of(
                 "allowedHosts", hosts,
-                "source", "provider_price_source",
+                "source", "provider_price_source+fx_rate_source",
                 "revision", Integer.toHexString(hosts.hashCode())));
     }
 

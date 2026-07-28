@@ -14,14 +14,16 @@ public class ModelPrice extends BaseEntity {
     private String platformModelId;
     private String providerInstanceId;
     private String currency;
-    @TableField("input_cost_per_1k")
-    private java.math.BigDecimal inputCostPer1k;
-    @TableField("output_cost_per_1k")
-    private java.math.BigDecimal outputCostPer1k;
-    @TableField("input_price_per_1k")
-    private java.math.BigDecimal inputPricePer1k;
-    @TableField("output_price_per_1k")
-    private java.math.BigDecimal outputPricePer1k;
+    private String billingBasis;
+    private Long billingQuantity;
+    @TableField("input_cost_unit_price")
+    private java.math.BigDecimal inputCostUnitPrice;
+    @TableField("output_cost_unit_price")
+    private java.math.BigDecimal outputCostUnitPrice;
+    @TableField("input_price_unit_price")
+    private java.math.BigDecimal inputPriceUnitPrice;
+    @TableField("output_price_unit_price")
+    private java.math.BigDecimal outputPriceUnitPrice;
     private java.time.OffsetDateTime effectiveFrom;
     private java.time.OffsetDateTime effectiveTo;
     private String status;

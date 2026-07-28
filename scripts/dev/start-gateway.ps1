@@ -33,6 +33,13 @@ $env:TOKENSEA_REDIS_URL = "redis://:$redisPassword@localhost:$redisPort/0"
 $env:TOKENSEA_RUNTIME_ENGINE_URL = "http://localhost:$runtimePort"
 $env:TOKENSEA_RUNTIME_CORE_BASE = "http://localhost:$runtimePort"
 $env:TOKENSEA_OUTBOX_DIR = (Join-Path $gatewayDir "runtime-data\outbox")
+$env:TOKENSEA_CORS_ORIGINS = if (-not [string]::IsNullOrWhiteSpace($env:TOKENSEA_CORS_ALLOWED_ORIGINS)) {
+    $env:TOKENSEA_CORS_ALLOWED_ORIGINS
+} elseif (-not [string]::IsNullOrWhiteSpace($env:TOKENSEA_CORS_ORIGINS)) {
+    $env:TOKENSEA_CORS_ORIGINS
+} else {
+    "http://localhost:39210,http://127.0.0.1:39210"
+}
 
 Push-Location $gatewayDir
 try {

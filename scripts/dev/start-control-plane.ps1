@@ -22,6 +22,7 @@ $env:PATH = "$env:JAVA_HOME\bin;$env:PATH"
 $dbPort = if ($env:TOKENSEA_POSTGRES_PORT) { $env:TOKENSEA_POSTGRES_PORT } else { "39213" }
 $redisPort = if ($env:TOKENSEA_REDIS_PORT) { $env:TOKENSEA_REDIS_PORT } else { "39214" }
 $runtimePort = if ($env:TOKENSEA_RUNTIME_CORE_PORT) { $env:TOKENSEA_RUNTIME_CORE_PORT } else { "39218" }
+$headlessPort = if ($env:TOKENSEA_HEADLESS_FETCHER_PORT) { $env:TOKENSEA_HEADLESS_FETCHER_PORT } else { "39219" }
 $egressPort = if ($env:TOKENSEA_EGRESS_PROXY_PORT) { $env:TOKENSEA_EGRESS_PROXY_PORT } else { "18080" }
 
 $env:SPRING_DATASOURCE_URL = "jdbc:postgresql://localhost:$dbPort/$env:TOKENSEA_DB_NAME"
@@ -33,7 +34,23 @@ $env:SPRING_DATA_REDIS_PASSWORD = $env:TOKENSEA_REDIS_PASSWORD
 $env:TOKENSEA_RUNTIME_ENGINE_URL = "http://localhost:$runtimePort"
 $env:TOKENSEA_EGRESS_PROXY_HOST = "localhost"
 $env:TOKENSEA_EGRESS_PROXY_PORT = $egressPort
-$env:TOKENSEA_CORS_ALLOWED_ORIGINS = "http://localhost:39210"
+$env:TOKENSEA_HEADLESS_FETCHER_URL = "http://localhost:$headlessPort"
+if ([string]::IsNullOrWhiteSpace($env:TOKENSEA_HEADLESS_FETCHER_TOKEN)) {
+    $env:TOKENSEA_HEADLESS_FETCHER_TOKEN = $env:TOKENSEA_EGRESS_POLICY_TOKEN
+}
+$localConsoleOrigins = @(
+    "http://localhost:39210",
+    "http://127.0.0.1:39210",
+    "http://[::1]:39210"
+)
+$configuredOrigins = @()
+if (-not [string]::IsNullOrWhiteSpace($env:TOKENSEA_CORS_ALLOWED_ORIGINS)) {
+    $configuredOrigins = $env:TOKENSEA_CORS_ALLOWED_ORIGINS.Split(",") |
+        ForEach-Object { $_.Trim() } |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+}
+$env:TOKENSEA_CORS_ALLOWED_ORIGINS = (($configuredOrigins + $localConsoleOrigins) |
+    Select-Object -Unique) -join ","
 
 Push-Location (Join-Path $ProjectRoot "services\control-plane")
 try {

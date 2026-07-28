@@ -1,0 +1,37 @@
+.console-page .table-wrap {
+  overflow-x: hidden;
+}
+
+.console-page .data-table {
+  width: 100%;
+  min-width: 0;
+  table-layout: fixed;
+}
+
+.console-page .data-table th,
+.console-page .data-table td {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  white-space: normal;
+}
+
+.page-header > div:first-child {
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.page-desc {
+  width: 100%;
+  max-width: none;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+@media (max-width: 760px) {
+  .page-desc {
+    max-width: none;
+    overflow: visible;
+    white-space: normal;
+  }
+}

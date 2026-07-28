@@ -9,6 +9,7 @@ import com.tokensea.asset.mapper.ProviderInstanceMapper;
 import com.tokensea.asset.mapper.PlatformModelMapper;
 import com.tokensea.asset.entity.ProviderInstance;
 import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
@@ -17,6 +18,8 @@ import java.util.Map;
 @RestController
 @RequestMapping("/api/dashboard")
 public class DashboardController {
+    @Value("${tokensea.provider.connection-test-valid-minutes:10080}")
+    private long connectionTestValidMinutes = 10080;
     private final TenantMapper tenants;
     private final PlatformModelMapper models;
     private final ApiKeyEntityMapper keys;
@@ -40,7 +43,7 @@ public class DashboardController {
             "providerHealth", providerInstances.selectCount(new QueryWrapper<ProviderInstance>()
                 .eq("status", "启用").eq("health_status", "健康")
                 .eq("last_connection_test_status", "成功")
-                .ge("last_connection_test_at", java.time.OffsetDateTime.now().minusMinutes(30)))
+                .ge("last_connection_test_at", java.time.OffsetDateTime.now().minusMinutes(connectionTestValidMinutes)))
         ));
     }
 }

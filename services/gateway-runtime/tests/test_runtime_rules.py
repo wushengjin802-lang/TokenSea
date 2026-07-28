@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import pathlib
 import sys
 import tempfile
@@ -6,9 +7,10 @@ import time
 import types
 import unittest
 from decimal import Decimal
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 from fastapi import HTTPException
+from fastapi.testclient import TestClient
 
 # The unit tests exercise pure routing/scope rules and do not require live DB/Redis drivers.
 if "asyncpg" not in sys.modules:
@@ -41,7 +43,94 @@ gateway = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(gateway)
 
 
+def token_price_components(input_price="0", output_price="0", cache_read_price=None,
+                           cache_write_price=None, cache_read_mode="NOT_APPLICABLE",
+                           cache_write_mode="NOT_APPLICABLE"):
+    return [
+        {"componentType": "INPUT_TOKEN", "variant": "DEFAULT", "unitPrice": input_price,
+         "unitBasis": "TOKEN", "unitQuantity": 1_000_000, "mode": "EXPLICIT",
+         "scope": {}, "priority": 100},
+        {"componentType": "CACHE_READ_TOKEN", "variant": "DEFAULT", "unitPrice": cache_read_price,
+         "unitBasis": "TOKEN", "unitQuantity": 1_000_000, "mode": cache_read_mode,
+         "scope": {}, "priority": 100},
+        {"componentType": "CACHE_WRITE_TOKEN", "variant": "DEFAULT", "unitPrice": cache_write_price,
+         "unitBasis": "TOKEN", "unitQuantity": 1_000_000, "mode": cache_write_mode,
+         "scope": {}, "priority": 100},
+        {"componentType": "OUTPUT_TOKEN", "variant": "DEFAULT", "unitPrice": output_price,
+         "unitBasis": "TOKEN", "unitQuantity": 1_000_000, "mode": "EXPLICIT",
+         "scope": {}, "priority": 100},
+    ]
+
+
+def component_by_type(components, component_type):
+    return next(item for item in components if item["componentType"] == component_type)
+
+
 class RuntimeRulesTest(unittest.TestCase):
+    def test_gateway_cors_allows_console_health_checks(self):
+        client = TestClient(gateway.app)
+        response = client.get("/health", headers={"Origin": "http://localhost:39210"})
+        self.assertEqual(200, response.status_code)
+        self.assertEqual("http://localhost:39210", response.headers.get("access-control-allow-origin"))
+
+        preflight = client.options(
+            "/health/readiness",
+            headers={
+                "Origin": "http://localhost:39210",
+                "Access-Control-Request-Method": "GET",
+            },
+        )
+        self.assertEqual(200, preflight.status_code)
+        self.assertEqual("http://localhost:39210", preflight.headers.get("access-control-allow-origin"))
+
+    def test_gateway_cors_supports_compose_environment_name(self):
+        original_primary = gateway.os.environ.get("TOKENSEA_CORS_ORIGINS")
+        original_compatible = gateway.os.environ.get("TOKENSEA_CORS_ALLOWED_ORIGINS")
+        try:
+            gateway.os.environ["TOKENSEA_CORS_ORIGINS"] = ""
+            gateway.os.environ["TOKENSEA_CORS_ALLOWED_ORIGINS"] = "http://console.example"
+            self.assertEqual(["http://console.example"], gateway.configured_cors_origins())
+        finally:
+            if original_primary is None:
+                gateway.os.environ.pop("TOKENSEA_CORS_ORIGINS", None)
+            else:
+                gateway.os.environ["TOKENSEA_CORS_ORIGINS"] = original_primary
+            if original_compatible is None:
+                gateway.os.environ.pop("TOKENSEA_CORS_ALLOWED_ORIGINS", None)
+            else:
+                gateway.os.environ["TOKENSEA_CORS_ALLOWED_ORIGINS"] = original_compatible
+
+    def test_runtime_pricing_alert_is_persisted_with_deterministic_identity(self):
+        class CapturingPool:
+            def __init__(self):
+                self.calls = []
+
+            async def execute(self, query, *args):
+                self.calls.append((query, args))
+
+        pool = CapturingPool()
+        previous_pool = gateway.pool
+        gateway.pool = pool
+        try:
+            error = HTTPException(status_code=409, detail={
+                "error_code": "TOKENSEA_CACHE_PRICE_MISSING", "message": "缓存价格缺失"})
+            route = {"provider_id": "provider-it", "provider_name": "DeepSeek",
+                     "runtime_model_name": "deepseek-v4-pro", "price": {"id": "price-it"}}
+            import asyncio
+            asyncio.run(gateway.record_runtime_pricing_alert("request-it", route, error))
+        finally:
+            gateway.pool = previous_pool
+
+        self.assertEqual(1, len(pool.calls))
+        query, args = pool.calls[0]
+        self.assertIn("INSERT INTO alert_event", query)
+        self.assertIn("ON CONFLICT(id) DO UPDATE", query)
+        self.assertEqual("CACHE_PRICE_MISSING", args[1])
+        self.assertEqual("request-it", args[2])
+        detail = gateway.json.loads(args[4])
+        self.assertEqual("TOKENSEA_CACHE_PRICE_MISSING", detail["errorCode"])
+        self.assertEqual("price-it", detail["priceVersionId"])
+
     def test_scope_requires_non_empty_json_array(self):
         for invalid in (None, "", "[]", "{}", "not-json", '["", "chat"]'):
             with self.subTest(invalid=invalid), self.assertRaises(HTTPException):
@@ -49,6 +138,17 @@ class RuntimeRulesTest(unittest.TestCase):
 
     def test_scope_is_deduplicated(self):
         self.assertEqual(["chat-standard"], gateway.parse_scope('["chat-standard", "chat-standard"]'))
+
+    def test_effective_model_scope_is_tenant_and_key_intersection(self):
+        context = {
+            "model_scope_parsed": ["chat-standard", "kimi-enterprise"],
+            "tenant_scope_parsed": ["chat-standard"],
+        }
+        gateway.validate_model_scope(context, "chat-standard")
+        with self.assertRaises(HTTPException) as denied:
+            gateway.validate_model_scope(context, "kimi-enterprise")
+        self.assertEqual(403, denied.exception.status_code)
+        self.assertEqual("TOKENSEA_MODEL_FORBIDDEN", denied.exception.detail["error_code"])
 
     def test_runtime_model_uses_provider_adapter(self):
         self.assertEqual("anthropic/claude-test", gateway.runtime_model_name({"api_style": "anthropic"}, "claude-test"))
@@ -58,6 +158,15 @@ class RuntimeRulesTest(unittest.TestCase):
     def test_provider_requires_real_connection_result(self):
         configured = {"api_base": "https://provider.example/v1", "status": "启用", "health_status": "健康", "last_connection_test_status": "成功", "last_connection_test_at": datetime.now(timezone.utc), "last_connection_test_host": "provider.example", "last_connection_test_addresses": "8.8.8.8", "key_status": "已托管"}
         self.assertTrue(gateway.provider_is_routable(configured))
+        configured["last_connection_test_at"] = datetime.fromtimestamp(
+            time.time() - gateway.CONNECTION_TEST_MAX_AGE_SECONDS + 60, timezone.utc
+        )
+        self.assertTrue(gateway.provider_is_routable(configured))
+        configured["last_connection_test_at"] = datetime.fromtimestamp(
+            time.time() - gateway.CONNECTION_TEST_MAX_AGE_SECONDS - 60, timezone.utc
+        )
+        self.assertFalse(gateway.provider_is_routable(configured))
+        configured["last_connection_test_at"] = datetime.now(timezone.utc)
         configured["last_connection_test_status"] = "失败"
         self.assertFalse(gateway.provider_is_routable(configured))
 
@@ -70,21 +179,31 @@ class RuntimeRulesTest(unittest.TestCase):
 
     def test_visibility_and_price_calculation(self):
         gateway.validate_visibility("全部租户", {"tenant_id": "t1", "tenant_type": "INTERNAL"})
+        gateway.validate_visibility('["全部租户"]', {"tenant_id": "t1", "tenant_type": "INTERNAL"})
         gateway.validate_visibility('["t1"]', {"tenant_id": "t1", "tenant_type": "INTERNAL"})
         with self.assertRaises(HTTPException):
             gateway.validate_visibility('["t2"]', {"tenant_id": "t1", "tenant_type": "INTERNAL"})
         usage = {"prompt_tokens": 1000, "completion_tokens": 500, "total_tokens": 1500}
-        cost, sales, components = gateway.calculate_amounts({
-            "input_cost_per_1k": "1", "output_cost_per_1k": "2",
-            "input_price_per_1k": "3", "output_price_per_1k": "4",
+        cost, sales, components, metrics = gateway.calculate_amounts({
+            "cost_billing_basis": "TOKEN", "cost_billing_quantity": 1_000_000,
+            "input_cost_unit_price": "1000", "output_cost_unit_price": "2000",
+            "price_billing_basis": "TOKEN", "price_billing_quantity": 1_000_000,
+            "input_price_unit_price": "3000", "output_price_unit_price": "4000",
+            "price_components": token_price_components("1000", "2000"),
             "internal_price_id": "internal-1"
         }, usage)
         self.assertEqual(gateway.Decimal("2"), cost)
         self.assertEqual(gateway.Decimal("5"), sales)
-        self.assertEqual("1", components["INPUT_TOKEN"])
-        zero_cost, zero_sales, _ = gateway.calculate_amounts({
-            "input_cost_per_1k": "0", "output_cost_per_1k": "0",
-            "input_price_per_1k": "0", "output_price_per_1k": "0"
+        input_component = component_by_type(components, "INPUT_TOKEN")
+        self.assertEqual("1", input_component["amount"])
+        self.assertEqual("1000", input_component["usageQuantity"])
+        self.assertEqual("0", metrics["cacheNetSavings"])
+        zero_cost, zero_sales, _, _ = gateway.calculate_amounts({
+            "cost_billing_basis": "TOKEN", "cost_billing_quantity": 1_000_000,
+            "input_cost_unit_price": "0", "output_cost_unit_price": "0",
+            "price_billing_basis": "TOKEN", "price_billing_quantity": 1_000_000,
+            "input_price_unit_price": "0", "output_price_unit_price": "0",
+            "price_components": token_price_components("0", "0")
         }, usage)
         self.assertEqual(Decimal("0"), zero_cost)
         self.assertEqual(Decimal("0"), zero_sales)
@@ -95,20 +214,124 @@ class RuntimeRulesTest(unittest.TestCase):
             "completion_tokens": 100,
             "prompt_tokens_details": {"cached_tokens": 400},
         })
-        cost, sales, components = gateway.calculate_amounts({
-            "input_cost_per_1k": "1",
-            "output_cost_per_1k": "2",
-            "input_price_per_1k": "1",
-            "output_price_per_1k": "2",
-            "price_components": {
-                "INPUT_TOKEN": {"unitPrice": "1", "unitBasis": "PER_1K_TOKENS"},
-                "OUTPUT_TOKEN": {"unitPrice": "2", "unitBasis": "PER_1K_TOKENS"},
-                "CACHE_READ_TOKEN": {"unitPrice": "0.1", "unitBasis": "PER_1K_TOKENS"},
-            },
+        cost, sales, components, metrics = gateway.calculate_amounts({
+            "cost_billing_basis": "TOKEN", "cost_billing_quantity": 1_000_000,
+            "input_cost_unit_price": "1000", "output_cost_unit_price": "2000",
+            "price_billing_basis": "TOKEN", "price_billing_quantity": 1_000_000,
+            "input_price_unit_price": "1000", "output_price_unit_price": "2000",
+            "price_components": token_price_components("1000", "2000", "100", None,
+                                                        "EXPLICIT", "NOT_APPLICABLE"),
         }, usage)
         self.assertEqual(Decimal("0.84"), cost)
         self.assertEqual(cost, sales)
-        self.assertEqual("0.04", components["CACHE_READ_TOKEN"])
+        self.assertEqual("0.04", component_by_type(components, "CACHE_READ_TOKEN")["amount"])
+        self.assertEqual("0.36", metrics["cacheGrossSavings"])
+        self.assertEqual("0.36", metrics["cacheNetSavings"])
+
+    def test_provider_usage_adapters_produce_mutually_exclusive_token_counts(self):
+        cases = [
+            ("deepseek", {"prompt_tokens": 1000, "completion_tokens": 100, "total_tokens": 1100,
+                          "prompt_cache_hit_tokens": 400, "prompt_cache_miss_tokens": 600},
+             (600, 400, 0, "DEEPSEEK")),
+            ("anthropic", {"input_tokens": 600, "output_tokens": 100,
+                           "cache_read_input_tokens": 300, "cache_creation_input_tokens": 100},
+             (600, 300, 100, "ANTHROPIC")),
+            ("openai", {"prompt_tokens": 1000, "completion_tokens": 100,
+                        "prompt_tokens_details": {"cached_tokens": 250}},
+             (750, 250, 0, "OPENAI")),
+            ("gemini", {"promptTokenCount": 1000, "candidatesTokenCount": 100,
+                        "cachedContentTokenCount": 200, "totalTokenCount": 1100},
+             (800, 200, 0, "GEMINI")),
+        ]
+        for provider, raw, expected in cases:
+            with self.subTest(provider=provider):
+                usage = gateway.normalize_usage(raw, provider)
+                self.assertEqual(expected[0], usage["input_uncached_tokens"])
+                self.assertEqual(expected[1], usage["cache_read_tokens"])
+                self.assertEqual(expected[2], usage["cache_write_tokens"])
+                self.assertEqual(expected[3], usage["usage_source"])
+                self.assertEqual(usage["input_tokens_total"],
+                                 usage["input_uncached_tokens"] + usage["cache_read_tokens"]
+                                 + usage["cache_write_tokens"])
+                self.assertEqual("COMPLETE", usage["cost_status"])
+
+    def test_unknown_cache_price_is_not_silently_treated_as_zero(self):
+        usage = gateway.normalize_usage({"prompt_tokens": 1000, "completion_tokens": 100,
+                                         "prompt_tokens_details": {"cached_tokens": 400}}, "openai")
+        with self.assertRaises(HTTPException) as error:
+            gateway.calculate_amounts({
+                "cost_billing_basis": "TOKEN", "cost_billing_quantity": 1_000_000,
+                "input_cost_unit_price": "1000", "output_cost_unit_price": "2000",
+                "price_components": token_price_components("1000", "2000", None, None,
+                                                            "UNKNOWN", "NOT_APPLICABLE"),
+            }, usage)
+        self.assertEqual("TOKENSEA_CACHE_PRICE_MISSING", error.exception.detail["error_code"])
+
+    def test_long_context_cache_variant_is_selected_by_scope(self):
+        usage = gateway.normalize_usage({
+            "usage_schema_version": 2, "input_uncached_tokens": 210000,
+            "input_tokens_total": 210100, "cache_read_tokens": 100, "cache_write_tokens": 0,
+            "completion_tokens": 10, "output_tokens": 10, "reasoning_tokens": 0,
+            "total_tokens": 210110,
+        })
+        components = token_price_components("10", "20", "1", None, "EXPLICIT", "NOT_APPLICABLE")
+        components.append({"componentType": "CACHE_READ_TOKEN", "variant": "ABOVE_200K",
+                           "unitPrice": "2", "unitBasis": "TOKEN", "unitQuantity": 1_000_000,
+                           "mode": "EXPLICIT", "scope": {"minContextTokens": 200000}, "priority": 50})
+        _, _, cost_components, _ = gateway.calculate_amounts({
+            "cost_billing_basis": "TOKEN", "cost_billing_quantity": 1_000_000,
+            "input_cost_unit_price": "10", "output_cost_unit_price": "20",
+            "price_components": components,
+        }, usage)
+        cache_component = component_by_type(cost_components, "CACHE_READ_TOKEN")
+        self.assertEqual("ABOVE_200K", cache_component["variant"])
+        self.assertEqual("2", cache_component["unitPrice"])
+
+    def test_inconsistent_deepseek_usage_is_rejected(self):
+        usage = gateway.normalize_usage({"prompt_tokens": 1000, "completion_tokens": 100,
+                                         "prompt_cache_hit_tokens": 400,
+                                         "prompt_cache_miss_tokens": 500}, "deepseek")
+        self.assertEqual("INVALID_USAGE", usage["cost_status"])
+        with self.assertRaises(HTTPException) as error:
+            gateway.calculate_amounts({
+                "price_components": token_price_components("1000", "2000", "100", None,
+                                                            "EXPLICIT", "NOT_APPLICABLE")
+            }, usage)
+        self.assertEqual("TOKENSEA_CACHE_USAGE_INCONSISTENT", error.exception.detail["error_code"])
+
+    def test_generic_request_component_uses_configured_quantity(self):
+        usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        cost, sales, components, _ = gateway.calculate_amounts({
+            "cost_billing_basis": "REQUEST", "cost_billing_quantity": 100,
+            "input_cost_unit_price": "0", "output_cost_unit_price": "0",
+            "price_components": [
+                {"componentType": "REQUEST", "variant": "DEFAULT", "unitPrice": "5",
+                 "unitBasis": "REQUEST", "unitQuantity": 100, "mode": "EXPLICIT",
+                 "scope": {}, "priority": 100},
+            ],
+        }, usage)
+        self.assertEqual(Decimal("0.05"), cost)
+        self.assertEqual(cost, sales)
+        request_component = component_by_type(components, "REQUEST")
+        self.assertEqual("0.05", request_component["amount"])
+        self.assertEqual("1", request_component["usageQuantity"])
+
+    def test_generic_image_component_preserves_non_token_usage(self):
+        usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "output_images": 2}
+        cost, sales, components, _ = gateway.calculate_amounts({
+            "cost_billing_basis": "IMAGE", "cost_billing_quantity": 1,
+            "input_cost_unit_price": "0", "output_cost_unit_price": "3",
+            "price_components": [
+                {"componentType": "IMAGE_OUTPUT", "variant": "DEFAULT", "unitPrice": "3",
+                 "unitBasis": "IMAGE", "unitQuantity": 1, "mode": "EXPLICIT",
+                 "scope": {}, "priority": 100},
+            ],
+        }, usage)
+        self.assertEqual(Decimal("6"), cost)
+        self.assertEqual(cost, sales)
+        image_component = component_by_type(components, "IMAGE_OUTPUT")
+        self.assertEqual("6", image_component["amount"])
+        self.assertEqual("2", image_component["usageQuantity"])
 
     def test_java_crypto_fixed_vectors_v2_and_legacy(self):
         previous = gateway.CRYPTO_KEY
@@ -144,17 +367,158 @@ class RuntimeRulesTest(unittest.TestCase):
 
 
 class GatewayAsyncRulesTest(unittest.IsolatedAsyncioTestCase):
+    async def test_explicit_local_test_upstream_accepts_private_snapshot_only_for_exact_host(self):
+        previous_enabled, previous_hosts = gateway.LOCAL_TEST_UPSTREAM_ENABLED, gateway.LOCAL_TEST_UPSTREAM_HOSTS
+        gateway.LOCAL_TEST_UPSTREAM_ENABLED = True
+        gateway.LOCAL_TEST_UPSTREAM_HOSTS = {"host.docker.internal"}
+        route = {
+            "api_base": "http://host.docker.internal:39300/v1",
+            "verified_host": "host.docker.internal",
+            "verified_addresses": "127.0.0.1",
+        }
+        try:
+            await gateway.validate_route_dns(route, force=True)
+            self.assertGreater(route.get("dns_valid_until", 0), time.monotonic())
+            with self.assertRaises(HTTPException):
+                gateway.validate_public_addresses({"127.0.0.1"})
+            self.assertFalse(gateway.is_local_test_upstream("other.internal"))
+        finally:
+            gateway.LOCAL_TEST_UPSTREAM_ENABLED = previous_enabled
+            gateway.LOCAL_TEST_UPSTREAM_HOSTS = previous_hosts
+
+    async def test_runtime_model_exists_supports_model_info_id_and_search_fallback(self):
+        class Response:
+            status_code = 200
+            def __init__(self, payload): self.payload = payload
+            def json(self): return self.payload
+
+        class Client:
+            def __init__(self): self.calls = []
+            async def get(self, _url, **kwargs):
+                params = kwargs.get("params", {})
+                self.calls.append(params)
+                if "modelId" in params:
+                    return Response({"data": [], "total_pages": 1})
+                return Response({"data": [{"model_name": "other", "model_info": {"id": "ts-existing"}}], "total_pages": 1})
+
+        client = Client()
+        self.assertTrue(await gateway.runtime_model_exists(client, "ts-existing"))
+        self.assertEqual("ts-existing", client.calls[0]["modelId"])
+        self.assertEqual("ts-existing", client.calls[1]["search"])
+
+    async def test_runtime_registration_reuses_persisted_model_after_gateway_restart(self):
+        class Response:
+            status_code = 500
+
+        class Client:
+            async def __aenter__(self): return self
+            async def __aexit__(self, *_): return False
+            async def post(self, *_args, **_kwargs): return Response()
+
+        async def persisted(_client, _alias): return True
+        async def skip_dns(_route, force=False): return None
+
+        previous_client = gateway.httpx.AsyncClient
+        previous_exists = gateway.runtime_model_exists
+        client_kwargs = {}
+        previous_dns = gateway.validate_route_dns
+        previous_models = dict(gateway.runtime_models)
+        def client_factory(*args, **kwargs):
+            client_kwargs.update(kwargs)
+            return Client()
+        gateway.httpx.AsyncClient = client_factory
+        gateway.runtime_model_exists = persisted
+        gateway.validate_route_dns = skip_dns
+        gateway.runtime_models.clear()
+        route = {
+            "deployment_id": "deployment-1",
+            "runtime_model_name": "openai/deepseek-v4-flash",
+            "api_base": "http://host.docker.internal:39301/v1",
+            "secret_version": "secret-1:v1",
+            "api_key": "mock-key",
+        }
+        try:
+            await gateway.ensure_runtime_model(route, force=True)
+            self.assertIn("deployment-1", gateway.runtime_models)
+            self.assertTrue(route.get("runtime_alias", "").startswith("ts-"))
+            self.assertIs(False, client_kwargs.get("trust_env"))
+        finally:
+            gateway.httpx.AsyncClient = previous_client
+            gateway.runtime_model_exists = previous_exists
+            gateway.validate_route_dns = previous_dns
+            gateway.runtime_models.clear()
+            gateway.runtime_models.update(previous_models)
+
     async def test_effective_zero_price_is_allowed(self):
         class FakePool:
             async def fetchrow(self, *_):
                 return {"id": "free", "currency": gateway.BUDGET_CURRENCY,
-                        "input_cost_per_1k": Decimal("0"), "output_cost_per_1k": Decimal("0"),
-                        "input_price_per_1k": Decimal("0"), "output_price_per_1k": Decimal("0")}
+                        "cost_billing_basis": "TOKEN", "cost_billing_quantity": 1_000_000,
+                        "input_cost_unit_price": Decimal("0"), "output_cost_unit_price": Decimal("0"),
+                        "price_billing_basis": "TOKEN", "price_billing_quantity": 1_000_000,
+                        "input_price_unit_price": Decimal("0"), "output_price_unit_price": Decimal("0"),
+                        "cache_read_cost_unit_price": None, "cache_write_cost_unit_price": None,
+                        "cache_read_mode": "NOT_APPLICABLE", "cache_write_mode": "NOT_APPLICABLE",
+                        "component_schema_version": 2, "price_completeness_status": "UNSUPPORTED_CACHE",
+                        "price_components": token_price_components("0", "0"), "internal_price_id": None}
         previous = gateway.pool
         gateway.pool = FakePool()
         try:
             price = await gateway.load_price("free", "platform", "provider", "model")
-            self.assertEqual(Decimal("0"), price["input_price_per_1k"])
+            self.assertEqual(Decimal("0"), price["input_price_unit_price"])
+        finally:
+            gateway.pool = previous
+
+    async def test_foreign_currency_price_uses_monthly_fx_for_budget_estimate(self):
+        class FakePool:
+            def __init__(self): self.calls = 0
+            async def fetchrow(self, query, *args):
+                self.calls += 1
+                if "FROM channel_model_deployment" in query:
+                    return {"id": "usd-price", "currency": "USD",
+                            "cost_billing_basis": "TOKEN", "cost_billing_quantity": 1_000_000,
+                            "input_cost_unit_price": Decimal("1"), "output_cost_unit_price": Decimal("2"),
+                            "price_billing_basis": "TOKEN", "price_billing_quantity": 1_000_000,
+                            "input_price_unit_price": Decimal("1"), "output_price_unit_price": Decimal("2"),
+                            "cache_read_cost_unit_price": None, "cache_write_cost_unit_price": None,
+                            "cache_read_mode": "NOT_APPLICABLE", "cache_write_mode": "NOT_APPLICABLE",
+                            "component_schema_version": 2, "price_completeness_status": "UNSUPPORTED_CACHE",
+                            "price_components": token_price_components("1", "2"), "internal_price_id": None}
+                if "FROM fx_rate" in query:
+                    return {"id": "fx-usd-cny", "rate": Decimal("7.2"), "source_date": date(2026, 7, 21),
+                            "source_type": "AUTOMATIC_ECB", "source_ref": "https://www.ecb.europa.eu/"}
+                return None
+        previous = gateway.pool
+        gateway.pool = FakePool()
+        try:
+            price = await gateway.load_price("usd-price", "platform", "provider", "model")
+            self.assertEqual(Decimal("7.2"), price["budget_fx_rate"])
+            self.assertEqual(gateway.BUDGET_CURRENCY, price["budget_currency"])
+            estimate = gateway.estimate_price_reservation(price, 1_000_000)
+            self.assertEqual(Decimal("14.4"), estimate)
+        finally:
+            gateway.pool = previous
+
+    async def test_foreign_currency_price_fails_closed_when_monthly_fx_is_missing(self):
+        class FakePool:
+            async def fetchrow(self, query, *args):
+                if "FROM channel_model_deployment" in query:
+                    return {"id": "usd-price", "currency": "USD",
+                            "cost_billing_basis": "TOKEN", "cost_billing_quantity": 1_000_000,
+                            "input_cost_unit_price": Decimal("1"), "output_cost_unit_price": Decimal("2"),
+                            "price_billing_basis": "TOKEN", "price_billing_quantity": 1_000_000,
+                            "input_price_unit_price": Decimal("1"), "output_price_unit_price": Decimal("2"),
+                            "cache_read_cost_unit_price": None, "cache_write_cost_unit_price": None,
+                            "cache_read_mode": "NOT_APPLICABLE", "cache_write_mode": "NOT_APPLICABLE",
+                            "component_schema_version": 2, "price_completeness_status": "UNSUPPORTED_CACHE",
+                            "price_components": token_price_components("1", "2"), "internal_price_id": None}
+                return None
+        previous = gateway.pool
+        gateway.pool = FakePool()
+        try:
+            with self.assertRaises(HTTPException) as error:
+                await gateway.load_price("usd-price", "platform", "provider", "model")
+            self.assertEqual("TOKENSEA_FX_RATE_MISSING", error.exception.detail["error_code"])
         finally:
             gateway.pool = previous
 
@@ -192,7 +556,8 @@ class GatewayAsyncRulesTest(unittest.IsolatedAsyncioTestCase):
         gateway.pool, gateway.cache = FakePool(), FakeCache()
         key_ctx = {"id": "key-1", "tenant_id": "tenant-1", "project_id": None,
                    "budget_amount": Decimal("10"), "project_budget": None, "tenant_budget": None}
-        route = {"price": {"input_cost_per_1k": Decimal("1"), "output_cost_per_1k": Decimal("2")}}
+        route = {"price": {"cost_billing_basis": "TOKEN", "cost_billing_quantity": 1_000_000,
+                           "input_cost_unit_price": Decimal("1000"), "output_cost_unit_price": Decimal("2000")}}
         try:
             reservation = await gateway.reserve_budget(key_ctx, [route], 1000, "request-1", "reservation-1")
             self.assertEqual("reservation-1", reservation["token"])
@@ -251,8 +616,15 @@ class GatewayAsyncRulesTest(unittest.IsolatedAsyncioTestCase):
         previous_pool, previous_cache = gateway.pool, gateway.cache
         gateway.pool, gateway.cache = FakePool(), OverrunRedis()
         route = {"runtime_model_name": "openai/model", "provider_id": "pi", "price": {
-            "id": "price", "currency": gateway.BUDGET_CURRENCY, "input_cost_per_1k": "1",
-            "output_cost_per_1k": "1", "input_price_per_1k": "2", "output_price_per_1k": "2"}}
+            "id": "price", "currency": gateway.BUDGET_CURRENCY,
+            "cost_billing_basis": "TOKEN", "cost_billing_quantity": 1_000_000,
+            "input_cost_unit_price": "1000", "output_cost_unit_price": "1000",
+            "price_billing_basis": "TOKEN", "price_billing_quantity": 1_000_000,
+            "input_price_unit_price": "2000", "output_price_unit_price": "2000",
+            "cache_read_cost_unit_price": None, "cache_write_cost_unit_price": None,
+            "cache_read_mode": "NOT_APPLICABLE", "cache_write_mode": "NOT_APPLICABLE",
+            "component_schema_version": 2, "price_completeness_status": "UNSUPPORTED_CACHE",
+            "price_components": token_price_components("1000", "1000"), "internal_price_id": "internal"}}
         reservation = {"state_key": "state", "keys": ["budget"], "limits": [100],
                        "amount_micro": 1, "amount": Decimal("0.000001"), "settled": False}
         try:
@@ -269,23 +641,37 @@ class GatewayAsyncRulesTest(unittest.IsolatedAsyncioTestCase):
         finally:
             gateway.pool, gateway.cache = previous_pool, previous_cache
 
-    async def test_dns_snapshot_change_and_restricted_address_fail_closed(self):
+    async def test_public_dns_rotation_is_accepted_and_restricted_address_fails_closed(self):
         previous = gateway.resolve_dns_addresses
-        route = {"api_base": "https://provider.example/v1", "verified_host": "provider.example",
+        previous_cache = dict(gateway.dns_validation_cache)
+        route = {"provider_id": "provider-1", "api_base": "https://provider.example/v1",
+                 "verified_host": "provider.example", "verified_port": 443,
                  "verified_addresses": "8.8.8.8"}
-        async def same(_): return {"8.8.8.8"}
-        async def changed(_): return {"1.1.1.1"}
+        calls = 0
+        async def changed(_):
+            nonlocal calls
+            calls += 1
+            return {"1.1.1.1"}
+        async def restricted(_): return {"169.254.169.254"}
         try:
-            gateway.resolve_dns_addresses = same
-            await gateway.validate_route_dns(route, force=True)
+            gateway.dns_validation_cache.clear()
             gateway.resolve_dns_addresses = changed
-            with self.assertRaises(HTTPException) as changed_error:
+            await gateway.validate_route_dns(route, force=True)
+            await gateway.validate_route_dns(route)
+            self.assertEqual(1, calls)
+            gateway.dns_validation_cache.clear()
+            gateway.resolve_dns_addresses = restricted
+            with self.assertRaises(HTTPException) as restricted_error:
                 await gateway.validate_route_dns(route, force=True)
-            self.assertEqual("TOKENSEA_DNS_SNAPSHOT_CHANGED", changed_error.exception.detail["error_code"])
-            with self.assertRaises(HTTPException):
-                gateway.validate_public_addresses({"169.254.169.254"})
+            self.assertEqual("TOKENSEA_SSRF_TARGET_REJECTED", restricted_error.exception.detail["error_code"])
+            route["verified_port"] = 8443
+            with self.assertRaises(HTTPException) as port_error:
+                await gateway.validate_route_dns(route, force=True)
+            self.assertEqual("TOKENSEA_DNS_PORT_CHANGED", port_error.exception.detail["error_code"])
         finally:
             gateway.resolve_dns_addresses = previous
+            gateway.dns_validation_cache.clear()
+            gateway.dns_validation_cache.update(previous_cache)
 
     async def test_db_outbox_and_usage_v8_status_columns(self):
         class FakePool:
@@ -303,11 +689,23 @@ class GatewayAsyncRulesTest(unittest.IsolatedAsyncioTestCase):
                 "completion_tokens": 1, "total_tokens": 2, "cost_amount": "0", "sales_amount": "0",
                 "currency": gateway.BUDGET_CURRENCY, "status": "SUCCESS", "latency_ms": 1,
                 "fallback_chain": "[]", "price_version_id": "p", "budget_reserved_amount": "0",
-                "budget_status": "SETTLED", "accounting_status": "COMMITTED"}
+                "budget_status": "SETTLED", "accounting_status": "COMMITTED",
+                "price_components": {"INPUT_TOKEN": {"unitPrice": "1"}},
+                "cost_components": {"OUTPUT_TOKEN": {"amount": "2"}}}
             await gateway.persist_usage(payload)
             usage_query, usage_args = next((query, args) for query, args in gateway.pool.calls if "INSERT INTO usage_record" in query)
             self.assertIn("budget_status,accounting_status", usage_query)
             self.assertEqual(("SETTLED", "COMMITTED"), usage_args[-2:])
+            snapshot_query, snapshot_args = next((query, args) for query, args in gateway.pool.calls if "INSERT INTO usage_cost_snapshot" in query)
+            self.assertIn("$35,$36::jsonb", snapshot_query)
+            self.assertIn("$42", snapshot_query)
+            self.assertEqual(42, len(snapshot_args))
+            self.assertEqual(2, snapshot_args[33])
+            self.assertEqual("UNKNOWN", snapshot_args[34])
+            self.assertEqual({}, json.loads(snapshot_args[35]))
+            self.assertEqual("COMPLETE", snapshot_args[-1])
+            self.assertEqual("INPUT_TOKEN", json.loads(snapshot_args[21])[0]["componentType"])
+            self.assertEqual("OUTPUT_TOKEN", json.loads(snapshot_args[22])[0]["componentType"])
         gateway.pool, gateway.cache, gateway.WAL_DIR, gateway.wal_pending = previous
 
     async def test_stream_intent_remains_pending_and_recovers_incomplete_usage(self):

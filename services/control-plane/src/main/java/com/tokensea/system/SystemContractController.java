@@ -21,6 +21,13 @@ import java.util.regex.Pattern;
 public class SystemContractController {
     private static final String MASK = "********";
     private static final Pattern SETTING_KEY = Pattern.compile("[A-Z][A-Z0-9_.-]{1,99}");
+    private static final Map<String,String> DEFAULT_SETTING_DESCRIPTIONS = Map.of(
+        "BASE_CURRENCY", "平台汇总、预算与内部核算的基准币种。修改会改变后续汇总与预算口径，不会改写历史明细或成本快照。",
+        "BUDGET_CURRENCY", "预算规则使用的默认币种。新建预算时作为默认值；修改不会自动换算或修改已有预算。",
+        "FX_AUTO_UPDATE_ENABLED", "是否按计划从汇率源自动更新汇率。关闭后仅保留人工维护和已有汇率，可能导致后续外币成本无法自动折算。",
+        "FX_MANAGED_CURRENCIES", "自动同步并折算至基准币种的外币列表（以逗号分隔）。新增币种前需确认汇率源支持；未维护的币种不会自动折算。",
+        "FX_RATE_SOURCE_URL", "自动汇率同步使用的官方参考数据地址。改为不兼容或不可访问的地址会导致自动同步失败，但不影响已生效的历史汇率。"
+    );
 
     private final JdbcTemplate jdbc;
     private final ObjectMapper json;
@@ -91,7 +98,10 @@ public class SystemContractController {
         return ApiResponse.ok(setting(key,value,request.description(),sensitive,after.get("updated_at")));
     }
 
-    private Map<String,Object> setting(String key,String value,String description,boolean sensitive,Object updatedAt){Map<String,Object> out=new LinkedHashMap<>();out.put("id",key);out.put("group",key.contains(".")?key.substring(0,key.indexOf('.')):"平台");out.put("key",key);out.put("displayName",description==null||description.isBlank()?key:description);out.put("value",sensitive?MASK:value);out.put("valueType",infer(value));out.put("editable",true);out.put("sensitive",sensitive);out.put("updatedAt",updatedAt);return out;}
+    private Map<String,Object> setting(String key,String value,String description,boolean sensitive,Object updatedAt){
+        String effectiveDescription=description==null||description.isBlank()?DEFAULT_SETTING_DESCRIPTIONS.getOrDefault(key,"用于平台运行控制；修改前请确认影响范围。"):description;
+        Map<String,Object> out=new LinkedHashMap<>();out.put("id",key);out.put("group",key.contains(".")?key.substring(0,key.indexOf('.')):"平台");out.put("key",key);out.put("displayName",effectiveDescription);out.put("description",effectiveDescription);out.put("value",sensitive?MASK:value);out.put("valueType",infer(value));out.put("editable",true);out.put("sensitive",sensitive);out.put("updatedAt",updatedAt);return out;
+    }
     private static String infer(String value){if(value!=null&&value.matches("-?\\d+(\\.\\d+)?"))return"NUMBER";if("true".equalsIgnoreCase(value)||"false".equalsIgnoreCase(value))return"BOOLEAN";return"STRING";}
     private static Map<String,Object> masked(Map<String,Object> value){if(value==null)return null;Map<String,Object> copy=new LinkedHashMap<>(value);if(Boolean.TRUE.equals(copy.get("sensitive")))copy.put("setting_value",MASK);return copy;}
     private boolean visible(Object raw,JwtService.Identity identity){if(identity.roles().contains("ADMIN"))return true;try{List<String> scope=json.readValue(String.valueOf(raw),new TypeReference<>(){});if(scope.isEmpty())return false;Set<String> tenantTypes=new HashSet<>(jdbc.queryForList("select type from tenant where id in (select tenant_id from user_tenant where user_id=? and status='ACTIVE')",String.class,identity.userId()));return scope.stream().anyMatch(v->identity.tenantIds().contains(v)||tenantTypes.contains(v));}catch(Exception e){return false;}}

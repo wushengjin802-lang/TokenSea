@@ -32,6 +32,14 @@ tokensea:
   crypto-key: ${TOKENSEA_CRYPTO_KEY}
   bootstrap-token: ${TOKENSEA_BOOTSTRAP_TOKEN:}
   budget-currency: ${TOKENSEA_BUDGET_CURRENCY:CNY}
+  fx:
+    source-url: ${TOKENSEA_FX_SOURCE_URL:https://www.ecb.europa.eu/stats/eurofxref/eurofxref-daily.xml}
+    managed-currencies: ${TOKENSEA_FX_MANAGED_CURRENCIES:USD}
+    monthly-cron: ${TOKENSEA_FX_MONTHLY_CRON:0 10 3 1 * *}
+    recovery-cron: ${TOKENSEA_FX_RECOVERY_CRON:0 40 3 * * *}
+    zone: ${TOKENSEA_FX_ZONE:Asia/Shanghai}
+  provider:
+    connection-test-valid-minutes: ${TOKENSEA_CONNECTION_TEST_VALID_MINUTES:10080}
   cors:
     allowed-origins: ${TOKENSEA_CORS_ALLOWED_ORIGINS:http://localhost:39210}
   egress:
@@ -40,6 +48,20 @@ tokensea:
     allowed-hosts: ${TOKENSEA_ALLOWED_EGRESS_HOSTS:}
     allowed-ports: ${TOKENSEA_EGRESS_ALLOWED_PORTS:80,443}
     policy-token: ${TOKENSEA_EGRESS_POLICY_TOKEN:}
+  headless-fetcher:
+    url: ${TOKENSEA_HEADLESS_FETCHER_URL:}
+    token: ${TOKENSEA_HEADLESS_FETCHER_TOKEN:}
+  price-document-llm:
+    enabled: ${TOKENSEA_PRICE_DOCUMENT_LLM_ENABLED:false}
+    url: ${TOKENSEA_PRICE_DOCUMENT_LLM_URL:}
+    model: ${TOKENSEA_PRICE_DOCUMENT_LLM_MODEL:}
+    api-key: ${TOKENSEA_PRICE_DOCUMENT_LLM_API_KEY:}
+    max-chars: ${TOKENSEA_PRICE_DOCUMENT_LLM_MAX_CHARS:60000}
+  provider-billing:
+    scheduler-ms: ${TOKENSEA_PROVIDER_BILLING_SCHEDULER_MS:300000}
+  local-test-upstream:
+    enabled: ${TOKENSEA_LOCAL_TEST_UPSTREAM_ENABLED:false}
+    hosts: ${TOKENSEA_LOCAL_TEST_UPSTREAM_HOSTS:}
   runtime:
     engine-url: ${TOKENSEA_RUNTIME_ENGINE_URL:http://localhost:39218}
     engine-key: ${TOKENSEA_RUNTIME_ENGINE_KEY}

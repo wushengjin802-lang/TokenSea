@@ -3,13 +3,18 @@ package com.tokensea.governance;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.tokensea.governance.pricing.adapter.PriceSourceAdapterContext;
+import com.tokensea.governance.pricing.adapter.PriceSourceAdapterRegistry;
+import com.tokensea.governance.pricing.adapter.PriceSourceDocument;
+import com.tokensea.governance.pricing.adapter.PriceSourceParseResult;
+import com.tokensea.governance.pricing.adapter.PriceStructureFingerprint;
 import org.jsoup.Jsoup;
 import org.jsoup.nodes.Document;
 import org.jsoup.nodes.Element;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
 import java.math.BigDecimal;
-import java.math.RoundingMode;
 import java.time.OffsetDateTime;
 import java.util.*;
 import java.util.regex.Matcher;
@@ -19,10 +24,18 @@ import java.util.regex.Pattern;
 public class PriceSourceParser {
     private static final BigDecimal THOUSAND = new BigDecimal("1000");
     private static final BigDecimal MILLION = new BigDecimal("1000000");
+    private static final long DEFAULT_TOKEN_QUANTITY = 1_000_000L;
     private final ObjectMapper json;
+    private final PriceSourceAdapterRegistry adapters;
 
     public PriceSourceParser(ObjectMapper json) {
+        this(json, new PriceSourceAdapterRegistry(List.of()));
+    }
+
+    @Autowired
+    public PriceSourceParser(ObjectMapper json, PriceSourceAdapterRegistry adapters) {
         this.json = json;
+        this.adapters = adapters;
     }
 
     public record NormalizedPrice(
@@ -30,8 +43,10 @@ public class PriceSourceParser {
             String providerModelName,
             String displayName,
             String currency,
-            BigDecimal inputAmountPer1k,
-            BigDecimal outputAmountPer1k,
+            String billingBasis,
+            long billingQuantity,
+            BigDecimal inputUnitPrice,
+            BigDecimal outputUnitPrice,
             String region,
             String requestMode,
             String serviceTier,
@@ -46,15 +61,31 @@ public class PriceSourceParser {
     public List<NormalizedPrice> parse(String adapterCode, String content, String endpoint,
                                        String configuredProvider, String defaultCurrency,
                                        Map<String,Object> config) {
-        if (content == null || content.isBlank()) throw new IllegalArgumentException("价格来源内容为空");
-        return switch (adapterCode) {
-            case "LITELLM_COST_MAP" -> parseLiteLlm(content, endpoint, defaultCurrency);
-            case "MODELS_DEV" -> parseModelsDev(content, endpoint, defaultCurrency);
-            case "DEEPSEEK_OFFICIAL_PAGE" -> parseDeepSeekOfficialPage(content, endpoint);
-            case "OFFICIAL_JSON" -> parseOfficialJson(content, endpoint, configuredProvider, defaultCurrency, config);
-            case "OFFICIAL_CSV" -> parseOfficialCsv(content, endpoint, configuredProvider, defaultCurrency, config);
-            default -> throw new IllegalArgumentException("不支持的价格适配器: " + adapterCode);
+        PriceSourceAdapterContext context = new PriceSourceAdapterContext(
+                null, adapterCode, configuredProvider, endpoint,
+                config == null ? "global" : String.valueOf(config.getOrDefault("region", "global")),
+                defaultCurrency, config == null ? "STANDARD" : String.valueOf(config.getOrDefault("requestMode", "STANDARD")),
+                100, "ORIGINAL", "1.0.0", config);
+        return parseDetailed(context, new PriceSourceDocument(content, endpoint, "", "")).prices();
+    }
+
+    public PriceSourceParseResult parseDetailed(PriceSourceAdapterContext context, PriceSourceDocument document) {
+        if (document == null || document.content() == null || document.content().isBlank()) {
+            throw new IllegalArgumentException("价格来源内容为空");
+        }
+        Optional<com.tokensea.governance.pricing.adapter.PriceSourceAdapter> registered = adapters.find(context.adapterCode());
+        if (registered.isPresent()) return registered.get().parse(context, document);
+        List<NormalizedPrice> prices = switch (context.adapterCode()) {
+            case "LITELLM_COST_MAP" -> parseLiteLlm(document.content(), document.endpoint(), context.defaultCurrency());
+            case "MODELS_DEV" -> parseModelsDev(document.content(), document.endpoint(), context.defaultCurrency());
+            case "DEEPSEEK_OFFICIAL_PAGE" -> parseDeepSeekOfficialPage(document.content(), document.endpoint(), context.defaultCurrency());
+            case "OFFICIAL_JSON" -> parseOfficialJson(document.content(), document.endpoint(), context.providerType(), context.defaultCurrency(), context.config());
+            case "OFFICIAL_CSV" -> parseOfficialCsv(document.content(), document.endpoint(), context.providerType(), context.defaultCurrency(), context.config());
+            default -> throw new IllegalArgumentException("不支持的价格适配器: " + context.adapterCode());
         };
+        return new PriceSourceParseResult(prices, List.of(), List.of(), List.of(),
+                PriceStructureFingerprint.calculate(json, document.content(), document.contentType()),
+                Map.of("endpoint", document.endpoint(), "adapterCode", context.adapterCode()), false);
     }
 
     private List<NormalizedPrice> parseLiteLlm(String content, String endpoint, String defaultCurrency) {
@@ -73,14 +104,18 @@ public class PriceSourceParser {
                 componentPerToken(item, components, "OUTPUT_TOKEN", "output_cost_per_token");
                 componentPerToken(item, components, "CACHE_READ_TOKEN", "cache_read_input_token_cost");
                 componentPerToken(item, components, "CACHE_WRITE_TOKEN", "cache_creation_input_token_cost");
+                componentPerTokenVariant(item, components, "CACHE_READ_TOKEN", "ABOVE_200K",
+                        "cache_read_input_token_cost_above_200k_tokens", Map.of("minContextTokens", 200000));
+                componentPerTokenVariant(item, components, "CACHE_WRITE_TOKEN", "ABOVE_200K",
+                        "cache_creation_input_token_cost_above_200k_tokens", Map.of("minContextTokens", 200000));
                 componentPerToken(item, components, "REASONING_TOKEN", "output_cost_per_reasoning_token");
                 componentPerToken(item, components, "INPUT_TOKEN_ABOVE_200K", "input_cost_per_token_above_200k_tokens");
                 componentPerToken(item, components, "OUTPUT_TOKEN_ABOVE_200K", "output_cost_per_token_above_200k_tokens");
-                componentDirect(item, components, "IMAGE_INPUT", "input_cost_per_image", "PER_IMAGE");
-                componentDirect(item, components, "IMAGE_OUTPUT", "output_cost_per_image", "PER_IMAGE");
-                componentDirect(item, components, "VIDEO_SECOND", "input_cost_per_video_per_second", "PER_SECOND");
-                componentDirect(item, components, "AUDIO_SECOND", "input_cost_per_audio_per_second", "PER_SECOND");
-                componentDirect(item, components, "REQUEST", "input_cost_per_query", "PER_REQUEST");
+                componentDirect(item, components, "IMAGE_INPUT", "input_cost_per_image", "IMAGE");
+                componentDirect(item, components, "IMAGE_OUTPUT", "output_cost_per_image", "IMAGE");
+                componentDirect(item, components, "VIDEO_SECOND", "input_cost_per_video_per_second", "SECOND");
+                componentDirect(item, components, "AUDIO_SECOND", "input_cost_per_audio_per_second", "SECOND");
+                componentDirect(item, components, "REQUEST", "input_cost_per_query", "REQUEST");
                 if (input == null && output == null && components.isEmpty()) return;
                 String provider = text(item, "litellm_provider");
                 if (blank(provider)) provider = providerFromModelKey(model);
@@ -89,7 +124,8 @@ public class PriceSourceParser {
                 String sourceRef = value(text(item, "source"), endpoint);
                 Map<String,Object> raw = json.convertValue(item, new TypeReference<>() {});
                 result.add(new NormalizedPrice(provider, model, value(text(item, "display_name"), model), currency,
-                        perTokenToPer1k(input), perTokenToPer1k(output), region, "STANDARD", "DEFAULT", "DEFAULT",
+                        "TOKEN", DEFAULT_TOKEN_QUANTITY, perTokenToPerMillion(input), perTokenToPerMillion(output),
+                        region, "STANDARD", "DEFAULT", "DEFAULT",
                         components, sourceRef, OffsetDateTime.now(), null, raw));
             });
             return result;
@@ -154,38 +190,52 @@ public class PriceSourceParser {
         String currency = upper(value(text(cost, "currency"), value(text(item, "currency"), value(defaultCurrency, "USD"))));
         Map<String,Object> raw = json.convertValue(item, new TypeReference<>() {});
         result.add(new NormalizedPrice(provider, modelKey, value(text(item, "name"), modelKey), currency,
-                perMillionToPer1k(inputPerMillion), perMillionToPer1k(outputPerMillion),
+                "TOKEN", DEFAULT_TOKEN_QUANTITY, amount(inputPerMillion), amount(outputPerMillion),
                 value(text(item, "region"), "global"), value(text(item, "request_mode"), "STANDARD"),
                 value(text(item, "service_tier"), "DEFAULT"), value(text(item, "context_tier"), "DEFAULT"),
                 components, endpoint, OffsetDateTime.now(), null, raw));
     }
 
-    private List<NormalizedPrice> parseDeepSeekOfficialPage(String content, String endpoint) {
+    private List<NormalizedPrice> parseDeepSeekOfficialPage(String content, String endpoint, String defaultCurrency) {
         Document document = Jsoup.parse(content, endpoint);
         List<String> models = new ArrayList<>();
         List<BigDecimal> cacheHit = new ArrayList<>();
         List<BigDecimal> cacheMiss = new ArrayList<>();
         List<BigDecimal> output = new ArrayList<>();
+        StringBuilder priceEvidence = new StringBuilder();
         for (Element table : document.select("table")) {
             List<String> tableModels = new ArrayList<>();
             List<BigDecimal> tableCacheHit = new ArrayList<>();
             List<BigDecimal> tableCacheMiss = new ArrayList<>();
             List<BigDecimal> tableOutput = new ArrayList<>();
+            StringBuilder tableEvidence = new StringBuilder();
             for (Element row : table.select("tr")) {
                 List<Element> cells = row.select("th,td");
                 if (cells.size() < 2) continue;
-                String label = normalizeLabel(cells.get(0).text());
-                if ("MODEL".equals(label)) {
-                    for (int i = 1; i < cells.size(); i++) {
-                        String model = cleanModelName(cells.get(i).text());
-                        if (!blank(model)) tableModels.add(model);
+                for (int labelIndex = 0; labelIndex < cells.size(); labelIndex++) {
+                    String label = normalizeLabel(cells.get(labelIndex).text());
+                    if (isDeepSeekModelLabel(label)) {
+                        for (int i = labelIndex + 1; i < cells.size(); i++) {
+                            String model = cleanModelName(cells.get(i).text());
+                            if (!blank(model)) tableModels.add(model);
+                        }
+                        break;
                     }
-                } else if (label.contains("1M INPUT TOKENS") && label.contains("CACHE HIT")) {
-                    appendMoneyCells(cells, tableCacheHit);
-                } else if (label.contains("1M INPUT TOKENS") && label.contains("CACHE MISS")) {
-                    appendMoneyCells(cells, tableCacheMiss);
-                } else if (label.contains("1M OUTPUT TOKENS")) {
-                    appendMoneyCells(cells, tableOutput);
+                    if (isDeepSeekCacheHitLabel(label)) {
+                        appendMoneyCells(cells, labelIndex + 1, tableCacheHit);
+                        tableEvidence.append(' ').append(row.text());
+                        break;
+                    }
+                    if (isDeepSeekCacheMissLabel(label)) {
+                        appendMoneyCells(cells, labelIndex + 1, tableCacheMiss);
+                        tableEvidence.append(' ').append(row.text());
+                        break;
+                    }
+                    if (isDeepSeekOutputLabel(label)) {
+                        appendMoneyCells(cells, labelIndex + 1, tableOutput);
+                        tableEvidence.append(' ').append(row.text());
+                        break;
+                    }
                 }
             }
             if (!tableModels.isEmpty() && tableModels.size() == tableCacheHit.size()
@@ -194,56 +244,122 @@ public class PriceSourceParser {
                 cacheHit = tableCacheHit;
                 cacheMiss = tableCacheMiss;
                 output = tableOutput;
+                priceEvidence.append(tableEvidence);
                 break;
             }
         }
         if (models.isEmpty()) {
             String text = document.text().replace('\u00a0', ' ').replaceAll("\\s+", " ").trim();
-            String modelSection = between(text, "MODEL ", " BASE URL");
+            String modelSection = firstNonBlank(
+                    betweenIgnoreCase(text, "MODEL ", " BASE URL"),
+                    betweenIgnoreCase(text, "模型 ", " BASE URL"));
             Matcher matcher = Pattern.compile("deepseek-[a-z0-9.-]+", Pattern.CASE_INSENSITIVE).matcher(modelSection);
             LinkedHashSet<String> found = new LinkedHashSet<>();
             while (matcher.find()) found.add(cleanModelName(matcher.group()));
             models.addAll(found);
-            cacheHit = dollarValues(between(text, "1M INPUT TOKENS (CACHE HIT)", "1M INPUT TOKENS (CACHE MISS)"));
-            cacheMiss = dollarValues(between(text, "1M INPUT TOKENS (CACHE MISS)", "1M OUTPUT TOKENS"));
-            output = dollarValues(between(text, "1M OUTPUT TOKENS", "Concurrency Limit"));
+            String hitSection = firstNonBlank(
+                    betweenIgnoreCase(text, "1M INPUT TOKENS (CACHE HIT)", "1M INPUT TOKENS (CACHE MISS)"),
+                    betweenIgnoreCase(text, "百万TOKENS输入（缓存命中）", "百万TOKENS输入（缓存未命中）"),
+                    betweenIgnoreCase(text, "百万 TOKENS 输入（缓存命中）", "百万 TOKENS 输入（缓存未命中）"));
+            String missSection = firstNonBlank(
+                    betweenIgnoreCase(text, "1M INPUT TOKENS (CACHE MISS)", "1M OUTPUT TOKENS"),
+                    betweenIgnoreCase(text, "百万TOKENS输入（缓存未命中）", "百万TOKENS输出"),
+                    betweenIgnoreCase(text, "百万 TOKENS 输入（缓存未命中）", "百万 TOKENS 输出"));
+            String outputSection = firstNonBlank(
+                    betweenIgnoreCase(text, "1M OUTPUT TOKENS", "CONCURRENCY LIMIT"),
+                    betweenIgnoreCase(text, "百万TOKENS输出", "并发限制"),
+                    betweenIgnoreCase(text, "百万 TOKENS 输出", "并发限制"));
+            cacheHit = moneyValues(hitSection);
+            cacheMiss = moneyValues(missSection);
+            output = moneyValues(outputSection);
+            priceEvidence.append(' ').append(hitSection).append(' ').append(missSection).append(' ').append(outputSection);
         }
         if (models.isEmpty() || models.size() != cacheHit.size() || models.size() != cacheMiss.size()
                 || models.size() != output.size()) {
             throw new IllegalArgumentException("DeepSeek 官方价格页结构发生变化，无法安全解析");
         }
+        String currency = deepSeekCurrency(priceEvidence.toString(), defaultCurrency);
+        String region = "global";
         List<NormalizedPrice> prices = new ArrayList<>();
         for (int i = 0; i < models.size(); i++) {
-            BigDecimal inputPer1k = perMillionToPer1k(cacheMiss.get(i));
-            BigDecimal outputPer1k = perMillionToPer1k(output.get(i));
-            BigDecimal cachePer1k = perMillionToPer1k(cacheHit.get(i));
+            BigDecimal inputPerMillion = cacheMiss.get(i);
+            BigDecimal outputPerMillion = output.get(i);
+            BigDecimal cachePerMillion = cacheHit.get(i);
             Map<String,Object> components = new LinkedHashMap<>();
-            components.put("INPUT_TOKEN", component(inputPer1k, "PER_1K_TOKENS"));
-            components.put("OUTPUT_TOKEN", component(outputPer1k, "PER_1K_TOKENS"));
-            components.put("CACHE_READ_TOKEN", component(cachePer1k, "PER_1K_TOKENS"));
+            components.put("INPUT_TOKEN", component(inputPerMillion, "TOKEN", DEFAULT_TOKEN_QUANTITY));
+            components.put("OUTPUT_TOKEN", component(outputPerMillion, "TOKEN", DEFAULT_TOKEN_QUANTITY));
+            components.put("CACHE_READ_TOKEN", component(cachePerMillion, "TOKEN", DEFAULT_TOKEN_QUANTITY));
             Map<String,Object> raw = new LinkedHashMap<>();
             raw.put("model", models.get(i));
             raw.put("inputPer1MTokensCacheHit", cacheHit.get(i));
             raw.put("inputPer1MTokensCacheMiss", cacheMiss.get(i));
             raw.put("outputPer1MTokens", output.get(i));
+            raw.put("currency", currency);
+            raw.put("configuredCurrency", upper(defaultCurrency));
             raw.put("officialPage", endpoint);
-            prices.add(new NormalizedPrice("deepseek", models.get(i), models.get(i), "USD",
-                    inputPer1k, outputPer1k, "global", "STANDARD", "DEFAULT", "DEFAULT",
+            prices.add(new NormalizedPrice("deepseek", models.get(i), models.get(i), currency,
+                    "TOKEN", DEFAULT_TOKEN_QUANTITY, inputPerMillion, outputPerMillion,
+                    region, "STANDARD", "DEFAULT", "DEFAULT",
                     components, endpoint, OffsetDateTime.now(), null, raw));
         }
         return prices;
     }
 
-    private static void appendMoneyCells(List<Element> cells, List<BigDecimal> target) {
-        for (int i = 1; i < cells.size(); i++) {
+    private static boolean isDeepSeekModelLabel(String label) {
+        String compact = compactLabel(label);
+        return "MODEL".equals(compact) || "模型".equals(compact);
+    }
+
+    private static boolean isDeepSeekCacheHitLabel(String label) {
+        String compact = compactLabel(label);
+        return (compact.contains("1MINPUTTOKENS") && compact.contains("CACHEHIT"))
+                || (compact.contains("百万TOKENS输入") && compact.contains("缓存命中")
+                    && !compact.contains("缓存未命中"));
+    }
+
+    private static boolean isDeepSeekCacheMissLabel(String label) {
+        String compact = compactLabel(label);
+        return (compact.contains("1MINPUTTOKENS") && compact.contains("CACHEMISS"))
+                || (compact.contains("百万TOKENS输入") && compact.contains("缓存未命中"));
+    }
+
+    private static boolean isDeepSeekOutputLabel(String label) {
+        String compact = compactLabel(label);
+        return compact.contains("1MOUTPUTTOKENS") || compact.contains("百万TOKENS输出");
+    }
+
+    private static String compactLabel(String value) {
+        return normalizeLabel(value).replace("（", "(").replace("）", ")").replaceAll("\\s+", "");
+    }
+
+    private static String deepSeekCurrency(String evidence, String defaultCurrency) {
+        String configured = upper(defaultCurrency);
+        if (!Set.of("CNY", "USD").contains(configured)) {
+            throw new IllegalArgumentException("DeepSeek 官方价格源默认币种必须是 CNY 或 USD");
+        }
+        String value = evidence == null ? "" : evidence;
+        boolean cny = Pattern.compile("(?:人民币|CNY|[¥￥]|[0-9]\\s*元)", Pattern.CASE_INSENSITIVE).matcher(value).find();
+        boolean usd = Pattern.compile("(?:美元|USD|\\$)", Pattern.CASE_INSENSITIVE).matcher(value).find();
+        if (cny && usd) throw new IllegalArgumentException("DeepSeek 官方价格页同时出现 CNY 与 USD 标识，无法安全判定币种");
+        String detected = cny ? "CNY" : usd ? "USD" : null;
+        if (detected != null && !detected.equals(configured)) {
+            throw new IllegalArgumentException("DeepSeek 官方价格页币种为 " + detected
+                    + "，与价格源默认币种 " + configured + " 不一致");
+        }
+        return detected == null ? configured : detected;
+    }
+
+    private static void appendMoneyCells(List<Element> cells, int startIndex, List<BigDecimal> target) {
+        for (int i = startIndex; i < cells.size(); i++) {
             BigDecimal amount = money(cells.get(i).text());
             if (amount != null) target.add(amount);
         }
     }
 
-    private static List<BigDecimal> dollarValues(String text) {
+    private static List<BigDecimal> moneyValues(String text) {
         List<BigDecimal> result = new ArrayList<>();
-        Matcher matcher = Pattern.compile("\\$\\s*([0-9]+(?:\\.[0-9]+)?)").matcher(value(text, ""));
+        Matcher matcher = Pattern.compile("(?:[$¥￥]|USD|CNY)?\\s*([0-9]+(?:\\.[0-9]+)?)\\s*(?:人民币|美元|元|USD|CNY)?",
+                Pattern.CASE_INSENSITIVE).matcher(value(text, ""));
         while (matcher.find()) result.add(new BigDecimal(matcher.group(1)));
         return result;
     }
@@ -254,12 +370,19 @@ public class PriceSourceParser {
         return matcher.find() ? new BigDecimal(matcher.group(1)) : null;
     }
 
-    private static String between(String value, String start, String end) {
-        int from = value.indexOf(start);
+    private static String betweenIgnoreCase(String value, String start, String end) {
+        String source = value(value, "");
+        String upperSource = source.toUpperCase(Locale.ROOT);
+        int from = upperSource.indexOf(start.toUpperCase(Locale.ROOT));
         if (from < 0) return "";
         from += start.length();
-        int to = value.indexOf(end, from);
-        return to < 0 ? value.substring(from) : value.substring(from, to);
+        int to = upperSource.indexOf(end.toUpperCase(Locale.ROOT), from);
+        return to < 0 ? source.substring(from) : source.substring(from, to);
+    }
+
+    private static String firstNonBlank(String... values) {
+        for (String candidate : values) if (!blank(candidate)) return candidate;
+        return "";
     }
 
     private static String normalizeLabel(String value) {
@@ -304,7 +427,7 @@ public class PriceSourceParser {
                 Map<String,Object> raw = json.convertValue(item, new TypeReference<>() {});
                 result.add(new NormalizedPrice(provider, model,
                         value(textAt(item, string(config, "displayNameField", "name")), model), currency,
-                        toPer1k(input, unit), toPer1k(output, unit),
+                        "TOKEN", DEFAULT_TOKEN_QUANTITY, toPerMillion(input, unit), toPerMillion(output, unit),
                         value(textAt(item, string(config, "regionField", "region")), string(config, "region", "global")),
                         value(textAt(item, string(config, "requestModeField", "requestMode")), string(config, "requestMode", "STANDARD")),
                         value(textAt(item, string(config, "serviceTierField", "serviceTier")), string(config, "serviceTier", "DEFAULT")),
@@ -342,10 +465,11 @@ public class PriceSourceParser {
             Map<String,Object> components = new LinkedHashMap<>();
             putTokenComponent(components, "INPUT_TOKEN", input, unit);
             putTokenComponent(components, "OUTPUT_TOKEN", output, unit);
+            addConfiguredCsvComponents(row, config, components, unit);
             result.add(new NormalizedPrice(provider, model,
                     value(row.get(string(config, "displayNameField", "display_name")), model),
                     upper(value(row.get(string(config, "currencyField", "currency")), defaultCurrency)),
-                    toPer1k(input, unit), toPer1k(output, unit),
+                    "TOKEN", DEFAULT_TOKEN_QUANTITY, toPerMillion(input, unit), toPerMillion(output, unit),
                     value(row.get(string(config, "regionField", "region")), string(config, "region", "global")),
                     value(row.get(string(config, "requestModeField", "request_mode")), string(config, "requestMode", "STANDARD")),
                     value(row.get(string(config, "serviceTierField", "service_tier")), string(config, "serviceTier", "DEFAULT")),
@@ -356,62 +480,141 @@ public class PriceSourceParser {
         return result;
     }
 
-    @SuppressWarnings("unchecked")
-    private void addConfiguredComponents(JsonNode item, Map<String,Object> config, Map<String,Object> components, String defaultUnit) {
+    private void addConfiguredComponents(JsonNode item, Map<String,Object> config,
+                                         Map<String,Object> components, String defaultUnit) {
         Object mappings = config == null ? null : config.get("componentFields");
         if (!(mappings instanceof Map<?,?> map)) return;
         for (Map.Entry<?,?> entry : map.entrySet()) {
-            String component = String.valueOf(entry.getKey());
-            String path;
-            String unit = defaultUnit;
-            if (entry.getValue() instanceof Map<?,?> spec) {
-                path = String.valueOf(spec.get("field"));
-                if (spec.get("unit") != null) unit = String.valueOf(spec.get("unit"));
-            } else path = String.valueOf(entry.getValue());
-            putTokenComponent(components, component, decimal(at(item, path)), unit);
+            String componentType = String.valueOf(entry.getKey());
+            if (entry.getValue() instanceof List<?> specs) {
+                for (Object spec : specs) addConfiguredJsonComponent(item, components, componentType, spec, defaultUnit);
+            } else addConfiguredJsonComponent(item, components, componentType, entry.getValue(), defaultUnit);
         }
     }
 
+    private void addConfiguredCsvComponents(Map<String,String> row, Map<String,Object> config,
+                                            Map<String,Object> components, String defaultUnit) {
+        Object mappings = config == null ? null : config.get("componentFields");
+        if (!(mappings instanceof Map<?,?> map)) return;
+        for (Map.Entry<?,?> entry : map.entrySet()) {
+            String componentType = String.valueOf(entry.getKey());
+            if (entry.getValue() instanceof List<?> specs) {
+                for (Object spec : specs) addConfiguredCsvComponent(row, components, componentType, spec, defaultUnit);
+            } else addConfiguredCsvComponent(row, components, componentType, entry.getValue(), defaultUnit);
+        }
+    }
+
+    private void addConfiguredJsonComponent(JsonNode item, Map<String,Object> components,
+                                            String componentType, Object rawSpec, String defaultUnit) {
+        ComponentMapping mapping = componentMapping(rawSpec, defaultUnit);
+        BigDecimal value = decimal(at(item, mapping.field()));
+        if (value == null) return;
+        addComponentValue(components, componentType, configuredComponent(value, mapping));
+    }
+
+    private void addConfiguredCsvComponent(Map<String,String> row, Map<String,Object> components,
+                                           String componentType, Object rawSpec, String defaultUnit) {
+        ComponentMapping mapping = componentMapping(rawSpec, defaultUnit);
+        BigDecimal value = decimal(row.get(mapping.field()));
+        if (value == null) return;
+        addComponentValue(components, componentType, configuredComponent(value, mapping));
+    }
+
+    private ComponentMapping componentMapping(Object rawSpec, String defaultUnit) {
+        if (rawSpec instanceof Map<?,?> spec) {
+            Object field = spec.get("field");
+            if (field == null || String.valueOf(field).isBlank()) throw new IllegalArgumentException("价格组件映射缺少 field");
+            return new ComponentMapping(String.valueOf(field),
+                    spec.get("unit") == null ? defaultUnit : String.valueOf(spec.get("unit")),
+                    spec.get("variant") == null ? "DEFAULT" : String.valueOf(spec.get("variant")),
+                    spec.get("mode") == null ? "EXPLICIT" : String.valueOf(spec.get("mode")),
+                    spec.get("priority") instanceof Number number ? number.intValue() : 100,
+                    spec.get("scope") instanceof Map<?,?> scope ? stringMap(scope) : Map.of(),
+                    spec.get("metadata") instanceof Map<?,?> metadata ? stringMap(metadata) : Map.of());
+        }
+        return new ComponentMapping(String.valueOf(rawSpec), defaultUnit, "DEFAULT", "EXPLICIT", 100, Map.of(), Map.of());
+    }
+
+    private Map<String,Object> configuredComponent(BigDecimal value, ComponentMapping mapping) {
+        Map<String,Object> result = new LinkedHashMap<>(component(toPerMillion(value, mapping.unit()),
+                "TOKEN", DEFAULT_TOKEN_QUANTITY));
+        result.put("variant", mapping.variant());
+        result.put("mode", mapping.mode());
+        result.put("priority", mapping.priority());
+        result.put("scope", mapping.scope());
+        result.put("metadata", mapping.metadata());
+        return result;
+    }
+
+    private void addComponentValue(Map<String,Object> components, String componentType, Map<String,Object> value) {
+        Object existing = components.get(componentType);
+        if (existing == null) components.put(componentType, value);
+        else if (existing instanceof List<?> list) {
+            List<Object> values = new ArrayList<>(list);
+            values.add(value);
+            components.put(componentType, values);
+        } else components.put(componentType, new ArrayList<>(List.of(existing, value)));
+    }
+
+    private record ComponentMapping(String field, String unit, String variant, String mode,
+                                    int priority, Map<String,Object> scope, Map<String,Object> metadata) {}
+
     private void componentPerToken(JsonNode item, Map<String,Object> components, String component, String field) {
         BigDecimal value = decimal(item.get(field));
-        if (value != null) components.put(component, component(perTokenToPer1k(value), "PER_1K_TOKENS"));
+        if (value != null) components.put(component,
+                component(perTokenToPerMillion(value), "TOKEN", DEFAULT_TOKEN_QUANTITY));
+    }
+
+    private void componentPerTokenVariant(JsonNode item, Map<String,Object> components,
+                                          String componentType, String variant, String field,
+                                          Map<String,Object> scope) {
+        BigDecimal value = decimal(item.get(field));
+        if (value == null) return;
+        Map<String,Object> spec = new LinkedHashMap<>(
+                component(perTokenToPerMillion(value), "TOKEN", DEFAULT_TOKEN_QUANTITY));
+        spec.put("variant", variant);
+        spec.put("mode", "EXPLICIT");
+        spec.put("priority", 50);
+        spec.put("scope", scope == null ? Map.of() : scope);
+        spec.put("metadata", Map.of("sourceField", field));
+        addComponentValue(components, componentType, spec);
     }
 
     private void componentPerMillion(JsonNode item, Map<String,Object> components, String component, String... fields) {
         BigDecimal value = decimal(firstNode(item, fields));
-        if (value != null) components.put(component, component(perMillionToPer1k(value), "PER_1K_TOKENS"));
+        if (value != null) components.put(component, component(value, "TOKEN", DEFAULT_TOKEN_QUANTITY));
     }
 
     private void componentDirect(JsonNode item, Map<String,Object> components, String component, String field, String basis) {
         BigDecimal value = decimal(item.get(field));
-        if (value != null) components.put(component, component(value, basis));
+        if (value != null) components.put(component, component(value, basis, 1));
     }
 
     private void putTokenComponent(Map<String,Object> components, String type, BigDecimal value, String unit) {
         if (value == null) return;
-        components.put(type, component(toPer1k(value, unit), "PER_1K_TOKENS"));
+        components.put(type, component(toPerMillion(value, unit), "TOKEN", DEFAULT_TOKEN_QUANTITY));
     }
 
-    private static Map<String,Object> component(BigDecimal value, String basis) {
-        return Map.of("unitPrice", value, "unitBasis", basis);
+    private static Map<String,Object> component(BigDecimal value, String basis, long quantity) {
+        return Map.of("unitPrice", amount(value), "unitBasis", basis, "unitQuantity", quantity);
     }
 
-    private static BigDecimal toPer1k(BigDecimal value, String unit) {
+    private static BigDecimal toPerMillion(BigDecimal value, String unit) {
         if (value == null) return BigDecimal.ZERO;
         return switch (value(unit, "PER_1M_TOKENS").toUpperCase(Locale.ROOT)) {
-            case "PER_TOKEN" -> perTokenToPer1k(value);
-            case "PER_1K_TOKENS" -> value;
-            case "PER_1M_TOKENS" -> perMillionToPer1k(value);
+            case "PER_TOKEN" -> perTokenToPerMillion(value);
+            case "PER_1K_TOKENS" -> value.multiply(THOUSAND);
+            case "PER_1M_TOKENS" -> value;
             default -> throw new IllegalArgumentException("不支持的 Token 计费单位: " + unit);
         };
     }
 
-    private static BigDecimal perTokenToPer1k(BigDecimal value) {
-        return value == null ? BigDecimal.ZERO : value.multiply(THOUSAND);
+    private static BigDecimal perTokenToPerMillion(BigDecimal value) {
+        return value == null ? BigDecimal.ZERO : value.multiply(MILLION);
     }
 
-    private static BigDecimal perMillionToPer1k(BigDecimal value) {
-        return value == null ? BigDecimal.ZERO : value.multiply(THOUSAND).divide(MILLION, 12, RoundingMode.HALF_UP);
+    private static BigDecimal amount(BigDecimal value) {
+        return value == null ? BigDecimal.ZERO : value;
     }
 
     private static JsonNode at(JsonNode root, String path) {
@@ -492,6 +695,12 @@ public class PriceSourceParser {
         }
         values.add(current.toString());
         return values;
+    }
+
+    private static Map<String,Object> stringMap(Map<?,?> source) {
+        Map<String,Object> result = new LinkedHashMap<>();
+        source.forEach((key, value) -> result.put(String.valueOf(key), value));
+        return result;
     }
 
     private static String upper(String value) { return value == null ? null : value.toUpperCase(Locale.ROOT); }

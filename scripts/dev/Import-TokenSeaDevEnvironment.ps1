@@ -14,6 +14,8 @@ if (-not (Test-Path -LiteralPath $envFile)) {
     throw "Missing local environment file: $envFile"
 }
 
+$loadedNames = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+
 Get-Content -LiteralPath $envFile | ForEach-Object {
     $line = $_.Trim()
     if (-not $line -or $line.StartsWith("#")) {
@@ -31,4 +33,16 @@ Get-Content -LiteralPath $envFile | ForEach-Object {
         $value = $value.Substring(1, $value.Length - 2)
     }
     Set-Item -Path "Env:$name" -Value $value
+    [void]$loadedNames.Add($name)
+}
+
+# Docker Compose exposes the shared Runtime Core key to application processes
+# under TOKENSEA_RUNTIME_ENGINE_KEY. When the local .env does not explicitly
+# define an engine key, override any stale inherited process value with the
+# current Runtime Core key so repeated hybrid restarts stay deterministic.
+$engineKeyConfiguredInFile = $loadedNames.Contains("TOKENSEA_RUNTIME_ENGINE_KEY") -and
+    -not [string]::IsNullOrWhiteSpace($env:TOKENSEA_RUNTIME_ENGINE_KEY)
+if (-not $engineKeyConfiguredInFile -and
+    -not [string]::IsNullOrWhiteSpace($env:TOKENSEA_RUNTIME_CORE_KEY)) {
+    $env:TOKENSEA_RUNTIME_ENGINE_KEY = $env:TOKENSEA_RUNTIME_CORE_KEY
 }

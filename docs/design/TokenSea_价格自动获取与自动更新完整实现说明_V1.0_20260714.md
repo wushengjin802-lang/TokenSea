@@ -177,7 +177,7 @@ PriceSourceParser.java
 
 - 根据 `adapter_code` 选择解析器；
 - 将各种来源转换为统一 `NormalizedPrice`；
-- 把每 Token、每千 Token、每百万 Token 统一转换为每千 Token；
+- 将每 Token、每千 Token、每百万 Token 统一规范为 `billingBasis=TOKEN`、`billingQuantity=1000000` 的每百万 Token 价格；非 Token 价格保留对应计费对象和计费基数；
 - 生成完整价格组件；
 - 对来源结构变化快速失败；
 - 使用 `BigDecimal` 保证金额精度。

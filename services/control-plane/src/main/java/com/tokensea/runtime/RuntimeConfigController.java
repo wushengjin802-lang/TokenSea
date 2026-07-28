@@ -90,7 +90,14 @@ public class RuntimeConfigController {
     }
 
     private boolean liveProbePassed(String instanceId, String actualModel) {
-        Integer count = jdbc.queryForObject("select count(*) from channel_model_deployment d where d.provider_instance_id=? and d.provider_model_name=? and d.review_status='APPROVED' and d.routing_status='ELIGIBLE' and exists(select 1 from capability_validation v where v.deployment_id=d.id and v.test_type='LIVE_PROBE' and v.status='PASSED')", Integer.class, instanceId, actualModel);
+        Integer count = jdbc.queryForObject("""
+            select count(*) from channel_model_deployment d
+            where d.provider_instance_id=? and d.provider_model_name=?
+              and d.production_status='APPROVED' and d.health_status='HEALTHY'
+              and d.discovery_status<>'MISSING_CONFIRMED' and d.routing_status='ELIGIBLE'
+              and (select v.status from capability_validation v where v.deployment_id=d.id
+                and v.test_type='LIVE_PROBE' order by v.validated_at desc limit 1)='PASSED'
+            """, Integer.class, instanceId, actualModel);
         return count != null && count > 0;
     }
 

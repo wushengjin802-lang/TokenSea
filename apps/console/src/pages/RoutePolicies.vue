@@ -1,11 +1,10 @@
 <template>
-  <div class="page console-page">
+  <div class="page console-page list-page-internal-scroll">
     <header class="page-header">
       <div>
-        <div class="eyebrow">运行治理</div>
-        <h1 class="page-title">路由与 Fallback</h1>
+        <h1 class="page-title">路由策略</h1>
         <p class="page-desc">
-          用已审核部署、真实价格版本和中文结构化选项配置候选链路。
+          平台管理员保存策略后可直接校验并生效；系统仍会检查模型映射、能力验证和价格版本。
         </p>
       </div>
       <div class="header-actions">
@@ -29,7 +28,6 @@
             class="filter-select"
           /><button class="btn" @click="apply">查询</button>
         </div>
-        <span class="table-meta">{{ total }} 条</span>
       </div>
       <div v-if="error" class="state-panel error-state">
         <strong>路由策略加载失败</strong>
@@ -70,19 +68,18 @@
                   }}</span>
                 </td>
                 <td class="row-actions">
-                  <button class="btn small" @click="openEdit(row)">编辑</button
-                  ><button
+                  <button
                     v-if="row.status === 'DRAFT'"
                     class="btn small"
-                    @click="action(row, 'submit', '提交审批')"
+                    @click="openEdit(row)"
                   >
-                    提交审批</button
+                    编辑</button
                   ><button
-                    v-if="row.status === 'PENDING_APPROVAL'"
+                    v-if="['DRAFT', 'PENDING_APPROVAL'].includes(row.status)"
                     class="btn small"
-                    @click="action(row, 'activate', '生效')"
+                    @click="action(row, 'activate', '校验并生效')"
                   >
-                    审批后生效</button
+                    校验并生效</button
                   ><button
                     v-if="row.status === 'ACTIVE'"
                     class="btn small"
@@ -97,9 +94,11 @@
         </div>
         <div v-if="!rows.length" class="state-panel empty-state">
           <strong>尚无路由策略</strong>
-          <p>创建策略前请先准备已审核部署和生效价格版本。</p>
+          <p>创建策略前请先准备已审核部署、能力验证记录和生效价格版本。</p>
         </div>
-        <footer v-if="total > size" class="pagination">
+        <footer class="pagination">
+          <span>共 {{ total }} 条</span>
+          <template v-if="total > size">
           <button
             class="btn"
             :disabled="page === 1"
@@ -120,6 +119,7 @@
           >
             下一页
           </button>
+          </template>
         </footer></template
       >
     </section>
@@ -189,16 +189,17 @@
               show-search
               option-filter-prop="label"
               placeholder="选择已审核模型"
+              @change="candidate.priceVersionId = undefined"
             />
           </div>
           <div>
             <label>价格版本</label
             ><a-select
               v-model:value="candidate.priceVersionId"
-              :options="priceOptions(candidate.providerInstanceId)"
+              :options="priceOptions(candidate.providerInstanceId, candidate.actualModel)"
               show-search
               option-filter-prop="label"
-              placeholder="选择实际成本"
+              placeholder="选择生效价格版本"
             />
           </div>
           <div>
@@ -236,6 +237,7 @@ import {
   queryPage,
   update,
 } from "../api/client";
+import { stableSortRows } from "../listSort";
 import { message } from "ant-design-vue";
 type Candidate = {
   localId: string;
@@ -245,15 +247,22 @@ type Candidate = {
   rank: number;
 };
 type Row = Record<string, any>;
-type Option = { label: string; value: any; providerInstanceId?: string };
+type Option = {
+  label: string;
+  value: any;
+  providerInstanceId?: string;
+  deploymentId?: string;
+  providerModelName?: string;
+  priceLayer?: string;
+};
 const rows = ref<Row[]>([]),
   total = ref(0),
   page = ref(1),
   size = ref(20),
   keyword = ref(""),
   status = ref<string>(),
-  sort = ref(""),
-  order = ref<"asc" | "desc">("asc"),
+  sort = ref("createdAt"),
+  order = ref<"asc" | "desc">("desc"),
   loading = ref(false),
   error = ref(""),
   visible = ref(false),
@@ -269,7 +278,7 @@ const form = reactive<{
 }>({ name: "", strategy: "priority", fallbackEnabled: true, candidates: [] });
 const modelOptions = ref<Option[]>([]),
   channelOptions = ref<Option[]>([]),
-  deployments = ref<(Option & { deploymentId?: string })[]>([]),
+  deployments = ref<Option[]>([]),
   prices = ref<Option[]>([]);
   const statusOptions = [
     { label: "草稿", value: "DRAFT" },
@@ -300,7 +309,7 @@ async function load() {
       sort: sort.value || undefined,
       order: order.value,
     });
-    rows.value = result.items;
+    rows.value = stableSortRows(result.items, sort.value || "id", order.value);
     total.value = result.total;
   } catch (e) {
     error.value = errorMessage(e);
@@ -310,6 +319,25 @@ async function load() {
     loading.value = false;
   }
 }
+function cacheModeLabel(value?: string) {
+  return ({
+    EXPLICIT: "明确价格",
+    EXPLICIT_ZERO: "免费",
+    INHERIT_INPUT: "沿用未命中价",
+    NOT_APPLICABLE: "不适用",
+    UNKNOWN: "未确认",
+  } as Record<string, string>)[String(value || "UNKNOWN")] || "未确认";
+}
+
+function priceCompletenessLabel(value?: string) {
+  return ({
+    COMPLETE: "价格完整",
+    PARTIAL: "价格不完整",
+    UNKNOWN_CACHE_PRICE: "缓存价未确认",
+    UNSUPPORTED_CACHE: "不支持缓存",
+  } as Record<string, string>)[String(value || "PARTIAL")] || "价格不完整";
+}
+
 async function loadOptions() {
   try {
     const [models, channels, deployed, costs] = await Promise.all([
@@ -317,7 +345,7 @@ async function loadOptions() {
       queryPage<Row>("/api/provider-instances", { size: 500 }),
       queryPage<Row>("/api/channel-model-deployments", {
         size: 500,
-        status: "APPROVED",
+        productionStatus: "APPROVED",
       }),
       queryPage<Row>("/api/price-versions", { size: 500, status: "ACTIVE" }),
     ]);
@@ -336,14 +364,28 @@ async function loadOptions() {
       deploymentId: x.id,
     }));
     prices.value = costs.items
-      .filter((x) => x.priceLayer === "CHANNEL_ACTUAL" && x.status === "ACTIVE")
-      .map((x) => ({
-        label: `渠道实际成本 · V${x.version} · ${x.currency}`,
-        value: x.id,
-        providerInstanceId: deployments.value.find(
+      .filter(
+        (x) =>
+          ["PROVIDER_OFFICIAL", "CHANNEL_ACTUAL"].includes(x.priceLayer) &&
+          x.status === "ACTIVE",
+      )
+      .map((x) => {
+        const deployment = deployments.value.find(
           (item) => item.deploymentId === x.deploymentId,
-        )?.providerInstanceId,
-      }));
+        );
+        const layerLabel =
+          x.priceLayer === "PROVIDER_OFFICIAL"
+            ? "供应商官方价"
+            : "渠道实际成本";
+        return {
+          label: `${layerLabel} · V${x.version} · ${x.currency} · 未命中输入 ${x.inputUnitPrice ?? "—"} / 缓存命中 ${x.cacheReadUnitPrice ?? cacheModeLabel(x.cacheReadMode)} / 缓存写入 ${x.cacheWriteUnitPrice ?? cacheModeLabel(x.cacheWriteMode)} / 输出 ${x.outputUnitPrice ?? "—"} · ${priceCompletenessLabel(x.priceCompletenessStatus)} · 每 ${x.billingQuantity ?? 1000000} ${x.billingBasis === "TOKEN" ? "Token" : x.billingBasis ?? "单位"}`,
+          value: x.id,
+          providerInstanceId: x.providerInstanceId || deployment?.providerInstanceId,
+          deploymentId: x.deploymentId,
+          providerModelName: x.providerModelName || deployment?.value,
+          priceLayer: x.priceLayer,
+        };
+      });
   } catch (e) {
     formError.value = `业务选项加载失败：${errorMessage(e)}`;
   }
@@ -351,8 +393,13 @@ async function loadOptions() {
 function deploymentOptions(id?: string) {
   return deployments.value.filter((x) => !id || x.providerInstanceId === id);
 }
-function priceOptions(id?: string) {
-  return prices.value.filter((x) => !id || x.providerInstanceId === id);
+function priceOptions(id?: string, actualModel?: string) {
+  if (!id || !actualModel) return [];
+  return prices.value.filter(
+    (x) =>
+      x.providerInstanceId === id &&
+      String(x.providerModelName).toLowerCase() === actualModel.toLowerCase(),
+  );
 }
 function addCandidate() {
   form.candidates.push({
@@ -450,7 +497,7 @@ async function action(row: Row, suffix: string, label: string) {
     message.success(`${label}成功`);
     await load();
   } catch (e) {
-    message.error(errorMessage(e));
+    message.error(errorMessage(e, `路由策略 / ${label}`));
   }
 }
 function apply() {
@@ -491,3 +538,20 @@ onMounted(async () => {
   await load();
 });
 </script>
+
+<style scoped>
+.candidate-row > div {
+  min-width: 0;
+}
+
+.candidate-row :deep(.ant-select) {
+  width: 100%;
+  min-width: 0;
+}
+
+.candidate-row :deep(.ant-select-selection-item) {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+</style>

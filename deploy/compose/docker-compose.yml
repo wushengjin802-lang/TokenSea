@@ -2,6 +2,7 @@
 services:
   tokensea-postgres:
     image: postgres:16-alpine
+    mem_limit: 512m
     environment:
       POSTGRES_DB: ${TOKENSEA_DB_NAME:-tokensea}
       POSTGRES_USER: ${TOKENSEA_DB_USER:-tokensea}
@@ -21,6 +22,7 @@ services:
 
   tokensea-redis:
     image: redis:7-alpine
+    mem_limit: 256m
     environment:
       REDIS_PASSWORD: ${TOKENSEA_REDIS_PASSWORD:?TOKENSEA_REDIS_PASSWORD is required}
     ports:
@@ -56,8 +58,24 @@ services:
       TOKENSEA_EGRESS_PROXY_HOST: tokensea-egress-proxy
       TOKENSEA_EGRESS_PROXY_PORT: 18080
       TOKENSEA_EGRESS_POLICY_TOKEN: ${TOKENSEA_EGRESS_POLICY_TOKEN:?TOKENSEA_EGRESS_POLICY_TOKEN is required}
+      TOKENSEA_HEADLESS_FETCHER_URL: http://tokensea-headless-fetcher:39219
+      TOKENSEA_HEADLESS_FETCHER_TOKEN: ${TOKENSEA_EGRESS_POLICY_TOKEN:?TOKENSEA_EGRESS_POLICY_TOKEN is required}
+      TOKENSEA_PRICE_DOCUMENT_LLM_ENABLED: ${TOKENSEA_PRICE_DOCUMENT_LLM_ENABLED:-false}
+      TOKENSEA_PRICE_DOCUMENT_LLM_URL: ${TOKENSEA_PRICE_DOCUMENT_LLM_URL:-}
+      TOKENSEA_PRICE_DOCUMENT_LLM_MODEL: ${TOKENSEA_PRICE_DOCUMENT_LLM_MODEL:-}
+      TOKENSEA_PRICE_DOCUMENT_LLM_API_KEY: ${TOKENSEA_PRICE_DOCUMENT_LLM_API_KEY:-}
+      TOKENSEA_PRICE_DOCUMENT_LLM_MAX_CHARS: ${TOKENSEA_PRICE_DOCUMENT_LLM_MAX_CHARS:-60000}
+      TOKENSEA_PROVIDER_BILLING_SCHEDULER_MS: ${TOKENSEA_PROVIDER_BILLING_SCHEDULER_MS:-300000}
       TOKENSEA_BOOTSTRAP_TOKEN: ${TOKENSEA_BOOTSTRAP_TOKEN:-}
       TOKENSEA_BUDGET_CURRENCY: ${TOKENSEA_BUDGET_CURRENCY:-CNY}
+      TOKENSEA_FX_SOURCE_URL: ${TOKENSEA_FX_SOURCE_URL:-https://www.ecb.europa.eu/stats/eurofxref/eurofxref-daily.xml}
+      TOKENSEA_FX_MANAGED_CURRENCIES: ${TOKENSEA_FX_MANAGED_CURRENCIES:-USD}
+      TOKENSEA_FX_MONTHLY_CRON: "${TOKENSEA_FX_MONTHLY_CRON:-0 10 3 1 * *}"
+      TOKENSEA_FX_RECOVERY_CRON: "${TOKENSEA_FX_RECOVERY_CRON:-0 40 3 * * *}"
+      TOKENSEA_FX_ZONE: ${TOKENSEA_FX_ZONE:-Asia/Shanghai}
+      TOKENSEA_CONNECTION_TEST_VALID_MINUTES: ${TOKENSEA_CONNECTION_TEST_VALID_MINUTES:-10080}
+      TOKENSEA_LOCAL_TEST_UPSTREAM_ENABLED: ${TOKENSEA_LOCAL_TEST_UPSTREAM_ENABLED:-false}
+      TOKENSEA_LOCAL_TEST_UPSTREAM_HOSTS: ${TOKENSEA_LOCAL_TEST_UPSTREAM_HOSTS:-}
     ports:
       - "127.0.0.1:${TOKENSEA_CONTROL_PORT:-39211}:39211"
     depends_on:
@@ -66,6 +84,8 @@ services:
       tokensea-redis:
         condition: service_healthy
       tokensea-egress-proxy:
+        condition: service_healthy
+      tokensea-headless-fetcher:
         condition: service_healthy
     networks:
       - tokensea-internal
@@ -87,6 +107,11 @@ services:
       TOKENSEA_CRYPTO_KEY: ${TOKENSEA_CRYPTO_KEY:?TOKENSEA_CRYPTO_KEY is required}
       TOKENSEA_RUNTIME_CORE_BASE: ${TOKENSEA_RUNTIME_CORE_BASE:-http://tokensea-runtime-core:39218}
       TOKENSEA_OUTBOX_DIR: /var/lib/tokensea-gateway/outbox
+      TOKENSEA_CONNECTION_TEST_MAX_AGE_SECONDS: ${TOKENSEA_CONNECTION_TEST_MAX_AGE_SECONDS:-604800}
+      TOKENSEA_DNS_RECHECK_TTL_SECONDS: ${TOKENSEA_DNS_RECHECK_TTL_SECONDS:-300}
+      TOKENSEA_LOCAL_TEST_UPSTREAM_ENABLED: ${TOKENSEA_LOCAL_TEST_UPSTREAM_ENABLED:-false}
+      TOKENSEA_LOCAL_TEST_UPSTREAM_HOSTS: ${TOKENSEA_LOCAL_TEST_UPSTREAM_HOSTS:-}
+      TOKENSEA_CORS_ORIGINS: ${TOKENSEA_CORS_ALLOWED_ORIGINS:-http://localhost:39210,http://127.0.0.1:39210}
     ports:
       - "127.0.0.1:${TOKENSEA_GATEWAY_PORT:-39212}:39212"
     volumes:
@@ -142,18 +167,50 @@ services:
       - tokensea-public
       - tokensea-provider-egress
 
+  tokensea-headless-fetcher:
+    build: ../../services/headless-fetcher
+    environment:
+      TOKENSEA_HEADLESS_FETCHER_TOKEN: ${TOKENSEA_EGRESS_POLICY_TOKEN:?TOKENSEA_EGRESS_POLICY_TOKEN is required}
+      TOKENSEA_HEADLESS_PROXY_URL: http://tokensea-egress-proxy:18080
+    expose:
+      - "39219"
+    init: true
+    ipc: host
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,size=256m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:39219/health', timeout=2)"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    depends_on:
+      tokensea-egress-proxy:
+        condition: service_healthy
+    networks:
+      - tokensea-internal
+
   tokensea-runtime-core:
     image: ${TOKENSEA_RUNTIME_CORE_IMAGE:-ghcr.io/berriai/litellm:v1.91.0}
+    mem_limit: 1536m
     command: ["--port", "39218", "--host", "0.0.0.0"]
     environment:
       LITELLM_MASTER_KEY: ${TOKENSEA_RUNTIME_CORE_KEY:?TOKENSEA_RUNTIME_CORE_KEY is required}
-      STORE_MODEL_IN_DB: "False"
+      # Gateway registers the approved deployment on demand through /model/new.
+      # LiteLLM v1.91 requires a database connection for that management API.
+      DATABASE_URL: postgresql://${TOKENSEA_DB_USER:-tokensea}:${TOKENSEA_DB_PASSWORD:?TOKENSEA_DB_PASSWORD is required}@tokensea-postgres:5432/${TOKENSEA_DB_NAME:-tokensea}?schema=litellm
+      STORE_MODEL_IN_DB: "True"
       HTTP_PROXY: http://tokensea-egress-proxy:18080
       HTTPS_PROXY: http://tokensea-egress-proxy:18080
       http_proxy: http://tokensea-egress-proxy:18080
       https_proxy: http://tokensea-egress-proxy:18080
-      NO_PROXY: localhost,127.0.0.1,tokensea-postgres
-      no_proxy: localhost,127.0.0.1,tokensea-postgres
+      NO_PROXY: localhost,127.0.0.1,tokensea-postgres${TOKENSEA_RUNTIME_NO_PROXY_EXTRA:-}
+      no_proxy: localhost,127.0.0.1,tokensea-postgres${TOKENSEA_RUNTIME_NO_PROXY_EXTRA:-}
     ports:
       - "127.0.0.1:${TOKENSEA_RUNTIME_CORE_PORT:-39218}:39218"
     depends_on:

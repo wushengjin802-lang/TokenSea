@@ -36,8 +36,9 @@ public class ModelPriceController {
     }
 
     public record PriceRequest(String modelId, String platformModelId, String providerInstanceId,
-                               String currency, BigDecimal inputCostPer1k, BigDecimal outputCostPer1k,
-                               BigDecimal inputPricePer1k, BigDecimal outputPricePer1k,
+                               String currency, String billingBasis, Long billingQuantity,
+                               BigDecimal inputCostUnitPrice, BigDecimal outputCostUnitPrice,
+                               BigDecimal inputPriceUnitPrice, BigDecimal outputPriceUnitPrice,
                                OffsetDateTime effectiveFrom, OffsetDateTime effectiveTo) {}
 
     @GetMapping public ApiResponse<List<ModelPrice>> list() { return ApiResponse.ok(mapper.selectList(null)); }
@@ -98,16 +99,25 @@ public class ModelPriceController {
         if (r.effectiveFrom() == null || (r.effectiveTo() != null && !r.effectiveTo().isAfter(r.effectiveFrom()))) {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "价格有效期无效");
         }
-        for (BigDecimal amount : List.of(amount(r.inputCostPer1k()), amount(r.outputCostPer1k()), amount(r.inputPricePer1k()), amount(r.outputPricePer1k()))) {
+        if (!List.of("TOKEN","REQUEST","IMAGE","SECOND","MINUTE","CHARACTER","AUDIO_MINUTE").contains(r.billingBasis())
+                || r.billingQuantity() == null || r.billingQuantity() <= 0) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "计费对象或计费基数无效");
+        }
+        for (BigDecimal amount : List.of(amount(r.inputCostUnitPrice()), amount(r.outputCostUnitPrice()),
+                amount(r.inputPriceUnitPrice()), amount(r.outputPriceUnitPrice()))) {
             if (amount.signum() < 0) throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "价格不能为负数");
         }
     }
     private void apply(ModelPrice v, PriceRequest r) {
         v.setModelId(blank(r.modelId()) ? null : r.modelId()); v.setPlatformModelId(blank(r.platformModelId()) ? null : r.platformModelId());
         v.setProviderInstanceId(blank(r.providerInstanceId()) ? null : r.providerInstanceId());
-        v.setCurrency(r.currency().toUpperCase(Locale.ROOT)); v.setInputCostPer1k(amount(r.inputCostPer1k()));
-        v.setOutputCostPer1k(amount(r.outputCostPer1k())); v.setInputPricePer1k(amount(r.inputPricePer1k()));
-        v.setOutputPricePer1k(amount(r.outputPricePer1k())); v.setEffectiveFrom(r.effectiveFrom()); v.setEffectiveTo(r.effectiveTo());
+        v.setCurrency(r.currency().toUpperCase(Locale.ROOT));
+        v.setBillingBasis(r.billingBasis()); v.setBillingQuantity(r.billingQuantity());
+        v.setInputCostUnitPrice(amount(r.inputCostUnitPrice()));
+        v.setOutputCostUnitPrice(amount(r.outputCostUnitPrice()));
+        v.setInputPriceUnitPrice(amount(r.inputPriceUnitPrice()));
+        v.setOutputPriceUnitPrice(amount(r.outputPriceUnitPrice()));
+        v.setEffectiveFrom(r.effectiveFrom()); v.setEffectiveTo(r.effectiveTo());
     }
     private ModelPrice require(String id) {
         ModelPrice value = mapper.selectById(id);

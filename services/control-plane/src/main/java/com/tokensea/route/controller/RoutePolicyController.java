@@ -7,6 +7,8 @@ import com.tokensea.asset.mapper.PlatformModelMapper;
 import com.tokensea.audit.entity.AuditLog;
 import com.tokensea.audit.mapper.AuditLogMapper;
 import com.tokensea.common.ApiResponse;
+import com.tokensea.common.OperationException;
+import com.tokensea.governance.CapabilityProbeService;
 import com.tokensea.route.entity.RoutePolicy;
 import com.tokensea.route.mapper.RoutePolicyMapper;
 import com.tokensea.route.service.RouteCandidateValidator;
@@ -32,13 +34,22 @@ public class RoutePolicyController {
     private final ObjectMapper json;
     private final RouteCandidateValidator candidateValidator;
     private final GovernanceApprovalService approvals;
+    private final CapabilityProbeService capabilityProbes;
 
-    public RoutePolicyController(RoutePolicyMapper mapper, PlatformModelMapper models, AuditLogMapper audits, ObjectMapper json,RouteCandidateValidator candidateValidator,GovernanceApprovalService approvals) {
-        this.mapper = mapper; this.models = models; this.audits = audits; this.json = json;this.candidateValidator=candidateValidator;this.approvals=approvals;
+    public RoutePolicyController(RoutePolicyMapper mapper, PlatformModelMapper models, AuditLogMapper audits,
+                                 ObjectMapper json, RouteCandidateValidator candidateValidator,
+                                 GovernanceApprovalService approvals, CapabilityProbeService capabilityProbes) {
+        this.mapper = mapper;
+        this.models = models;
+        this.audits = audits;
+        this.json = json;
+        this.candidateValidator = candidateValidator;
+        this.approvals = approvals;
+        this.capabilityProbes = capabilityProbes;
     }
     public record RouteRequest(String name, String modelAlias, String strategy, Boolean fallbackEnabled, String config) {}
 
-    @GetMapping public ApiResponse<List<RoutePolicy>> list() { return ApiResponse.ok(mapper.selectList(null)); }
+    @GetMapping public ApiResponse<List<RoutePolicy>> list() { return ApiResponse.ok(mapper.selectList(new com.baomidou.mybatisplus.core.conditions.query.QueryWrapper<RoutePolicy>().orderByDesc("created_at"))); }
     @GetMapping("/{id}") public ApiResponse<RoutePolicy> get(@PathVariable String id) { return ApiResponse.ok(require(id)); }
 
     @PostMapping @Transactional
@@ -53,14 +64,52 @@ public class RoutePolicyController {
         apply(value, request); mapper.updateById(value); audit("ROUTE_UPDATE", value, before); return ApiResponse.ok(value);
     }
     @PostMapping("/{id}/activate") @Transactional
-    public ApiResponse<RoutePolicy> activate(@PathVariable String id,Authentication authentication) {
-        approvals.requireApproved("ROUTE_POLICY",id,actor(authentication));
-        RoutePolicy value=require(id), before=require(id);
-        if (!"DRAFT".equals(value.getStatus())) throw new ResponseStatusException(HttpStatus.CONFLICT, "仅草稿路由可生效");
-        validate(new RouteRequest(value.getName(),value.getModelAlias(),value.getStrategy(),value.getFallbackEnabled(),value.getConfig()), true);
-        value.setStatus("ACTIVE"); mapper.updateById(value); audit("ROUTE_ACTIVATE", value, before); return ApiResponse.ok(value);
+    public ApiResponse<RoutePolicy> activate(@PathVariable String id, Authentication authentication) {
+        RoutePolicy value = require(id), before = require(id);
+        boolean admin = isPlatformAdmin(authentication);
+        if (!admin) approvals.requireApproved("ROUTE_POLICY", id, actor(authentication));
+        boolean activatable = admin
+                ? "DRAFT".equals(value.getStatus()) || "PENDING_APPROVAL".equals(value.getStatus())
+                : "PENDING_APPROVAL".equals(value.getStatus());
+        if (!activatable) {
+            throw OperationException.conflict(
+                    "ROUTE_STATUS_NOT_ACTIVATABLE",
+                    "路由策略 / 校验并生效",
+                    "路由“" + value.getName() + "”当前状态为 " + value.getStatus() + "，不能执行生效",
+                    "仅草稿或历史待审批路由可以生效；已生效路由无需重复操作，已退役路由请新建策略");
+        }
+        try {
+            ensureCandidateCapabilities(value, authentication);
+            validate(new RouteRequest(value.getName(), value.getModelAlias(), value.getStrategy(),
+                    value.getFallbackEnabled(), value.getConfig()), true);
+        } catch (ResponseStatusException exception) {
+            throw OperationException.conflict(
+                    "ROUTE_ACTIVATION_VALIDATION_FAILED",
+                    "路由策略 / 校验并生效",
+                    exception.getReason() == null ? "路由生效校验未通过" : exception.getReason(),
+                    "检查企业服务模型映射、候选部署的能力验证结果和生效价格版本，修正后再次点击“校验并生效”");
+        }
+        value.setStatus("ACTIVE");
+        mapper.updateById(value);
+        audit("ROUTE_ACTIVATE", value, before);
+        return ApiResponse.ok(value);
     }
-    @PostMapping("/{id}/submit") public ApiResponse<Map<String,Object>> submit(@PathVariable String id,Authentication authentication){require(id);return ApiResponse.ok(approvals.submit("ROUTE_POLICY",id,"路由策略生效审批",actor(authentication)));}
+    @PostMapping("/{id}/submit") @Transactional
+    public ApiResponse<Map<String,Object>> submit(@PathVariable String id, Authentication authentication) {
+        RoutePolicy value = require(id);
+        if (isPlatformAdmin(authentication)) {
+            throw OperationException.conflict(
+                    "ROUTE_APPROVAL_NOT_REQUIRED",
+                    "路由策略 / 提交审批",
+                    "平台管理员配置路由无需重复提交审批",
+                    "返回路由列表，直接点击“校验并生效”；系统仍会执行完整校验并写入审计日志");
+        }
+        if (!"DRAFT".equals(value.getStatus())) throw new ResponseStatusException(HttpStatus.CONFLICT, "仅草稿路由可提交审批");
+        Map<String,Object> approval = approvals.submit("ROUTE_POLICY", id, "路由策略生效审批", actor(authentication));
+        value.setStatus("PENDING_APPROVAL");
+        mapper.updateById(value);
+        return ApiResponse.ok(approval);
+    }
     @PostMapping("/{id}/retire") @Transactional
     public ApiResponse<RoutePolicy> retire(@PathVariable String id) {
         RoutePolicy value=require(id), before=require(id);
@@ -71,8 +120,29 @@ public class RoutePolicyController {
         throw new ResponseStatusException(HttpStatus.METHOD_NOT_ALLOWED, "路由策略禁止物理删除");
     }
 
+    private void ensureCandidateCapabilities(RoutePolicy route, Authentication authentication) {
+        Map<String,Object> config;
+        try {
+            config = json.readValue(route.getConfig(), new TypeReference<>() {});
+        } catch (Exception exception) {
+            throw OperationException.conflict(
+                    "ROUTE_CONFIG_INVALID",
+                    "路由策略 / 校验并生效 / 路由配置",
+                    "路由候选配置不是有效 JSON",
+                    "编辑路由策略并重新保存候选渠道、实际模型和价格版本");
+        }
+        Object raw = config.get("candidates");
+        if (!(raw instanceof List<?> candidates) || candidates.isEmpty()) return;
+        for (Object item : candidates) {
+            if (!(item instanceof Map<?,?> candidate)) continue;
+            String provider = String.valueOf(candidate.get("providerInstanceId"));
+            String model = String.valueOf(candidate.get("actualModel"));
+            capabilityProbes.ensureEligible(provider, model, authentication);
+        }
+    }
+
     private void validate(RouteRequest r, boolean activating) {
-        if (r==null || blank(r.name()) || blank(r.modelAlias()) || !r.modelAlias().matches("^[a-z0-9][a-z0-9._-]{0,159}$")) {
+        if (r==null || blank(r.name()) || blank(r.modelAlias()) || !r.modelAlias().matches("^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$")) {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "路由名称或服务模型别名无效");
         }
         if (!STRATEGIES.contains(r.strategy())) throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "路由策略仅支持 priority 或 weighted");
@@ -116,5 +186,10 @@ public class RoutePolicyController {
     private RoutePolicy require(String id){RoutePolicy v=mapper.selectById(id);if(v==null)throw new ResponseStatusException(HttpStatus.NOT_FOUND,"路由策略不存在");return v;}
     private void audit(String action,RoutePolicy after,RoutePolicy before){try{AuditLog log=new AuditLog();log.setId(UUID.randomUUID().toString().replace("-",""));log.setAction(action);log.setObjectType("RoutePolicy");log.setObjectId(after.getId());log.setBeforeValue(before==null?null:json.writeValueAsString(before));log.setAfterValue(json.writeValueAsString(after));audits.insert(log);}catch(Exception e){throw new IllegalStateException("关键操作审计写入失败",e);}}
     private static boolean blank(String value){return value==null||value.isBlank();}
+    private static boolean isPlatformAdmin(Authentication authentication) {
+        return authentication != null
+                && authentication.getPrincipal() instanceof JwtService.Identity identity
+                && identity.roles().contains("ADMIN");
+    }
     private static String actor(Authentication a){return a!=null&&a.getPrincipal() instanceof JwtService.Identity i?i.userId():"SYSTEM";}
 }

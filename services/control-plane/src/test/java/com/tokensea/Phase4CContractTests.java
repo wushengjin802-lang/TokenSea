@@ -2,6 +2,7 @@ package com.tokensea;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.tokensea.audit.service.AuditService;
+import com.tokensea.common.OperationException;
 import com.tokensea.governance.*;
 import org.junit.jupiter.api.Test;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -17,12 +18,16 @@ import static org.mockito.Mockito.*;
 
 class Phase4CContractTests {
     @Test void activeProbeRejectsClientSelectedUnsupportedCapability(){
-        CapabilityProbeController controller=new CapabilityProbeController(mock(JdbcTemplate.class),null,null,null,new ObjectMapper(),mock(AuditService.class));
-        assertThrows(ResponseStatusException.class,()->controller.probe("deployment",new CapabilityProbeController.ProbeRequest("CLIENT_ASSERTED"),null));
+        CapabilityProbeService service = new CapabilityProbeService(
+                mock(JdbcTemplate.class), null, null, null, new ObjectMapper(), mock(AuditService.class),
+                mock(ModelLifecycleService.class));
+        CapabilityProbeController controller = new CapabilityProbeController(service);
+        assertThrows(OperationException.class,()->controller.probe(
+                "deployment",new CapabilityProbeController.ProbeRequest("CLIENT_ASSERTED"),null));
     }
 
     @Test void budgetApprovalRejectionWritesRuleLifecycleState(){
-        JdbcTemplate jdbc=mock(JdbcTemplate.class);AuditService audits=mock(AuditService.class);GovernanceController controller=new GovernanceController(jdbc,new ObjectMapper(),audits,mock(GovernanceApprovalService.class));
+        JdbcTemplate jdbc=mock(JdbcTemplate.class);AuditService audits=mock(AuditService.class);GovernanceController controller=new GovernanceController(jdbc,new ObjectMapper(),audits,mock(GovernanceApprovalService.class),new PricingComponentService(new ObjectMapper()));
         when(jdbc.queryForList(startsWith("select * from approval_request"),eq("approval"))).thenReturn(List.of(new HashMap<>(Map.of("id","approval","status","PENDING","resource_type","BUDGET_RULE","resource_id","rule"))));
         when(jdbc.queryForMap(startsWith("select * from approval_request"),eq("approval"))).thenReturn(new HashMap<>(Map.of("id","approval","status","REJECTED")));
         controller.reject("approval",new GovernanceController.ApprovalDecisionRequest("额度依据不足"),null);
@@ -30,7 +35,7 @@ class Phase4CContractTests {
     }
 
     @Test void reconciliationRequiresCompleteBillClassificationInputs(){
-        GovernanceController controller=new GovernanceController(mock(JdbcTemplate.class),new ObjectMapper(),mock(AuditService.class),mock(GovernanceApprovalService.class));
+        GovernanceController controller=new GovernanceController(mock(JdbcTemplate.class),new ObjectMapper(),mock(AuditService.class),mock(GovernanceApprovalService.class),new PricingComponentService(new ObjectMapper()));
         var incomplete=new GovernanceController.ReconciliationRequest("provider",LocalDate.now(),LocalDate.now(),"CNY",BigDecimal.TEN,null,null,null,"bill",null);
         assertThrows(ResponseStatusException.class,()->controller.reconcile(incomplete));
     }

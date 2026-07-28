@@ -7,6 +7,7 @@ import java.math.BigDecimal;
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class PriceSourceParserTests {
     private final PriceSourceParser parser = new PriceSourceParser(new ObjectMapper().findAndRegisterModules());
@@ -34,8 +35,10 @@ class PriceSourceParserTests {
         var price = prices.get(0);
         assertThat(price.providerType()).isEqualTo("deepseek");
         assertThat(price.providerModelName()).isEqualTo("deepseek/deepseek-chat");
-        assertThat(price.inputAmountPer1k()).isEqualByComparingTo(new BigDecimal("0.00014000"));
-        assertThat(price.outputAmountPer1k()).isEqualByComparingTo(new BigDecimal("0.00028000"));
+        assertThat(price.billingBasis()).isEqualTo("TOKEN");
+        assertThat(price.billingQuantity()).isEqualTo(1_000_000L);
+        assertThat(price.inputUnitPrice()).isEqualByComparingTo(new BigDecimal("0.14"));
+        assertThat(price.outputUnitPrice()).isEqualByComparingTo(new BigDecimal("0.28"));
         assertThat(price.components()).containsKeys("INPUT_TOKEN", "OUTPUT_TOKEN", "CACHE_READ_TOKEN");
     }
 
@@ -59,8 +62,10 @@ class PriceSourceParserTests {
         assertThat(prices).hasSize(1);
         var price = prices.get(0);
         assertThat(price.providerModelName()).isEqualTo("model-a");
-        assertThat(price.inputAmountPer1k()).isEqualByComparingTo("0.00125");
-        assertThat(price.outputAmountPer1k()).isEqualByComparingTo("0.005");
+        assertThat(price.billingBasis()).isEqualTo("TOKEN");
+        assertThat(price.billingQuantity()).isEqualTo(1_000_000L);
+        assertThat(price.inputUnitPrice()).isEqualByComparingTo("1.25");
+        assertThat(price.outputUnitPrice()).isEqualByComparingTo("5");
     }
 
     @Test
@@ -79,10 +84,75 @@ class PriceSourceParserTests {
 
         assertThat(prices).hasSize(2);
         assertThat(prices.get(0).providerModelName()).isEqualTo("deepseek-v4-flash");
-        assertThat(prices.get(0).inputAmountPer1k()).isEqualByComparingTo("0.00014");
-        assertThat(prices.get(0).outputAmountPer1k()).isEqualByComparingTo("0.00028");
+        assertThat(prices.get(0).currency()).isEqualTo("USD");
+        assertThat(prices.get(0).region()).isEqualTo("global");
+        assertThat(prices.get(0).inputUnitPrice()).isEqualByComparingTo("0.14");
+        assertThat(prices.get(0).outputUnitPrice()).isEqualByComparingTo("0.28");
         assertThat(prices.get(0).components()).containsKey("CACHE_READ_TOKEN");
-        assertThat(prices.get(1).inputAmountPer1k()).isEqualByComparingTo("0.000435");
+        assertThat(prices.get(1).inputUnitPrice()).isEqualByComparingTo("0.435");
+    }
+
+    @Test
+    void parsesDeepSeekChineseOfficialPricingTableAsCny() {
+        String source = """
+            <html><body><table>
+              <tr><th>模型</th><th>deepseek-v4-flash(1)</th><th>deepseek-v4-pro</th></tr>
+              <tr><td rowspan="3">价格</td><td>百万 tokens 输入（缓存命中）</td><td>0.02元</td><td>0.025元</td></tr>
+              <tr><td>百万 tokens 输入（缓存未命中）</td><td>1元</td><td>3元</td></tr>
+              <tr><td>百万 tokens 输出</td><td>2元</td><td>6元</td></tr>
+            </table></body></html>
+            """;
+
+        var prices = parser.parse("DEEPSEEK_OFFICIAL_PAGE", source,
+                "https://api-docs.deepseek.com/zh-cn/quick_start/pricing/", "deepseek", "CNY", Map.of());
+
+        assertThat(prices).hasSize(2);
+        assertThat(prices.get(0).providerModelName()).isEqualTo("deepseek-v4-flash");
+        assertThat(prices.get(0).currency()).isEqualTo("CNY");
+        assertThat(prices.get(0).region()).isEqualTo("global");
+        assertThat(prices.get(0).inputUnitPrice()).isEqualByComparingTo("1");
+        assertThat(prices.get(0).outputUnitPrice()).isEqualByComparingTo("2");
+        assertThat(((Map<?,?>) prices.get(0).components().get("CACHE_READ_TOKEN")).get("unitPrice"))
+                .isEqualTo(new BigDecimal("0.02"));
+        assertThat(prices.get(1).inputUnitPrice()).isEqualByComparingTo("3");
+        assertThat(prices.get(1).outputUnitPrice()).isEqualByComparingTo("6");
+    }
+
+    @Test
+    void rejectsDeepSeekPageWhenDetectedCurrencyConflictsWithSourceConfiguration() {
+        String source = """
+            <html><body><table>
+              <tr><th>模型</th><th>deepseek-v4-flash</th></tr>
+              <tr><td>百万 tokens 输入（缓存命中）</td><td>0.02元</td></tr>
+              <tr><td>百万 tokens 输入（缓存未命中）</td><td>1元</td></tr>
+              <tr><td>百万 tokens 输出</td><td>2元</td></tr>
+            </table></body></html>
+            """;
+
+        assertThatThrownBy(() -> parser.parse("DEEPSEEK_OFFICIAL_PAGE", source,
+                "https://api-docs.deepseek.com/zh-cn/quick_start/pricing/", "deepseek", "USD", Map.of()))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("与价格源默认币种 USD 不一致");
+    }
+
+    @Test
+    void parsesDeepSeekChineseRenderedTextFallback() {
+        String source = """
+            <html><body>
+              模型 deepseek-v4-flash(1) deepseek-v4-pro BASE URL https://api.deepseek.com
+              价格 百万tokens输入（缓存命中） 0.02元 0.025元
+              百万tokens输入（缓存未命中） 1元 3元
+              百万tokens输出 2元 6元 并发限制 2500 500
+            </body></html>
+            """;
+
+        var prices = parser.parse("DEEPSEEK_OFFICIAL_PAGE", source,
+                "https://api-docs.deepseek.com/zh-cn/quick_start/pricing/", "deepseek", "CNY", Map.of());
+
+        assertThat(prices).hasSize(2);
+        assertThat(prices.get(0).currency()).isEqualTo("CNY");
+        assertThat(prices.get(0).inputUnitPrice()).isEqualByComparingTo("1");
+        assertThat(prices.get(1).outputUnitPrice()).isEqualByComparingTo("6");
     }
 
     @Test
@@ -106,7 +176,7 @@ class PriceSourceParserTests {
 
         assertThat(prices).hasSize(1);
         assertThat(prices.get(0).providerType()).isEqualTo("openai");
-        assertThat(prices.get(0).inputAmountPer1k()).isEqualByComparingTo("0.0025");
+        assertThat(prices.get(0).inputUnitPrice()).isEqualByComparingTo("2.5");
         assertThat(prices.get(0).components()).containsKey("CACHE_READ_TOKEN");
     }
 }
