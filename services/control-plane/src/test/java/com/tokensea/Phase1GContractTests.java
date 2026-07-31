@@ -110,7 +110,7 @@ class Phase1GContractTests {
     }
 
     @Test
-    void routeCandidateAcceptsApprovedDeploymentWithEffectiveOfficialPrice() {
+    void routeCandidateAcceptsApprovedDeploymentWithoutManualPriceVersion() {
         JdbcTemplate jdbc = mock(JdbcTemplate.class);
         EffectiveCostPriceResolver effectivePrices = mock(EffectiveCostPriceResolver.class);
         RouteCandidateValidator validator = new RouteCandidateValidator(
@@ -123,17 +123,7 @@ class Phase1GContractTests {
         route.setConfig("{\"candidates\":[{\"providerInstanceId\":\"pi-1\",\"actualModel\":\"model-a\"}]}");
         when(jdbc.queryForList(anyString(), eq("pi-1"), eq("model-a")))
                 .thenReturn(List.of(Map.of("id", "deployment-1", "region", "cn")));
-        when(effectivePrices.resolve(eq("deployment-1"), any(OffsetDateTime.class), eq("cn"),
-                eq("STANDARD"), eq("DEFAULT"), eq("DEFAULT")))
-                .thenReturn(new EffectiveCostPriceResolver.ResolvedPrice(
-                        "price-1", "deployment-1", "PROVIDER_OFFICIAL", "USD", "TOKEN", 1_000_000L,
-                        1, 0, "EXPLICIT_ZERO", null, "NOT_APPLICABLE", 2, List.of(),
-                        "cn", "STANDARD", "DEFAULT", "DEFAULT",
-                        "https://official.example/pricing", "evidence", "使用供应商官方价", Map.of()));
-
         assertDoesNotThrow(() -> validator.validate(model, route, true));
-        verify(effectivePrices).resolve(eq("deployment-1"), any(OffsetDateTime.class), eq("cn"),
-                eq("STANDARD"), eq("DEFAULT"), eq("DEFAULT"));
     }
 
     @Test

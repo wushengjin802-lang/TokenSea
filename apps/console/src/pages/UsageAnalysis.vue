@@ -199,6 +199,7 @@
                 preserveAspectRatio="none"
                 role="img"
                 aria-label="用量趋势图"
+                @mouseleave="trendTooltip = undefined"
               >
                 <defs>
                   <linearGradient id="requestArea" x1="0" y1="0" x2="0" y2="1">
@@ -239,12 +240,32 @@
                   :points="linePoints(dashboard.trend, 'cost')"
                   class="series cost"
                 />
+                <rect
+                  v-for="hit in trendHitBoxes"
+                  :key="`trend-hit-${hit.index}`"
+                  class="chart-hit-area"
+                  :x="hit.x"
+                  y="18"
+                  :width="hit.width"
+                  height="202"
+                  @mouseenter="showTrendTooltip(hit.index)"
+                />
                 <g v-for="(label, index) in trendLabels" :key="label.date">
                   <text :x="label.x" y="242" class="axis-label">
                     {{ shortDate(label.date) }}
                   </text>
                 </g>
               </svg>
+              <div
+                v-if="trendTooltip"
+                :class="['chart-tooltip', { 'align-right': trendTooltip.index > Math.floor((dashboard.trend.length - 1) / 2) }]"
+                :style="{ left: `${trendTooltip.left}%` }"
+              >
+                <strong>{{ trendTooltip.row.date }}</strong>
+                <span>请求 <b>{{ number(trendTooltip.row.requests) }}</b></span>
+                <span>Token <b>{{ number(trendTooltip.row.tokens) }}</b></span>
+                <span>成本 <b>{{ money(trendTooltip.row.cost) }} {{ summary.currency || 'CNY' }}</b></span>
+              </div>
             </div>
             <div v-else class="chart-empty">当前筛选条件没有趋势数据</div>
           </article>
@@ -471,6 +492,7 @@
                 class="app-chart"
                 viewBox="0 0 540 190"
                 preserveAspectRatio="none"
+                @mouseleave="appTooltip = undefined"
               >
                 <defs>
                   <linearGradient id="appArea" x1="0" y1="0" x2="0" y2="1">
@@ -509,6 +531,16 @@
                     :style="{ fill: series.color }"
                   />
                 </template>
+                <rect
+                  v-for="hit in appTrendHitBoxes"
+                  :key="`app-trend-hit-${hit.index}`"
+                  class="chart-hit-area"
+                  :x="hit.x"
+                  y="16"
+                  :width="hit.width"
+                  height="148"
+                  @mouseenter="showAppTooltip(hit.index)"
+                />
                 <text
                   v-for="label in appTrendLabels"
                   :key="label.date"
@@ -519,6 +551,16 @@
                   {{ shortDate(label.date) }}
                 </text>
               </svg>
+              <div
+                v-if="appTooltip"
+                :class="['chart-tooltip', 'app-chart-tooltip', { 'align-right': appTooltip.index > Math.floor(appTrendDates.length / 2) }]"
+                :style="{ left: `${appTooltip.left}%` }"
+              >
+                <strong>{{ appTooltip.date }}</strong>
+                <span v-for="item in appTooltip.metrics" :key="item.name">
+                  <i :style="{ background: item.color }"></i>{{ item.name }} <b>{{ number(item.value) }} 请求</b>
+                </span>
+              </div>
             </div>
             <div v-else class="chart-empty">暂无应用趋势数据</div>
           </article>
@@ -878,6 +920,17 @@ const dashboard = reactive<any>({
 });
 const dashboardLoading = ref(false),
   dashboardError = ref("");
+const trendTooltip = ref<{
+  index: number;
+  left: number;
+  row: Record<string, any>;
+}>();
+const appTooltip = ref<{
+  index: number;
+  left: number;
+  date: string;
+  metrics: Array<{ name: string; color: string; value: number }>;
+}>();
 const detailRows = ref<Row[]>([]),
   detailTotal = ref(0),
   detailPage = ref(1),
@@ -1117,6 +1170,15 @@ const trendLabels = computed(() => {
     x: 48 + (656 * index) / Math.max(rows.length - 1, 1),
   }));
 });
+const trendHitBoxes = computed(() => {
+  const rows = dashboard.trend || [];
+  const width = 656 / Math.max(rows.length, 1);
+  return rows.map((_: any, index: number) => ({
+    index,
+    x: 48 + index * width,
+    width,
+  }));
+});
 const appSeries = computed(() => {
   const rows = dashboard.appTrend || [];
   const dates = [...new Set(rows.map((item: any) => item.date))] as string[];
@@ -1145,14 +1207,25 @@ const appSeries = computed(() => {
       points,
       dots,
       area,
+      values,
       total: values.reduce((sum, value) => sum + value, 0),
     };
   });
 });
+const appTrendDates = computed(
+  () => [...new Set((dashboard.appTrend || []).map((item: any) => item.date))] as string[],
+);
+const appTrendHitBoxes = computed(() => {
+  const dates = appTrendDates.value;
+  const width = 502 / Math.max(dates.length, 1);
+  return dates.map((_: string, index: number) => ({
+    index,
+    x: 24 + index * width,
+    width,
+  }));
+});
 const appTrendLabels = computed(() => {
-  const dates = [
-    ...new Set((dashboard.appTrend || []).map((item: any) => item.date)),
-  ] as string[];
+  const dates = appTrendDates.value;
   if (!dates.length) return [];
   const indexes = [0, Math.floor((dates.length - 1) / 2), dates.length - 1];
   return [...new Set(indexes)].map((index) => ({
@@ -1346,6 +1419,29 @@ function linePoints(rows: any[], key: string) {
 function areaPoints(rows: any[], key: string) {
   const line = linePoints(rows, key);
   return line ? `48,215 ${line} 704,215` : "";
+}
+function showTrendTooltip(index: number) {
+  const row = dashboard.trend?.[index];
+  if (!row) return;
+  trendTooltip.value = {
+    index,
+    row,
+    left: ((48 + (656 * index) / Math.max(dashboard.trend.length - 1, 1)) / 720) * 100,
+  };
+}
+function showAppTooltip(index: number) {
+  const date = appTrendDates.value[index];
+  if (!date) return;
+  appTooltip.value = {
+    index,
+    date,
+    left: ((24 + (502 * index) / Math.max(appTrendDates.value.length - 1, 1)) / 540) * 100,
+    metrics: appSeries.value.map((series: any) => ({
+      name: series.name,
+      color: series.color,
+      value: Number(series.values[index] || 0),
+    })),
+  };
 }
 function barWidth(value: any, rows: any[], key: string) {
   const max = Math.max(
@@ -1811,6 +1907,44 @@ onMounted(async () => {
   height: 100%;
   overflow: visible;
 }
+.chart-hit-area {
+  fill: transparent;
+  cursor: crosshair;
+}
+.chart-tooltip {
+  position: absolute;
+  z-index: 2;
+  top: 10px;
+  display: grid;
+  min-width: 144px;
+  gap: 4px;
+  padding: 8px 10px;
+  border: 1px solid #d6e2f3;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.96);
+  box-shadow: 0 8px 20px rgba(25, 54, 97, 0.16);
+  color: #64748b;
+  font-size: 10px;
+  pointer-events: none;
+  transform: translateX(8px);
+}
+.chart-tooltip.align-right {
+  transform: translateX(calc(-100% - 8px));
+}
+.chart-tooltip strong {
+  color: #223654;
+  font-size: 11px;
+}
+.chart-tooltip span {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  white-space: nowrap;
+}
+.chart-tooltip b {
+  color: #314763;
+  font-weight: 650;
+}
 .grid-lines line {
   stroke: #e7edf6;
   stroke-width: 1;
@@ -1924,10 +2058,15 @@ onMounted(async () => {
   display: flex;
   min-width: 0;
   height: 100%;
+  min-height: 0;
   flex-direction: column;
   justify-content: flex-start;
   gap: 4px;
-  overflow: hidden;
+  padding-right: 4px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
 }
 .provider-legend-row {
   display: grid;
@@ -2008,11 +2147,14 @@ onMounted(async () => {
   display: flex;
   height: calc(100% - 44px);
   min-height: 0;
-  overflow: hidden;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
   flex-direction: column;
   justify-content: flex-start;
   gap: 5px;
-  padding-top: 1px;
+  padding: 1px 4px 0 0;
 }
 .horizontal-row {
   display: grid;
@@ -2099,11 +2241,14 @@ onMounted(async () => {
   display: flex;
   height: calc(100% - 44px);
   min-height: 0;
-  overflow: hidden;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
   flex-direction: column;
   justify-content: flex-start;
   gap: 5px;
-  padding-top: 1px;
+  padding: 1px 4px 0 0;
 }
 .tenant-row {
   display: grid;
@@ -2179,11 +2324,14 @@ onMounted(async () => {
   display: flex;
   height: calc(100% - 44px);
   min-height: 0;
-  overflow: hidden;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
   flex-direction: column;
   justify-content: flex-start;
   gap: 5px;
-  padding-top: 1px;
+  padding: 1px 4px 0 0;
 }
 .project-row {
   display: grid;
@@ -2259,6 +2407,7 @@ onMounted(async () => {
   background: linear-gradient(90deg, #93c5fd, #2563eb);
 }
 .app-chart-shell {
+  position: relative;
   height: calc(100% - 44px);
   min-height: 0;
 }
@@ -2304,6 +2453,19 @@ onMounted(async () => {
   width: 100%;
   height: calc(100% - 31px);
 }
+.app-chart-tooltip {
+  top: 30px;
+  min-width: 156px;
+}
+.app-chart-tooltip span {
+  align-items: center;
+}
+.app-chart-tooltip i {
+  width: 6px;
+  height: 6px;
+  margin-right: 5px;
+  border-radius: 50%;
+}
 .app-series {
   fill: none;
   stroke-width: 2.25;
@@ -2321,7 +2483,10 @@ onMounted(async () => {
   display: flex;
   height: calc(100% - 44px);
   min-height: 0;
-  overflow: hidden;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
   flex-direction: column;
   border: 1px solid #e6edf6;
   border-radius: 9px;
@@ -2336,6 +2501,10 @@ onMounted(async () => {
   align-items: center;
 }
 .ranking-head {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  flex: 0 0 auto;
   padding: 6px 8px;
   border-bottom: 1px solid #e6edf6;
   background: linear-gradient(180deg, #f8fbff, #f3f7fc);
@@ -2345,6 +2514,7 @@ onMounted(async () => {
 }
 .ranking-row {
   min-height: 28px;
+  flex: 0 0 auto;
   padding: 0 8px;
   border-bottom: 1px solid #eef2f7;
   color: #536178;
@@ -2380,6 +2550,36 @@ onMounted(async () => {
   background: linear-gradient(135deg, #e9f2ff, #dce9ff);
   color: #2563eb;
   font-weight: 800;
+}
+.donut-legend,
+.horizontal-bars,
+.tenant-ranking,
+.project-bars,
+.ranking-table {
+  scrollbar-width: thin;
+  scrollbar-color: #c7d4e5 transparent;
+}
+.donut-legend::-webkit-scrollbar,
+.horizontal-bars::-webkit-scrollbar,
+.tenant-ranking::-webkit-scrollbar,
+.project-bars::-webkit-scrollbar,
+.ranking-table::-webkit-scrollbar {
+  width: 6px;
+}
+.donut-legend::-webkit-scrollbar-thumb,
+.horizontal-bars::-webkit-scrollbar-thumb,
+.tenant-ranking::-webkit-scrollbar-thumb,
+.project-bars::-webkit-scrollbar-thumb,
+.ranking-table::-webkit-scrollbar-thumb {
+  border-radius: 999px;
+  background: #c7d4e5;
+}
+.donut-legend::-webkit-scrollbar-track,
+.horizontal-bars::-webkit-scrollbar-track,
+.tenant-ranking::-webkit-scrollbar-track,
+.project-bars::-webkit-scrollbar-track,
+.ranking-table::-webkit-scrollbar-track {
+  background: transparent;
 }
 .text-action {
   border: 0;

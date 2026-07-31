@@ -313,59 +313,71 @@
         layout="vertical"
         :class="['compact-modal-form', { 'form-compact': compactForm }]"
       >
-        <a-form-item
-          v-for="field in formFields"
-          :key="field"
-          :class="{ 'form-item-wide': fieldType(field) === 'json' }"
-          :label="label(field)"
-          :required="required(field)"
-        >
-          <a-select
-            v-if="isSelectField(field)"
-            v-model:value="form[field]"
-            :options="options(field)"
-            :mode="selectMode(field)"
-            :loading="optionLoading[field]"
-            :disabled="fieldDisabled(field)"
-            show-search
-            option-filter-prop="label"
-            allow-clear
-            :placeholder="`请选择${label(field)}`"
-            @change="onFieldChange(field)"
-            @dropdown-visible-change="onDropdown(field, $event)"
-          />
-          <a-input-number
-            v-else-if="numberFields?.includes(field)"
-            v-model:value="form[field]"
-            :min="0"
-            :disabled="fieldDisabled(field)"
-            style="width: 100%"
-          />
-          <a-input
-            v-else-if="fieldType(field) === 'datetime'"
-            v-model:value="form[field]"
-            :disabled="fieldDisabled(field)"
-            type="datetime-local"
-          />
-          <a-input
-            v-else-if="fieldType(field) === 'date'"
-            v-model:value="form[field]"
-            :disabled="fieldDisabled(field)"
-            type="date"
-          />
-          <a-textarea
-            v-else-if="['textarea', 'json'].includes(fieldType(field))"
-            v-model:value="form[field]"
-            :disabled="fieldDisabled(field)"
-            :rows="compactForm ? 3 : 4"
-          />
-          <a-input
+        <template v-for="field in formDisplayFields" :key="field">
+          <div
+            v-if="field === ADVANCED_FORM_TOGGLE"
+            class="advanced-form-toggle form-item-wide"
+          >
+            <a-button type="link" @click="advancedFormExpanded = !advancedFormExpanded">
+              {{ advancedFormExpanded ? `收起${advancedFormLabel}` : `展开${advancedFormLabel}（${visibleAdvancedFormFields.length}项）` }}
+            </a-button>
+            <span>系统已根据采集方式和供应商填充安全默认值，特殊场景再展开调整。</span>
+          </div>
+          <a-form-item
             v-else
-            v-model:value="form[field]"
-            :disabled="fieldDisabled(field)"
-            :placeholder="fieldPlaceholder(field)"
-          />
-        </a-form-item>
+            :class="{ 'form-item-wide': fieldType(field) === 'json' }"
+            :label="label(field)"
+            :required="required(field)"
+          >
+            <a-select
+              v-if="isSelectField(field)"
+              v-model:value="form[field]"
+              :options="options(field)"
+              :mode="selectMode(field)"
+              :loading="optionLoading[field]"
+              :disabled="fieldDisabled(field)"
+              show-search
+              option-filter-prop="label"
+              allow-clear
+              :placeholder="`请选择${label(field)}`"
+              @change="onFieldChange(field)"
+              @dropdown-visible-change="onDropdown(field, $event)"
+            />
+            <a-input-number
+              v-else-if="numberFields?.includes(field)"
+              v-model:value="form[field]"
+              :min="0"
+              :disabled="fieldDisabled(field)"
+              style="width: 100%"
+            />
+            <a-input
+              v-else-if="fieldType(field) === 'datetime'"
+              v-model:value="form[field]"
+              :disabled="fieldDisabled(field)"
+              type="datetime-local"
+            />
+            <a-input
+              v-else-if="fieldType(field) === 'date'"
+              v-model:value="form[field]"
+              :disabled="fieldDisabled(field)"
+              type="date"
+            />
+            <a-textarea
+              v-else-if="['textarea', 'json'].includes(fieldType(field))"
+              v-model:value="form[field]"
+              :disabled="fieldDisabled(field)"
+              :rows="compactForm ? 3 : 4"
+            />
+            <a-input
+              v-else
+              v-model:value="form[field]"
+              :disabled="fieldDisabled(field)"
+              :placeholder="fieldPlaceholder(field)"
+              @input="onFieldInput(field, $event)"
+              @blur="onFieldBlur(field)"
+            />
+          </a-form-item>
+        </template>
       </a-form>
     </a-modal>
 
@@ -501,6 +513,101 @@
       <template v-if="snapshotData"><h3>快照正文</h3><pre class="secret-value">{{ display(snapshotData.rawPayload) }}</pre><h3>字段来源</h3><pre class="secret-value">{{ display(snapshotData.fieldSources) }}</pre></template>
     </a-modal>
     <a-modal
+      v-model:open="routeConfigVisible"
+      :title="`配置路由 · ${routeConfigRow?.displayName || routeConfigRow?.platformModelName || ''}`"
+      width="980px"
+      :footer="null"
+    >
+      <div class="route-workflow-steps" aria-label="企业服务模型配置进度">
+        <span class="done">1 基本信息</span><i></i>
+        <span class="done">2 部署模型</span><i></i>
+        <span class="current">3 路由配置</span><i></i>
+        <span>4 发布检查</span>
+      </div>
+      <div v-if="routeConfigLoading" class="state-panel compact-state">
+        <span class="loading-mark"></span><strong>正在生成并读取路由草稿</strong>
+      </div>
+      <template v-else>
+        <div v-if="routeConfigError" class="inline-alert danger" role="alert">
+          {{ routeConfigError }}
+        </div>
+        <div class="inline-alert info route-config-tip">
+          系统已根据企业服务模型选择的渠道和已审核部署模型生成默认候选。确认顺序、权重和故障切换后，可直接保存并生效，无需前往独立路由页面重复选择服务模型。
+        </div>
+        <div v-if="routeUnavailableChannelNames.length" class="inline-alert info route-config-tip">
+          {{ routeUnavailableChannelNames.join("、") }} 暂无已批准且可路由的已选模型，不能作为候选链路；请先在“模型部署”恢复其生产准入后再配置。
+        </div>
+        <a-form layout="vertical" class="route-config-form">
+          <a-form-item label="企业服务模型">
+            <a-input :value="routeConfigRow?.platformModelName" disabled />
+          </a-form-item>
+          <a-form-item label="路由名称" required>
+            <a-input v-model:value="routeForm.name" />
+          </a-form-item>
+          <a-form-item label="策略类型" required>
+            <a-select v-model:value="routeForm.strategy" :options="routeStrategyOptions" />
+          </a-form-item>
+          <a-form-item label="故障切换" required>
+            <a-select v-model:value="routeForm.fallbackEnabled" :options="booleanOptions" />
+          </a-form-item>
+        </a-form>
+        <section class="route-candidate-editor">
+          <div class="route-candidate-heading">
+            <div>
+              <strong>候选链路</strong>
+              <span>候选只能从当前服务模型已选择的渠道与部署模型中配置。</span>
+            </div>
+            <button class="btn" type="button" @click="addRouteCandidate">添加候选</button>
+          </div>
+          <article
+            v-for="(candidate, index) in routeForm.candidates"
+            :key="candidate.localId"
+            class="route-candidate-row"
+          >
+            <span class="route-candidate-index">{{ String(index + 1).padStart(2, "0") }}</span>
+            <div>
+              <label>供应商渠道</label>
+              <a-select
+                v-model:value="candidate.providerInstanceId"
+                :options="availableRouteChannels(candidate)"
+                show-search
+                option-filter-prop="label"
+                placeholder="选择渠道"
+                @change="candidate.actualModel = undefined"
+              />
+            </div>
+            <div>
+              <label>实际模型</label>
+              <a-select
+                v-model:value="candidate.actualModel"
+                :options="availableRouteDeployments(candidate)"
+                show-search
+                option-filter-prop="label"
+                placeholder="选择已审核模型"
+              />
+            </div>
+            <div>
+              <label>{{ routeForm.strategy === "weighted" ? "权重" : "优先级" }}</label>
+              <a-input-number v-model:value="candidate.rank" :min="1" :max="10000" style="width:100%" />
+            </div>
+            <button class="icon-button" type="button" aria-label="删除候选" @click="removeRouteCandidate(index)">×</button>
+          </article>
+          <div v-if="!routeForm.candidates.length" class="state-panel compact-state empty-state">
+            至少需要一个候选链路
+          </div>
+        </section>
+        <div class="route-config-footer">
+          <button class="btn" type="button" @click="routeConfigVisible = false">取消</button>
+          <button class="btn" type="button" :disabled="routeConfigSaving || routeConfigActivating" @click="saveRouteConfiguration(false)">
+            {{ routeConfigSaving ? "保存中" : "保存草稿" }}
+          </button>
+          <button class="btn primary" type="button" :disabled="routeConfigSaving || routeConfigActivating" @click="saveRouteConfiguration(true)">
+            {{ routeConfigActivating ? "校验并生效中" : "保存并生效" }}
+          </button>
+        </div>
+      </template>
+    </a-modal>
+    <a-modal
       v-model:open="actionFormVisible"
       :title="actionName"
       :confirm-loading="actionSaving"
@@ -549,7 +656,7 @@ import {
   update,
 } from "../api/client";
 import { message } from "ant-design-vue";
-type Option = { label: string; value: any };
+type Option = { label: string; value: any; disabled?: boolean };
 type Source = {
   path: string;
   label: string;
@@ -589,6 +696,15 @@ type ActionPrecondition = {
   equals: unknown;
   message: string;
 };
+type RouteCandidateDraft = {
+  localId: string;
+  providerInstanceId?: string;
+  actualModel?: string;
+  rank: number;
+};
+type RouteDeploymentOption = Option & {
+  providerInstanceId?: string;
+};
 const props = withDefaults(defineProps<{
   title: string;
   desc?: string;
@@ -614,6 +730,8 @@ const props = withDefaults(defineProps<{
   immutableFields?: string[];
   detailFields?: string[];
   compactForm?: boolean;
+  advancedFormFields?: string[];
+  advancedFormLabel?: string;
   internalScroll?: boolean;
   updateKey?: string;
   allowDelete?: boolean;
@@ -661,6 +779,7 @@ const props = withDefaults(defineProps<{
   hideTopTotal: true,
   showCellTooltip: true,
 });
+const ADVANCED_FORM_TOGGLE = "__advanced_form_toggle__";
 const uid = Math.random().toString(36).slice(2);
 const rows = ref<any[]>([]),
   total = ref(0),
@@ -674,6 +793,10 @@ const rows = ref<any[]>([]),
   order = ref<"asc" | "desc">(props.defaultOrder || "asc"),
   selected = ref<any>(null);
 const formVisible = ref(false),
+  advancedFormExpanded = ref(false),
+  endpointHostAutofilled = ref(""),
+  recommendedNameAutofilled = ref(""),
+  nameManuallyEdited = ref(false),
   editing = ref<any>(null),
   saving = ref(false),
   formError = ref(""),
@@ -702,6 +825,31 @@ const actionFormVisible = ref(false),
   actionError = ref(""),
   actionSaving = ref(false),
   actionLoading = ref<Record<string, true>>({});
+const routeConfigVisible = ref(false),
+  routeConfigLoading = ref(false),
+  routeConfigSaving = ref(false),
+  routeConfigActivating = ref(false),
+  routeConfigError = ref(""),
+  routeConfigRow = ref<any>(),
+  routeDraft = ref<any>(),
+  routeChannelOptions = ref<Option[]>([]),
+  routeDeployments = ref<RouteDeploymentOption[]>([]),
+  routeUnavailableChannelNames = ref<string[]>([]),
+  routeAllowedPairs = ref<Array<{ providerInstanceId: string; actualModel: string }>>([]);
+const routeForm = reactive<{
+  name: string;
+  strategy: string;
+  fallbackEnabled: boolean;
+  candidates: RouteCandidateDraft[];
+}>({ name: "", strategy: "priority", fallbackEnabled: true, candidates: [] });
+const routeStrategyOptions = [
+  { label: "优先级", value: "priority" },
+  { label: "加权", value: "weighted" },
+];
+const booleanOptions = [
+  { label: "启用", value: true },
+  { label: "停用", value: false },
+];
 const currentActionForm = computed(() => props.actionForms?.[actionName.value]);
 const tabs = computed(() => props.tabs || []),
   activeTab = ref(props.defaultTab || props.tabs?.[0]?.key || "data"),
@@ -751,7 +899,24 @@ const canCreate = computed(
           "keyStatus",
         ].includes(field) && fieldConditionMatches(props.fieldVisibility?.[field]),
     ),
-  );
+  ),
+  visibleAdvancedFormFields = computed(() => {
+    const advanced = new Set(props.advancedFormFields || []);
+    return formFields.value.filter((field) => advanced.has(field));
+  }),
+  primaryFormFields = computed(() => {
+    const advanced = new Set(visibleAdvancedFormFields.value);
+    return formFields.value.filter((field) => !advanced.has(field));
+  }),
+  advancedFormLabel = computed(() => props.advancedFormLabel || "高级配置"),
+  formDisplayFields = computed(() => {
+    if (!visibleAdvancedFormFields.value.length) return formFields.value;
+    return [
+      ...primaryFormFields.value,
+      ADVANCED_FORM_TOGGLE,
+      ...(advancedFormExpanded.value ? visibleAdvancedFormFields.value : []),
+    ];
+  });
 const statePath = computed(() => props.statePath),
   stateLabel = computed(() => props.stateLabel),
   relatedFields = computed(() => props.relatedFields || []),
@@ -1180,6 +1345,11 @@ function availableActions(row: any) {
       return true;
     });
   }
+  if (activePath.value === "/api/provider-price-unmapped-records") {
+    return actions.value.filter((action) =>
+      action !== "忽略" || String(cellValue(row, "status") || "") === "OPEN",
+    );
+  }
   if (activePath.value === "/api/provider-price-diffs") {
     const diffStatus = String(cellValue(row, "status") || "");
     return actions.value.filter((action) => {
@@ -1233,6 +1403,7 @@ function statusClass(value: any) {
       "SUCCESS",
       "HEALTHY",
       "MATCHED_OFFICIAL",
+      "MATCHED_REFERENCE",
       "APPROVED",
       "启用",
       "生效",
@@ -1326,7 +1497,14 @@ function applySourceAutofill(field: string) {
     ? undefined
     : optionRows[field]?.[String(selected)];
   for (const [targetField, sourceField] of Object.entries(config.autofill)) {
-    form[targetField] = row ? cellValue(row, sourceField) : undefined;
+    const value = row ? cellValue(row, sourceField) : undefined;
+    if (targetField === "name") {
+      if (editing.value || nameManuallyEdited.value) continue;
+      recommendedNameAutofilled.value = String(value || "");
+    }
+    form[targetField] = fieldType(targetField) === "json" ? jsonFormValue(value) : value;
+    if (targetField === "officialHosts") endpointHostAutofilled.value = String(value || "");
+    applyFieldPreset(targetField);
   }
 }
 function applyFieldPreset(field: string) {
@@ -1339,6 +1517,7 @@ function applyFieldPreset(field: string) {
 function onFieldChange(field: string) {
   applySourceAutofill(field);
   applyFieldPreset(field);
+  syncGenericDocumentLlmConfig();
   const directDependents = Object.entries(props.optionSources || {})
     .filter(([, config]) => config.dependsOn === field)
     .map(([dependent]) => dependent);
@@ -1350,6 +1529,45 @@ function onFieldChange(field: string) {
     }
   }
   directDependents.forEach(loadFieldOptions);
+}
+function onFieldInput(field: string, event: any) {
+  if (field === "name") {
+    const value = event?.target?.value ?? event ?? form.name;
+    nameManuallyEdited.value = String(value || "") !== recommendedNameAutofilled.value;
+  }
+}
+function readJsonConfig(): Record<string, any> | null {
+  const value = form.config;
+  if (value && typeof value === "object" && !Array.isArray(value)) return { ...value };
+  if (typeof value !== "string" || !value.trim()) return {};
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+function syncGenericDocumentLlmConfig() {
+  if (activePath.value !== "/api/provider-price-sources" || form.adapterCode !== "GENERIC_DOCUMENT") return;
+  const config = readJsonConfig();
+  if (!config) return;
+  config.llmEnabled = form.extractionMode === "DETERMINISTIC_LLM";
+  form.config = jsonFormValue(config);
+}
+function onFieldBlur(field: string) {
+  if (field !== "endpoint") return;
+  const endpoint = String(form.endpoint || "").trim();
+  if (!endpoint) return;
+  try {
+    const host = new URL(endpoint).hostname.toLowerCase();
+    const current = String(form.officialHosts || "").trim();
+    if (host && (!current || current === endpointHostAutofilled.value)) {
+      form.officialHosts = host;
+      endpointHostAutofilled.value = host;
+    }
+  } catch {
+    // 后端仍会执行完整的 URL 与出口域名校验。
+  }
 }
 async function loadFieldOptions(field: string) {
   const config = source(field);
@@ -1404,6 +1622,10 @@ async function loadOptions() {
 }
 async function openCreate() {
   editing.value = null;
+  advancedFormExpanded.value = false;
+  endpointHostAutofilled.value = "";
+  recommendedNameAutofilled.value = "";
+  nameManuallyEdited.value = false;
   formError.value = "";
   formFields.value.forEach((field) => {
     const value = props.defaultFormValues?.[field] ??
@@ -1415,6 +1637,10 @@ async function openCreate() {
 }
 async function openEdit(row: any) {
   editing.value = row;
+  advancedFormExpanded.value = false;
+  endpointHostAutofilled.value = "";
+  recommendedNameAutofilled.value = "";
+  nameManuallyEdited.value = true;
   formError.value = "";
   formFields.value.forEach((field) => {
     const value = cellValue(row, field);
@@ -1444,6 +1670,7 @@ async function openEdit(row: any) {
   await loadOptions();
 }
 async function save() {
+  syncGenericDocumentLlmConfig();
   const missing = requiredFields.value.filter(
     (field) =>
       form[field] === undefined ||
@@ -1545,6 +1772,7 @@ async function save() {
       )
         payload[field] = JSON.stringify(payload[field] || []);
     });
+    const creatingPlatformModel = !editing.value && activePath.value === "/api/platform-models";
     const saved = editing.value
       ? await update(
         activePath.value,
@@ -1574,8 +1802,9 @@ async function save() {
       }
     }
     formVisible.value = false;
-    message.success("保存成功");
+    message.success(creatingPlatformModel ? "草稿已保存，继续配置路由" : "保存成功");
     await load();
+    if (creatingPlatformModel && saved?.id) await openRouteConfiguration(saved);
   } catch (e) {
     formError.value = errorMessage(e);
   } finally {
@@ -1600,6 +1829,187 @@ async function openDetail(row: any) {
     }
   }
 }
+function parseStringList(value: any): string[] {
+  if (Array.isArray(value)) return value.map((item) => String(item)).filter(Boolean);
+  if (typeof value !== "string" || !value.trim()) return [];
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed.map((item) => String(item)).filter(Boolean) : [];
+  } catch {
+    return [];
+  }
+}
+function routePairs(row: any, deployments: any[]) {
+  const providers = new Set(parseStringList(row?.providerInstanceIds));
+  const models = parseStringList(row?.actualModels);
+  return models.flatMap((actualModel) => {
+    const matches = deployments.filter((deployment) =>
+      providers.has(String(deployment.providerInstanceId))
+      && String(deployment.providerModelName || "").toLowerCase() === actualModel.toLowerCase(),
+    );
+    return matches.length === 1
+      ? [{ providerInstanceId: String(matches[0].providerInstanceId), actualModel }]
+      : [];
+  });
+}
+function routeConfigCandidates(value: any): RouteCandidateDraft[] {
+  try {
+    const config = typeof value === "string" ? JSON.parse(value) : value || {};
+    return Array.isArray(config.candidates)
+      ? config.candidates.map((item: any, index: number) => ({
+          localId: crypto.randomUUID(),
+          providerInstanceId: item.providerInstanceId,
+          actualModel: item.actualModel,
+          rank: Number(item.priority ?? item.weight ?? index + 1),
+        }))
+      : [];
+  } catch {
+    return [];
+  }
+}
+async function loadRouteConfigurationOptions(row: any) {
+  const [channels, deployments] = await Promise.all([
+    queryPage<any>("/api/provider-instances", { size: 500 }),
+    queryPage<any>("/api/channel-model-deployments", { size: 500, productionStatus: "APPROVED" }),
+  ]);
+  const selectedProviders = new Set(parseStringList(row?.providerInstanceIds));
+  const approvedDeployments = deployments.items.filter((item) => selectedProviders.has(String(item.providerInstanceId)));
+  routeAllowedPairs.value = routePairs(row, approvedDeployments);
+  const allowedProviders = new Set(routeAllowedPairs.value.map((item) => item.providerInstanceId));
+  routeChannelOptions.value = channels.items
+    .filter((item) => selectedProviders.has(String(item.id)))
+    .map((item) => ({
+      label: item.instanceName || item.name || item.id,
+      value: item.id,
+      disabled: !allowedProviders.has(String(item.id)),
+    }));
+  routeUnavailableChannelNames.value = routeChannelOptions.value
+    .filter((item) => item.disabled)
+    .map((item) => String(item.label));
+  routeDeployments.value = approvedDeployments.map((item) => ({
+    label: item.displayName || item.providerModelName,
+    value: item.providerModelName,
+    providerInstanceId: item.providerInstanceId,
+  }));
+}
+async function openRouteConfiguration(row: any) {
+  routeConfigRow.value = row;
+  routeDraft.value = undefined;
+  routeChannelOptions.value = [];
+  routeDeployments.value = [];
+  routeUnavailableChannelNames.value = [];
+  Object.assign(routeForm, { name: "", strategy: "priority", fallbackEnabled: true, candidates: [] });
+  routeConfigVisible.value = true;
+  routeConfigLoading.value = true;
+  routeConfigError.value = "";
+  routeAllowedPairs.value = [];
+  try {
+    const [draft] = await Promise.all([
+      postAction<any>(`/api/platform-models/${row.id}/route-draft`),
+      loadRouteConfigurationOptions(row),
+    ]);
+    routeDraft.value = draft;
+    const candidates = routeConfigCandidates(draft.config);
+    Object.assign(routeForm, {
+      name: draft.name || `${row.displayName || row.platformModelName} 默认路由`,
+      strategy: draft.strategy || "priority",
+      fallbackEnabled: Boolean(draft.fallbackEnabled),
+      candidates: candidates.length
+        ? candidates
+        : routeAllowedPairs.value.map((item, index) => ({ ...item, localId: crypto.randomUUID(), rank: index + 1 })),
+    });
+  } catch (exception) {
+    routeConfigError.value = errorMessage(exception, "企业服务模型 / 配置路由");
+  } finally {
+    routeConfigLoading.value = false;
+  }
+}
+function availableRouteChannels(_candidate: RouteCandidateDraft) {
+  return routeChannelOptions.value;
+}
+function availableRouteDeployments(candidate: RouteCandidateDraft) {
+  if (!candidate.providerInstanceId) return [];
+  return routeAllowedPairs.value
+    .filter((item) => item.providerInstanceId === candidate.providerInstanceId)
+    .map((item) => routeDeployments.value.find((option) =>
+      option.providerInstanceId === item.providerInstanceId && option.value === item.actualModel,
+    ) || ({ label: item.actualModel, value: item.actualModel, providerInstanceId: item.providerInstanceId }));
+}
+function addRouteCandidate() {
+  const used = new Set(routeForm.candidates.map((item) => `${item.providerInstanceId}\u0000${item.actualModel}`));
+  const pair = routeAllowedPairs.value.find((item) => !used.has(`${item.providerInstanceId}\u0000${item.actualModel}`));
+  if (!pair) {
+    message.warning("当前服务模型的候选链路已全部添加");
+    return;
+  }
+  routeForm.candidates.push({
+    localId: crypto.randomUUID(),
+    providerInstanceId: pair?.providerInstanceId,
+    actualModel: pair?.actualModel,
+    rank: routeForm.candidates.length + 1,
+  });
+}
+function removeRouteCandidate(index: number) {
+  routeForm.candidates.splice(index, 1);
+}
+async function saveRouteConfiguration(activate: boolean) {
+  if (!routeDraft.value?.id || !routeConfigRow.value?.platformModelName) return;
+  if (!activate && routeDraft.value.status === "ACTIVE") {
+    routeConfigError.value = "当前路由已生效；如需修改，请点击“保存并生效”，系统会先校验后原地更新该路由";
+    return;
+  }
+  if (!routeForm.name.trim() || !routeForm.candidates.length
+      || routeForm.candidates.some((item) => !item.providerInstanceId || !item.actualModel || !item.rank)) {
+    routeConfigError.value = "请完整填写路由名称、候选渠道、实际模型和优先级或权重";
+    return;
+  }
+  const pairs = routeForm.candidates.map((item) => `${item.providerInstanceId}\u0000${item.actualModel}`);
+  if (new Set(pairs).size !== pairs.length) {
+    routeConfigError.value = "候选渠道和实际模型不能重复";
+    return;
+  }
+  activate ? (routeConfigActivating.value = true) : (routeConfigSaving.value = true);
+  routeConfigError.value = "";
+  try {
+    const payload = {
+      name: routeForm.name.trim(),
+      modelAlias: routeConfigRow.value.platformModelName,
+      strategy: routeForm.strategy,
+      fallbackEnabled: routeForm.fallbackEnabled,
+      config: JSON.stringify({
+        candidates: routeForm.candidates.map((item) => ({
+          providerInstanceId: item.providerInstanceId,
+          actualModel: item.actualModel,
+          [routeForm.strategy === "weighted" ? "weight" : "priority"]: item.rank,
+        })),
+      }),
+    };
+    const saved = await update<any>("/api/routes", routeDraft.value.id, payload);
+    routeDraft.value = saved;
+    if (activate) {
+      const activated = saved.status === "ACTIVE"
+        ? saved
+        : await postAction<any>(`/api/routes/${saved.id}/activate`);
+      routeDraft.value = activated;
+      await patchAction(`/api/platform-models/${routeConfigRow.value.id}/route-policy`, {
+        routePolicyId: activated.id,
+        routePolicy: activated.name,
+      });
+    }
+    routeConfigVisible.value = false;
+    message.success(activate
+      ? "路由已校验、生效并绑定，可继续执行发布检查"
+      : routeConfigRow.value.status === "已发布"
+        ? "路由草稿已保存，当前已发布模型仍使用原生效路由"
+        : "路由草稿已保存");
+    await load();
+  } catch (exception) {
+    routeConfigError.value = errorMessage(exception, "企业服务模型 / 配置路由");
+  } finally {
+    routeConfigSaving.value = false;
+    routeConfigActivating.value = false;
+  }
+}
 async function runAction(action: string, row: any) {
   const loadingKey = actionLoadingKey(action, row);
   const showProgress = shouldShowActionProgress(action);
@@ -1622,11 +2032,18 @@ async function runAction(action: string, row: any) {
         return;
       }
     }
+    if (activePath.value === "/api/platform-models" && action === "配置路由") {
+      await openRouteConfiguration(row);
+      return;
+    }
     if (props.actionForms?.[action]) {
       actionName.value = action;
       actionRow.value = row;
       actionError.value = "";
       Object.keys(actionPayload).forEach((key) => delete actionPayload[key]);
+      if (activePath.value === "/api/provider-instances" && action === "托管密钥") {
+        actionPayload.secretPurpose = "INFERENCE";
+      }
       actionFormVisible.value = true;
       return;
     }
@@ -1649,6 +2066,9 @@ function isActionLoading(action: string, row: any) {
   return Boolean(actionLoading.value[actionLoadingKey(action, row)]);
 }
 function actionTooltip(action: string) {
+  if (activePath.value === "/api/platform-models" && action === "配置路由") {
+    return "在当前页面配置候选链路，并保存或校验生效";
+  }
   if (activePath.value === "/api/provider-price-sources") {
     return {
       测试获取: "请求价格源并检查访问是否正常",
@@ -1841,6 +2261,112 @@ watch(
 
 .form-compact :deep(.ant-form-item-label) {
   padding-bottom: 3px;
+}
+
+.advanced-form-toggle {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 34px;
+  margin: 2px 0 8px;
+  padding: 6px 10px;
+  border: 1px dashed #d6dce8;
+  border-radius: 6px;
+  background: #f8fafc;
+}
+
+.advanced-form-toggle :deep(.ant-btn) {
+  height: auto;
+  padding: 0;
+  font-weight: 600;
+}
+
+.advanced-form-toggle span {
+  color: #6b7280;
+  font-size: 12px;
+}
+
+.route-workflow-steps {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 14px;
+  padding: 10px 12px;
+  border: 1px solid #e1e8f2;
+  border-radius: 9px;
+  background: #f8fbff;
+}
+
+.route-workflow-steps span {
+  flex: 0 0 auto;
+  color: #7b8799;
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.route-workflow-steps span.done { color: #18794e; }
+.route-workflow-steps span.current { color: #0f62fe; }
+.route-workflow-steps i { height: 1px; flex: 1; background: #d8e1ed; }
+
+.route-config-tip { margin-bottom: 14px; }
+.route-config-form {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0 14px;
+}
+
+.route-candidate-editor {
+  margin-top: 4px;
+  padding-top: 14px;
+  border-top: 1px solid #e6ebf2;
+}
+
+.route-candidate-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 10px;
+}
+
+.route-candidate-heading > div { display: grid; gap: 3px; }
+.route-candidate-heading strong { color: #233753; font-size: 14px; }
+.route-candidate-heading span { color: #768399; font-size: 11px; }
+
+.route-candidate-row {
+  display: grid;
+  grid-template-columns: 34px minmax(180px, .85fr) minmax(250px, 1.3fr) 120px 32px;
+  align-items: end;
+  gap: 10px;
+  margin-bottom: 9px;
+  padding: 11px;
+  border: 1px solid #e1e7ef;
+  border-radius: 9px;
+  background: #fbfcfe;
+}
+
+.route-candidate-row > div { min-width: 0; }
+.route-candidate-row label {
+  display: block;
+  margin-bottom: 5px;
+  color: #66758a;
+  font-size: 11px;
+  font-weight: 650;
+}
+.route-candidate-row :deep(.ant-select) { width: 100%; }
+.route-candidate-index {
+  align-self: center;
+  color: #0f62fe;
+  font-size: 12px;
+  font-weight: 800;
+}
+.route-config-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px solid #e6ebf2;
 }
 
 .page-desc-nowrap {
@@ -2267,6 +2793,13 @@ watch(
 }
 
 @media (max-width: 760px) {
+  .route-workflow-steps { align-items: stretch; flex-direction: column; }
+  .route-workflow-steps i { width: 1px; min-height: 8px; align-self: center; }
+  .route-config-form { grid-template-columns: 1fr; }
+  .route-candidate-row { grid-template-columns: 28px minmax(0, 1fr) 32px; align-items: center; }
+  .route-candidate-row > div { grid-column: 2; }
+  .route-candidate-row .icon-button { grid-column: 3; grid-row: 1; }
+  .route-config-footer { flex-wrap: wrap; }
   .provider-channel-table .column-providerTemplateId {
     display: none;
   }

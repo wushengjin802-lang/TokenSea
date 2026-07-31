@@ -64,7 +64,12 @@ public class ProviderBillingController {
             String defaultCurrency,
             String scheduleExpression,
             Map<String,Object> config,
-            String status
+            String status,
+            String credentialRef,
+            String credentialPurpose,
+            String schemaVersion,
+            java.math.BigDecimal varianceAlertRatio,
+            Boolean observationMode
     ) {}
 
     public record PeriodRequest(OffsetDateTime from, OffsetDateTime to) {}
@@ -127,13 +132,15 @@ public class ProviderBillingController {
         jdbc.update("""
             insert into provider_billing_source(
               id,name,provider_instance_id,adapter_code,endpoint,official_hosts,default_currency,
-              schedule_expression,config,status,next_run_at,created_by,updated_by)
+              schedule_expression,config,status,next_run_at,credential_ref,credential_purpose,
+              schema_version,variance_alert_ratio,observation_mode,created_by,updated_by)
             values(?,?,?,?,?,cast(? as jsonb),?,?,cast(? as jsonb),?,
-              case when ?='ACTIVE' then now() else null end,?,?)
+              case when ?='ACTIVE' then now() else null end,?,?,?,?,?,?,?)
             """, id, normalized.name(), normalized.providerInstanceId(), normalized.adapterCode(),
                 normalized.endpoint(), write(normalized.officialHosts()), normalized.defaultCurrency(),
                 normalized.scheduleExpression(), write(normalized.config()), normalized.status(), normalized.status(),
-                actor(authentication), actor(authentication));
+                normalized.credentialRef(), normalized.credentialPurpose(), normalized.schemaVersion(),
+                normalized.varianceAlertRatio(), normalized.observationMode(), actor(authentication), actor(authentication));
         Map<String,Object> created = requireSource(id);
         audits.record("PROVIDER_BILLING_SOURCE_CREATE", "ProviderBillingSource", id, null, created);
         return ApiResponse.ok(created);
@@ -155,10 +162,13 @@ public class ProviderBillingController {
             update provider_billing_source set name=?,provider_instance_id=?,adapter_code=?,endpoint=?,
               official_hosts=cast(? as jsonb),default_currency=?,schedule_expression=?,config=cast(? as jsonb),
               status=?,next_run_at=case when ?='ACTIVE' then coalesce(next_run_at,now()) else next_run_at end,
+              credential_ref=?,credential_purpose=?,schema_version=?,variance_alert_ratio=?,observation_mode=?,
               updated_by=?,updated_at=now() where id=?
             """, normalized.name(), normalized.providerInstanceId(), normalized.adapterCode(), normalized.endpoint(),
                 write(normalized.officialHosts()), normalized.defaultCurrency(), normalized.scheduleExpression(),
-                write(normalized.config()), normalized.status(), normalized.status(), actor(authentication), id);
+                write(normalized.config()), normalized.status(), normalized.status(), normalized.credentialRef(),
+                normalized.credentialPurpose(), normalized.schemaVersion(), normalized.varianceAlertRatio(),
+                normalized.observationMode(), actor(authentication), id);
         Map<String,Object> after = requireSource(id);
         audits.record("PROVIDER_BILLING_SOURCE_UPDATE", "ProviderBillingSource", id, before, after);
         return ApiResponse.ok(after);
@@ -237,6 +247,41 @@ public class ProviderBillingController {
         return ApiResponse.ok(new PageResult<>(rows, total == null ? 0 : total, paging.page(), paging.size()));
     }
 
+    @GetMapping("/provider-billing-snapshots")
+    public ApiResponse<PageResult<Map<String,Object>>> snapshots(
+            @RequestParam(required=false) String sourceId,
+            @RequestParam(required=false) Integer page,
+            @RequestParam(required=false) Integer size,
+            @RequestParam(required=false) String sort,
+            @RequestParam(required=false) String order) {
+        PageQuery paging = PageQuery.of(page, size, sort, order, Map.of(
+                "fetchedAt", "b.fetched_at", "responseBytes", "b.response_bytes",
+                "pageCount", "b.page_count", "httpStatus", "b.http_status"
+        ), "fetchedAt", "desc");
+        String filter = "where (?::text is null or b.billing_source_id=?)";
+        List<Map<String,Object>> rows = jdbc.queryForList("""
+            select b.id,b.billing_source_id "billingSourceId",b.sync_run_id "syncRunId",
+              b.source_endpoint "sourceEndpoint",b.final_endpoint "finalEndpoint",b.http_status "httpStatus",
+              b.content_type "contentType",b.checksum,b.response_bytes "responseBytes",
+              b.page_count "pageCount",b.fetched_at "fetchedAt",s.name "sourceName"
+            from provider_billing_raw_snapshot b join provider_billing_source s on s.id=b.billing_source_id
+            """ + filter + " order by " + paging.sortColumn() + " " + paging.direction()
+                + ",b.id " + paging.direction() + " limit ? offset ?",
+                sourceId, sourceId, paging.size(), paging.offset());
+        Long total = jdbc.queryForObject("""
+            select count(*) from provider_billing_raw_snapshot b
+            join provider_billing_source s on s.id=b.billing_source_id
+            """ + filter, Long.class, sourceId, sourceId);
+        return ApiResponse.ok(new PageResult<>(rows, total == null ? 0 : total, paging.page(), paging.size()));
+    }
+
+    @GetMapping("/provider-billing-snapshots/{id}")
+    public ApiResponse<Map<String,Object>> snapshot(@PathVariable String id) {
+        List<Map<String,Object>> rows = jdbc.queryForList("select * from provider_billing_raw_snapshot where id=?", id);
+        if (rows.isEmpty()) throw new ResponseStatusException(HttpStatus.NOT_FOUND, "供应商账单原始快照不存在");
+        return ApiResponse.ok(rows.getFirst());
+    }
+
     @DeleteMapping("/provider-billing-sources/{id}")
     public void delete(@PathVariable String id) {
         throw new ResponseStatusException(HttpStatus.METHOD_NOT_ALLOWED, "供应商账单来源禁止物理删除，请暂停或停用");
@@ -247,6 +292,7 @@ public class ProviderBillingController {
                                                    String action,
                                                    Authentication authentication) {
         Map<String,Object> before = requireSource(id);
+        if ("ACTIVE".equals(status)) requireBillingCredential(before);
         jdbc.update("""
             update provider_billing_source set status=?,next_run_at=case when ?='ACTIVE' then now() else next_run_at end,
               updated_by=?,updated_at=now() where id=?
@@ -282,7 +328,8 @@ public class ProviderBillingController {
     }
 
     private BillingSourceRequest normalize(BillingSourceRequest request, Map<String,Object> before) {
-        if (request == null) request = new BillingSourceRequest(null,null,null,null,null,null,null,null,null);
+        if (request == null) request = new BillingSourceRequest(
+                null,null,null,null,null,null,null,null,null,null,null,null,null,null);
         String endpoint = choose(request.endpoint(), before, "endpoint", "");
         List<String> hosts = request.officialHosts() == null
                 ? before == null ? endpointHost(endpoint) : strings(before.get("official_hosts"))
@@ -297,7 +344,14 @@ public class ProviderBillingController {
                 choose(request.defaultCurrency(), before, "default_currency", "USD").toUpperCase(Locale.ROOT),
                 choose(request.scheduleExpression(), before, "schedule_expression", "P1D"),
                 request.config() != null ? request.config() : before == null ? Map.of() : map(before.get("config")),
-                choose(request.status(), before, "status", "DRAFT").toUpperCase(Locale.ROOT));
+                choose(request.status(), before, "status", "DRAFT").toUpperCase(Locale.ROOT),
+                chooseNullable(request.credentialRef(), before, "credential_ref"),
+                choose(request.credentialPurpose(), before, "credential_purpose", "BILLING_READ").toUpperCase(Locale.ROOT),
+                choose(request.schemaVersion(), before, "schema_version", "provider-cost-record-v1"),
+                request.varianceAlertRatio() != null ? request.varianceAlertRatio()
+                        : before == null ? new java.math.BigDecimal("0.0500") : decimal(before.get("variance_alert_ratio")),
+                request.observationMode() != null ? request.observationMode()
+                        : before == null || Boolean.TRUE.equals(before.get("observation_mode")));
     }
 
     private void validate(BillingSourceRequest request) {
@@ -305,6 +359,12 @@ public class ProviderBillingController {
                 || request.officialHosts().isEmpty()) bad("账单来源名称、供应商渠道、地址和官方域名不能为空");
         if (!ADAPTERS.contains(request.adapterCode())) bad("供应商账单适配器无效");
         if (!STATUSES.contains(request.status())) bad("供应商账单来源状态无效");
+        if (!"BILLING_READ".equals(request.credentialPurpose())) bad("供应商账单凭据用途必须为 BILLING_READ");
+        if (blank(request.schemaVersion())) bad("供应商账单 Schema 版本不能为空");
+        if (request.varianceAlertRatio() == null || request.varianceAlertRatio().signum() < 0
+                || request.varianceAlertRatio().compareTo(new java.math.BigDecimal("10")) > 0) {
+            bad("账单差异告警比例必须在 0 到 10 之间");
+        }
         if (!request.defaultCurrency().matches("^[A-Z]{3}$")) bad("账单币种必须是三位大写代码");
         try {
             Duration.parse(request.scheduleExpression());
@@ -322,6 +382,15 @@ public class ProviderBillingController {
         if (!request.officialHosts().contains(uri.getHost().toLowerCase(Locale.ROOT))) bad("账单地址主机必须列入官方域名");
         List<Map<String,Object>> channel = jdbc.queryForList("select id,status from provider_instance where id=?", request.providerInstanceId());
         if (channel.isEmpty()) bad("绑定的供应商渠道不存在");
+        if ("ACTIVE".equals(request.status()) && blank(request.credentialRef()))
+            bad("启用供应商账单来源前必须选择独立的 BILLING_READ 凭据");
+        if (!blank(request.credentialRef())) {
+            List<Map<String,Object>> secrets = jdbc.queryForList("""
+                select id from provider_secret
+                where id=? and provider_instance_id=? and secret_purpose='BILLING_READ' and status='ACTIVE'
+                """, stripSecretPrefix(request.credentialRef()), request.providerInstanceId());
+            if (secrets.isEmpty()) bad("所选账单凭据不存在、未启用、用途不正确或不属于当前供应商渠道");
+        }
         if ("OPENAI_COSTS_API".equals(request.adapterCode())
                 && !uri.getPath().endsWith("/v1/organization/costs")) {
             bad("OpenAI Costs API 地址必须以 /v1/organization/costs 结尾");
@@ -330,6 +399,11 @@ public class ProviderBillingController {
             if (!request.config().containsKey("recordsPath") || !request.config().containsKey("amountField")
                     || !request.config().containsKey("periodStartField") || !request.config().containsKey("periodEndField")) {
                 bad("通用账单 JSON 必须配置 recordsPath、amountField、periodStartField 和 periodEndField");
+            }
+            Object header = request.config().get("authHeader");
+            if (header != null && !Set.of("authorization","api-key","x-api-key","x-goog-api-key")
+                    .contains(String.valueOf(header).toLowerCase(Locale.ROOT))) {
+                bad("通用账单认证头不在允许列表中");
             }
         }
     }
@@ -340,9 +414,36 @@ public class ProviderBillingController {
         return rows.getFirst();
     }
 
+    private void requireBillingCredential(Map<String,Object> source) {
+        String reference = text(source.get("credential_ref"));
+        if (blank(reference)) conflict("启用供应商账单来源前必须配置独立的 BILLING_READ 凭据");
+        List<Map<String,Object>> rows = jdbc.queryForList("""
+            select id from provider_secret
+            where id=? and provider_instance_id=? and secret_purpose='BILLING_READ' and status='ACTIVE'
+            """, stripSecretPrefix(reference), source.get("provider_instance_id"));
+        if (rows.isEmpty()) conflict("账单凭据不存在、未启用、用途不正确或不属于当前供应商渠道");
+    }
+
     private String choose(String supplied, Map<String,Object> before, String key, String fallback) {
         if (!blank(supplied)) return supplied;
         return before != null && before.get(key) != null ? String.valueOf(before.get(key)) : fallback;
+    }
+
+    private String chooseNullable(String supplied, Map<String,Object> before, String key) {
+        if (supplied != null) return supplied.isBlank() ? null : supplied.trim();
+        return before != null && before.get(key) != null ? String.valueOf(before.get(key)) : null;
+    }
+
+    private java.math.BigDecimal decimal(Object value) {
+        try {
+            return new java.math.BigDecimal(String.valueOf(value));
+        } catch (Exception exception) {
+            return java.math.BigDecimal.ZERO;
+        }
+    }
+
+    private String stripSecretPrefix(String reference) {
+        return reference != null && reference.startsWith("secret:") ? reference.substring(7) : reference;
     }
 
     private List<String> endpointHost(String endpoint) {
@@ -391,6 +492,10 @@ public class ProviderBillingController {
 
     private String id() {
         return UUID.randomUUID().toString().replace("-", "");
+    }
+
+    private String text(Object value) {
+        return value == null ? "" : String.valueOf(value).trim();
     }
 
     private boolean blank(String value) {

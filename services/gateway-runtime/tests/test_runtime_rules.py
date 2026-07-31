@@ -469,6 +469,37 @@ class GatewayAsyncRulesTest(unittest.IsolatedAsyncioTestCase):
         finally:
             gateway.pool = previous
 
+    async def test_current_public_reference_is_used_when_manual_price_is_absent(self):
+        class FakePool:
+            async def fetchrow(self, query, *_):
+                if "v_effective_deployment_reference_price" not in query:
+                    return None
+                return {
+                    "id": None, "price_layer": "PUBLIC_REFERENCE", "currency": gateway.BUDGET_CURRENCY,
+                    "channel_deployment_id": "doubao-deployment", "cost_billing_basis": "TOKEN",
+                    "cost_billing_quantity": 1_000_000, "input_cost_unit_price": Decimal("0.6"),
+                    "output_cost_unit_price": Decimal("3.6"), "price_billing_basis": "TOKEN",
+                    "price_billing_quantity": 1_000_000, "input_price_unit_price": Decimal("0.6"),
+                    "output_price_unit_price": Decimal("3.6"), "cache_read_cost_unit_price": None,
+                    "cache_write_cost_unit_price": None, "cache_read_mode": "UNKNOWN",
+                    "cache_write_mode": "UNKNOWN", "component_schema_version": 2,
+                    "price_completeness_status": "COMPLETE", "internal_price_id": None,
+                    "source_ref": "bundle://doubao", "price_components": [
+                        {"componentType": "INPUT_TOKEN", "unitPrice": "0.6", "billingBasis": "TOKEN", "billingQuantity": 1_000_000, "mode": "EXPLICIT"},
+                        {"componentType": "OUTPUT_TOKEN", "unitPrice": "3.6", "billingBasis": "TOKEN", "billingQuantity": 1_000_000, "mode": "EXPLICIT"},
+                    ],
+                }
+        previous = gateway.pool
+        gateway.pool = FakePool()
+        try:
+            price = await gateway.load_price(None, "platform", "provider", "doubao-seed-2-0-lite-260215")
+            self.assertEqual("PUBLIC_REFERENCE", price["price_layer"])
+            self.assertEqual(1_000_000, price["price_components"][0]["unitQuantity"])
+            cost, _, _, _ = gateway.calculate_amounts(price, {"prompt_tokens": 1_000_000, "completion_tokens": 0})
+            self.assertEqual(Decimal("0.6"), cost)
+        finally:
+            gateway.pool = previous
+
     async def test_foreign_currency_price_uses_monthly_fx_for_budget_estimate(self):
         class FakePool:
             def __init__(self): self.calls = 0

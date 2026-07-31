@@ -8,11 +8,11 @@
       <nav class="landing-links" aria-label="产品导航">
         <a href="#product-capabilities">产品能力</a>
         <a href="#solutions">解决方案</a>
-        <router-link to="/quick-start">开发者文档</router-link>
+        <a href="#developer-docs">开发者文档</a>
       </nav>
       <div class="landing-actions">
+        <button v-if="loggedIn" class="landing-console-button" type="button" @click="openConsole">控制台</button>
         <button v-if="!loggedIn" class="landing-login-button" type="button" @click="loginOpen = true">登录</button>
-        <button class="landing-console-button" type="button" @click="openConsole">进入控制台</button>
         <a-dropdown v-if="loggedIn" :trigger="['click']"><button class="landing-user-avatar" type="button" :title="sessionName">{{ initials }}</button><template #overlay><a-menu><a-menu-item key="logout" @click="logout">退出登录</a-menu-item></a-menu></template></a-dropdown>
       </div>
     </header>
@@ -78,7 +78,7 @@
         </div>
       </section>
 
-      <section class="landing-section landing-docs-overview">
+      <section id="developer-docs" class="landing-section landing-docs-overview">
         <div class="landing-docs-copy">
           <span>Developer Documentation</span>
           <h2>从供应商接入到 Virtual Key 调用，一套文档走完整流程</h2>

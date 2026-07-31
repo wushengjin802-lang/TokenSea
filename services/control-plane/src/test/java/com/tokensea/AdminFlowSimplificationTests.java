@@ -160,9 +160,11 @@ class AdminFlowSimplificationTests {
         when(routes.selectById("route-1")).thenReturn(route);
         when(instances.selectById("channel-1")).thenReturn(channel);
         when(connections.matchesVerifiedTarget(channel)).thenReturn(true);
+        JdbcTemplate jdbc = mock(JdbcTemplate.class);
+        when(jdbc.queryForObject(anyString(), eq(Integer.class), any(), any())).thenReturn(1);
         PlatformModelController controller = new PlatformModelController(
                 models, instances, mock(AuditLogMapper.class), routes, connections, validator,
-                new ObjectMapper(), transactions, approvals, mock(JdbcTemplate.class));
+                new ObjectMapper(), transactions, approvals, jdbc);
 
         PlatformModel result = controller.publish("service-model-1", ADMIN).data();
         PlatformModelController.PublishCheckResult check = controller.publishCheck("service-model-1").data();

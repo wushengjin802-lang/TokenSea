@@ -54,6 +54,11 @@ public class ModelDiscoveryController {
         List<Map<String,Object>> models=parseModels(result.rawPayload());
         if(models.isEmpty()) throw new ResponseStatusException(HttpStatus.BAD_GATEWAY,"供应商 /models 未返回可识别模型");
         DiscoveryOutcome outcome=transactions.execute(status->persist(instance,result,models));
+        try {
+            jdbc.queryForObject("select tokensea_refresh_reference_price_bindings()", Integer.class);
+        } catch (RuntimeException exception) {
+            log.warn("模型发现后的参考价格绑定刷新失败，后台定时任务将自动重试，providerInstanceId={}", id, exception);
+        }
         for (String deploymentId : outcome.probeDeploymentIds()) {
             try {
                 autoProbes.probeChat(deploymentId);

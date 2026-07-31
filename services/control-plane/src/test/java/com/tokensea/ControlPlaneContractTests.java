@@ -2,6 +2,7 @@ package com.tokensea;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.tokensea.apikey.mapper.ApiKeyEntityMapper;
+import com.tokensea.asset.entity.PlatformModel;
 import com.tokensea.asset.mapper.PlatformModelMapper;
 import com.tokensea.audit.mapper.AuditLogMapper;
 import com.tokensea.bootstrap.BootstrapController;
@@ -89,6 +90,36 @@ class ControlPlaneContractTests {
                 "{\"candidates\":[{\"providerInstanceId\":\"channel\",\"actualModel\":\"qwen3.7-plus\"}]}"));
 
         verify(routes).insert(any(RoutePolicy.class));
+    }
+
+    @Test
+    void routeRenameSynchronizesTheBoundServiceModelDisplayName() {
+        RoutePolicyMapper routes = mock(RoutePolicyMapper.class);
+        PlatformModelMapper models = mock(PlatformModelMapper.class);
+        RoutePolicy route = new RoutePolicy();
+        route.setId("route-1");
+        route.setName("旧路由");
+        route.setModelAlias("chat-standard");
+        route.setStrategy("priority");
+        route.setFallbackEnabled(true);
+        route.setConfig("{\"candidates\":[{\"providerInstanceId\":\"channel-1\",\"actualModel\":\"model-1\"}]}");
+        route.setStatus("DRAFT");
+        PlatformModel bound = new PlatformModel();
+        bound.setId("model-1");
+        bound.setRoutePolicyId("route-1");
+        bound.setRoutePolicy("旧路由");
+        when(routes.selectById("route-1")).thenReturn(route, route);
+        when(models.selectList(any())).thenReturn(List.of(bound));
+        RoutePolicyController controller = new RoutePolicyController(routes, models, mock(AuditLogMapper.class),
+                new ObjectMapper(), mock(RouteCandidateValidator.class),
+                mock(com.tokensea.governance.GovernanceApprovalService.class),
+                mock(com.tokensea.governance.CapabilityProbeService.class));
+
+        controller.update("route-1", new RoutePolicyController.RouteRequest("新路由", "chat-standard", "priority", true,
+                "{\"candidates\":[{\"providerInstanceId\":\"channel-1\",\"actualModel\":\"model-1\"}]}"));
+
+        assertEquals("新路由", bound.getRoutePolicy());
+        verify(models).updateById(bound);
     }
 
     @Test

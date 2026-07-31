@@ -2,13 +2,16 @@
   <div class="page console-page list-page-internal-scroll">
     <header class="page-header">
       <div>
-        <div class="eyebrow">租户工作台</div>
         <h1 class="page-title">我的业务空间</h1>
         <p class="page-desc">数据范围由当前账号的实时租户成员关系决定。</p>
       </div>
       <button class="btn" :disabled="loading" @click="load">刷新</button>
     </header>
-    <div v-if="error" class="state-panel error-state" role="alert">
+    <div v-if="noTenantMembership" class="state-panel empty-state" role="status">
+      <strong>暂无可访问的数据</strong>
+      <p>当前账号尚未加入有效租户，暂时没有可展示的业务数据。</p>
+    </div>
+    <div v-else-if="error" class="state-panel error-state" role="alert">
       <strong>工作台加载失败</strong>
       <p>{{ error }}</p>
       <button class="btn" @click="load">重试</button>
@@ -75,6 +78,7 @@ import { assertTenantScope } from "../security/tenantScope";
 const session = identity(),
   loading = ref(false),
   error = ref(""),
+  noTenantMembership = ref(false),
   context = ref<any>({}),
   active = ref("tenants"),
   datasets = reactive<Record<string, any[]>>({});
@@ -181,6 +185,7 @@ function display(value: any) {
 async function load() {
   loading.value = true;
   error.value = "";
+  noTenantMembership.value = false;
   try {
     context.value = await get("/api/tenant/context");
     assertTenantScope(context.value, session);
@@ -193,9 +198,11 @@ async function load() {
     );
   } catch (e) {
     Object.keys(datasets).forEach((key) => (datasets[key] = []));
-    error.value = (e as any)?.response?.status === 403
-      ? "异常位置：租户成员关系；异常原因：当前账号没有有效的租户成员关系；处理方式：请平台管理员在租户成员管理中将该账号加入目标租户后重新登录。"
-      : errorMessage(e, "租户工作台");
+    if ((e as any)?.response?.status === 403) {
+      noTenantMembership.value = true;
+    } else {
+      error.value = errorMessage(e, "租户工作台");
+    }
   } finally {
     loading.value = false;
   }

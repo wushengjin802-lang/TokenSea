@@ -31,6 +31,11 @@ tokensea:
   jwt-secret: ${TOKENSEA_JWT_SECRET}
   crypto-key: ${TOKENSEA_CRYPTO_KEY}
   bootstrap-token: ${TOKENSEA_BOOTSTRAP_TOKEN:}
+  default-admin:
+    enabled: ${TOKENSEA_DEFAULT_ADMIN_ENABLED:true}
+    username: ${TOKENSEA_DEFAULT_ADMIN_USERNAME:admin}
+    password: ${TOKENSEA_DEFAULT_ADMIN_PASSWORD:TokenSea@local2026}
+    display-name: ${TOKENSEA_DEFAULT_ADMIN_DISPLAY_NAME:系统管理员}
   budget-currency: ${TOKENSEA_BUDGET_CURRENCY:CNY}
   fx:
     source-url: ${TOKENSEA_FX_SOURCE_URL:https://www.ecb.europa.eu/stats/eurofxref/eurofxref-daily.xml}
@@ -51,11 +56,20 @@ tokensea:
   headless-fetcher:
     url: ${TOKENSEA_HEADLESS_FETCHER_URL:}
     token: ${TOKENSEA_HEADLESS_FETCHER_TOKEN:}
+  reference-price:
+    enabled: ${TOKENSEA_REFERENCE_PRICE_ENABLED:true}
+    bootstrap-enabled: ${TOKENSEA_REFERENCE_PRICE_BOOTSTRAP_ENABLED:true}
+    bootstrap-resource: ${TOKENSEA_REFERENCE_PRICE_BOOTSTRAP_RESOURCE:classpath:reference-prices/reference-price-bootstrap.json}
+    immediate-sync-on-startup: ${TOKENSEA_REFERENCE_PRICE_IMMEDIATE_SYNC:true}
+    default-schedule: ${TOKENSEA_REFERENCE_PRICE_SCHEDULE:P1D}
+    stale-after-hours: ${TOKENSEA_REFERENCE_PRICE_STALE_AFTER_HOURS:168}
+    hard-stale-after-hours: ${TOKENSEA_REFERENCE_PRICE_HARD_STALE_AFTER_HOURS:720}
+    health-refresh-ms: ${TOKENSEA_REFERENCE_PRICE_HEALTH_REFRESH_MS:3600000}
   price-document-llm:
     enabled: ${TOKENSEA_PRICE_DOCUMENT_LLM_ENABLED:false}
     url: ${TOKENSEA_PRICE_DOCUMENT_LLM_URL:}
     model: ${TOKENSEA_PRICE_DOCUMENT_LLM_MODEL:}
-    api-key: ${TOKENSEA_PRICE_DOCUMENT_LLM_API_KEY:}
+    virtual-key: ${TOKENSEA_PRICE_DOCUMENT_LLM_VIRTUAL_KEY:${TOKENSEA_PRICE_DOCUMENT_LLM_API_KEY:}}
     max-chars: ${TOKENSEA_PRICE_DOCUMENT_LLM_MAX_CHARS:60000}
   provider-billing:
     scheduler-ms: ${TOKENSEA_PROVIDER_BILLING_SCHEDULER_MS:300000}

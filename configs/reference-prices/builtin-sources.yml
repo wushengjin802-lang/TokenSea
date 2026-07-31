@@ -1,0 +1,26 @@
+schemaVersion: reference-source-catalog-v1
+sources:
+  - id: builtin_litellm_cost_map
+    name: LiteLLM 公共成本参考
+    adapterCode: LITELLM_COST_MAP
+    endpoint: https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json
+    officialHosts: [raw.githubusercontent.com]
+    scheduleExpression: P1D
+    sourcePriority: 200
+    staleAfterHours: 168
+  - id: builtin_models_dev
+    name: models.dev 公共模型参考
+    adapterCode: MODELS_DEV
+    endpoint: https://models.dev/api.json
+    officialHosts: [models.dev]
+    scheduleExpression: P1D
+    sourcePriority: 150
+    staleAfterHours: 168
+  - id: builtin_reference_price_bundle
+    name: TokenSea 内置参考价格快照
+    adapterCode: BUNDLED_REFERENCE
+    endpoint: classpath:reference-prices/reference-price-bootstrap.json
+    officialHosts: []
+    scheduleExpression: P3650D
+    sourcePriority: 10
+    staleAfterHours: 720

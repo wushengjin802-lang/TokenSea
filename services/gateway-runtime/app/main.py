@@ -793,14 +793,28 @@ async def select_routes(model_alias: str, key_ctx: Dict[str, Any]) -> List[Dict[
     config = strict_object(model["route_config"], "TOKENSEA_ROUTE_POLICY_INVALID")
     instance_ids = strict_string_list(model["provider_instance_ids"])
     actual_models = strict_string_list(model["actual_models"])
-    if not instance_ids or not actual_models or len(instance_ids) not in (1, len(actual_models)):
+    if not instance_ids or not actual_models or len(set(instance_ids)) != len(instance_ids) or len(set(actual_models)) != len(actual_models):
         raise gateway_error(503, "TOKENSEA_ROUTE_MAPPING_INVALID", "模型路由映射无效")
+    deployment_rows = await pool.fetch("""
+      SELECT provider_instance_id,provider_model_name
+      FROM channel_model_deployment
+      WHERE provider_instance_id=ANY($1::varchar[]) AND discovery_status<>'MISSING_CONFIRMED'
+    """, instance_ids)
+    deployments_by_model: Dict[str, List[str]] = {}
+    for deployment in deployment_rows:
+        deployments_by_model.setdefault(str(deployment["provider_model_name"]).lower(), []).append(
+            str(deployment["provider_instance_id"]))
     mappings = []
     for index, actual in enumerate(actual_models):
-        mappings.append({"provider_instance_id": instance_ids[0] if len(instance_ids) == 1 else instance_ids[index],
+        matches = sorted(set(deployments_by_model.get(actual.lower(), [])))
+        if len(matches) != 1:
+            raise gateway_error(503, "TOKENSEA_ROUTE_MAPPING_INVALID", "模型路由映射无效")
+        mappings.append({"provider_instance_id": matches[0],
                          "actual_model": actual, "priority": index + 1, "weight": 100,
                          "timeout_seconds": 120, "max_retries": 0,
                          "price_version_id": model["price_policy_id"]})
+    if {mapping["provider_instance_id"] for mapping in mappings} != set(instance_ids):
+        raise gateway_error(503, "TOKENSEA_ROUTE_MAPPING_INVALID", "模型路由映射无效")
     configured = config.get("candidates")
     if configured is not None:
         if not isinstance(configured, list) or not configured:
@@ -892,9 +906,36 @@ async def load_price(_price_id: Any, platform_model_id: str, provider_instance_i
           AND v.test_type='LIVE_PROBE' ORDER BY v.validated_at DESC LIMIT 1)='PASSED'
     """, platform_model_id, provider_instance_id, actual_model)
     if not row:
-        raise gateway_error(503, "TOKENSEA_PRICE_NOT_CONFIGURED", "模型未匹配当前生效的供应商官方价格")
+        row = await pool.fetchrow("""
+          SELECT NULL::varchar id,'PUBLIC_REFERENCE' price_layer,r.currency,d.id channel_deployment_id,
+                 r.billing_basis cost_billing_basis,r.billing_quantity cost_billing_quantity,
+                 r.input_unit_price input_cost_unit_price,r.cache_read_unit_price cache_read_cost_unit_price,
+                 r.cache_write_unit_price cache_write_cost_unit_price,
+                 CASE WHEN r.cache_read_unit_price IS NULL THEN 'UNKNOWN' ELSE 'EXPLICIT' END cache_read_mode,
+                 CASE WHEN r.cache_write_unit_price IS NULL THEN 'UNKNOWN' ELSE 'EXPLICIT' END cache_write_mode,
+                 2 component_schema_version,'COMPLETE' price_completeness_status,
+                 r.output_unit_price output_cost_unit_price,NULL::varchar internal_price_id,
+                 r.billing_basis price_billing_basis,r.billing_quantity price_billing_quantity,
+                 r.input_unit_price input_price_unit_price,r.output_unit_price output_price_unit_price,
+                 r.source_ref,r.price_components,r.evidence_hash,r.region,'STANDARD' request_mode,
+                 'DEFAULT' service_tier,'DEFAULT' context_tier
+          FROM channel_model_deployment d
+          JOIN v_effective_deployment_reference_price r ON r.deployment_id=d.id
+          WHERE d.provider_instance_id=$1 AND d.provider_model_name=$2
+            AND d.production_status='APPROVED' AND d.health_status='HEALTHY'
+            AND d.discovery_status<>'MISSING_CONFIRMED' AND d.routing_status='ELIGIBLE'
+            AND (SELECT v.status FROM capability_validation v WHERE v.deployment_id=d.id
+              AND v.test_type='LIVE_PROBE' ORDER BY v.validated_at DESC LIMIT 1)='PASSED'
+        """, provider_instance_id, actual_model)
+    if not row:
+        raise gateway_error(503, "TOKENSEA_PRICE_NOT_CONFIGURED", "模型未匹配当前有效成本价或自动参考价")
     price = dict(row)
     price["price_components"] = parse_json_array(price.get("price_components"))
+    for component in price["price_components"]:
+        if "unitBasis" not in component and component.get("billingBasis") is not None:
+            component["unitBasis"] = component["billingBasis"]
+        if "unitQuantity" not in component and component.get("billingQuantity") is not None:
+            component["unitQuantity"] = component["billingQuantity"]
     amount_fields = ("input_cost_unit_price", "output_cost_unit_price",
                      "input_price_unit_price", "output_price_unit_price")
     quantity_fields = ("cost_billing_quantity", "price_billing_quantity")

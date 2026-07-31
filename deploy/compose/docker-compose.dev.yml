@@ -11,6 +11,8 @@ services:
   tokensea-egress-proxy:
     ports:
       - "127.0.0.1:${TOKENSEA_EGRESS_PROXY_PORT:-18080}:18080"
+    volumes:
+      - ../../services/egress-proxy/app:/app/app:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"
     environment:

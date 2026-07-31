@@ -1,0 +1,40 @@
+{
+  "schemaVersion": "reference-price-bundle-v1",
+  "bundleVersion": "2026.07.29.1",
+  "generatedAt": "2026-07-29T00:00:00Z",
+  "notice": "公开参考价，仅用于模型选型和成本估算，不作为实际结算依据。",
+  "prices": [
+    {
+      "providerType": "qwen",
+      "providerModelName": "qwen-plus",
+      "displayName": "Qwen Plus",
+      "currency": "CNY",
+      "region": "cn",
+      "billingBasis": "TOKEN",
+      "billingQuantity": 1000000,
+      "inputUnitPrice": 0.8,
+      "outputUnitPrice": 2.0,
+      "requestMode": "STANDARD",
+      "serviceTier": "DEFAULT",
+      "contextTier": "DEFAULT",
+      "sourceRef": "bundle://tokensea/2026.07.29.1/qwen-plus",
+      "sourceObservedAt": "2026-07-29T00:00:00Z"
+    },
+    {
+      "providerType": "volcengine_ark",
+      "providerModelName": "doubao-seed-2-0-lite-260215",
+      "displayName": "Doubao Seed 2.0 Lite",
+      "currency": "CNY",
+      "region": "cn",
+      "billingBasis": "TOKEN",
+      "billingQuantity": 1000000,
+      "inputUnitPrice": 0.6,
+      "outputUnitPrice": 3.6,
+      "requestMode": "STANDARD",
+      "serviceTier": "DEFAULT",
+      "contextTier": "0_32K",
+      "sourceRef": "bundle://tokensea/2026.07.29.1/doubao-seed-2-0-lite-0-32k",
+      "sourceObservedAt": "2026-07-29T00:00:00Z"
+    }
+  ]
+}

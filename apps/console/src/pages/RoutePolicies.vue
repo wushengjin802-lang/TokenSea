@@ -4,7 +4,7 @@
       <div>
         <h1 class="page-title">路由策略</h1>
         <p class="page-desc">
-          平台管理员保存策略后可直接校验并生效；系统仍会检查模型映射、能力验证和价格版本。
+          平台管理员保存策略后可直接校验并生效；系统会检查模型映射、能力验证和生产准入状态。
         </p>
       </div>
       <div class="header-actions">
@@ -49,9 +49,11 @@
                 </th>
                 <th>服务模型</th>
                 <th>策略</th>
-                <th>Fallback</th>
+                <th>故障切换</th>
                 <th>候选数</th>
                 <th>状态</th>
+                <th>创建时间</th>
+                <th>更新时间</th>
                 <th>操作</th>
               </tr>
             </thead>
@@ -60,33 +62,39 @@
                 <td>{{ row.name }}</td>
                 <td>{{ modelLabel(row.modelAlias) }}</td>
                 <td>{{ row.strategy === "weighted" ? "加权" : "优先级" }}</td>
-                <td>{{ row.fallbackEnabled ? "启用" : "停用" }}</td>
+                <td>
+                  <span :class="['status', fallbackClass(row)]" :title="fallbackHint(row)">{{ fallbackLabel(row) }}</span>
+                </td>
                 <td>{{ candidateCount(row.config) }}</td>
                 <td>
                   <span :class="['status', statusClass(row.status)]">{{
                     statusLabel(row.status)
                   }}</span>
                 </td>
-                <td class="row-actions">
-                  <button
-                    v-if="row.status === 'DRAFT'"
-                    class="btn small"
-                    @click="openEdit(row)"
-                  >
-                    编辑</button
-                  ><button
-                    v-if="['DRAFT', 'PENDING_APPROVAL'].includes(row.status)"
-                    class="btn small"
-                    @click="action(row, 'activate', '校验并生效')"
-                  >
-                    校验并生效</button
-                  ><button
-                    v-if="row.status === 'ACTIVE'"
-                    class="btn small"
-                    @click="action(row, 'retire', '退役')"
-                  >
-                    退役
-                  </button>
+                <td>{{ formatDateTime(row.createdAt) }}</td>
+                <td>{{ formatDateTime(row.updatedAt) }}</td>
+                <td>
+                  <div class="row-actions">
+                    <button
+                      v-if="row.status === 'DRAFT'"
+                      class="btn small"
+                      @click="openEdit(row)"
+                    >
+                      编辑</button
+                    ><button
+                      v-if="['DRAFT', 'PENDING_APPROVAL'].includes(row.status)"
+                      class="btn small"
+                      @click="action(row, 'activate', '校验并生效')"
+                    >
+                      校验并生效</button
+                    ><button
+                      v-if="row.status === 'ACTIVE'"
+                      class="btn small"
+                      @click="action(row, 'retire', '退役')"
+                    >
+                      退役
+                    </button>
+                  </div>
                 </td>
               </tr>
             </tbody>
@@ -94,7 +102,7 @@
         </div>
         <div v-if="!rows.length" class="state-panel empty-state">
           <strong>尚无路由策略</strong>
-          <p>创建策略前请先准备已审核部署、能力验证记录和生效价格版本。</p>
+          <p>创建策略前请先准备已批准部署和通过的能力验证记录。</p>
         </div>
         <footer class="pagination">
           <span>共 {{ total }} 条</span>
@@ -177,7 +185,7 @@
               placeholder="选择渠道"
               @change="
                 candidate.actualModel = undefined;
-                candidate.priceVersionId = undefined;
+                candidate.referencePriceLabel = undefined;
               "
             />
           </div>
@@ -189,18 +197,14 @@
               show-search
               option-filter-prop="label"
               placeholder="选择已审核模型"
-              @change="candidate.priceVersionId = undefined"
+              @change="loadReferencePrice(candidate)"
             />
           </div>
           <div>
-            <label>价格版本</label
-            ><a-select
-              v-model:value="candidate.priceVersionId"
-              :options="priceOptions(candidate.providerInstanceId, candidate.actualModel)"
-              show-search
-              option-filter-prop="label"
-              placeholder="选择生效价格版本"
-            />
+            <label>参考价格</label>
+            <div class="reference-price" :class="{ loading: candidate.referencePriceLoading }" :title="candidate.referencePriceLabel">
+              {{ candidate.referencePriceLabel || "选择实际模型后加载" }}
+            </div>
           </div>
           <div>
             <label>{{ form.strategy === "weighted" ? "权重" : "优先级" }}</label
@@ -233,17 +237,20 @@ import { computed, onMounted, reactive, ref } from "vue";
 import {
   create,
   errorMessage,
+  get,
   postAction,
   queryPage,
   update,
 } from "../api/client";
+import { formatDateTime } from "../format";
 import { stableSortRows } from "../listSort";
 import { message } from "ant-design-vue";
 type Candidate = {
   localId: string;
   providerInstanceId?: string;
   actualModel?: string;
-  priceVersionId?: string;
+  referencePriceLabel?: string;
+  referencePriceLoading?: boolean;
   rank: number;
 };
 type Row = Record<string, any>;
@@ -253,7 +260,6 @@ type Option = {
   providerInstanceId?: string;
   deploymentId?: string;
   providerModelName?: string;
-  priceLayer?: string;
 };
 const rows = ref<Row[]>([]),
   total = ref(0),
@@ -278,8 +284,7 @@ const form = reactive<{
 }>({ name: "", strategy: "priority", fallbackEnabled: true, candidates: [] });
 const modelOptions = ref<Option[]>([]),
   channelOptions = ref<Option[]>([]),
-  deployments = ref<Option[]>([]),
-  prices = ref<Option[]>([]);
+  deployments = ref<Option[]>([]);
   const statusOptions = [
     { label: "草稿", value: "DRAFT" },
     { label: "待审批", value: "PENDING_APPROVAL" },
@@ -329,25 +334,15 @@ function cacheModeLabel(value?: string) {
   } as Record<string, string>)[String(value || "UNKNOWN")] || "未确认";
 }
 
-function priceCompletenessLabel(value?: string) {
-  return ({
-    COMPLETE: "价格完整",
-    PARTIAL: "价格不完整",
-    UNKNOWN_CACHE_PRICE: "缓存价未确认",
-    UNSUPPORTED_CACHE: "不支持缓存",
-  } as Record<string, string>)[String(value || "PARTIAL")] || "价格不完整";
-}
-
 async function loadOptions() {
   try {
-    const [models, channels, deployed, costs] = await Promise.all([
+    const [models, channels, deployed] = await Promise.all([
       queryPage<Row>("/api/platform-models", { size: 500 }),
       queryPage<Row>("/api/provider-instances", { size: 500 }),
       queryPage<Row>("/api/channel-model-deployments", {
         size: 500,
         productionStatus: "APPROVED",
       }),
-      queryPage<Row>("/api/price-versions", { size: 500, status: "ACTIVE" }),
     ]);
     modelOptions.value = models.items.map((x) => ({
       label: x.displayName || x.platformModelName,
@@ -363,29 +358,6 @@ async function loadOptions() {
       providerInstanceId: x.providerInstanceId,
       deploymentId: x.id,
     }));
-    prices.value = costs.items
-      .filter(
-        (x) =>
-          ["PROVIDER_OFFICIAL", "CHANNEL_ACTUAL"].includes(x.priceLayer) &&
-          x.status === "ACTIVE",
-      )
-      .map((x) => {
-        const deployment = deployments.value.find(
-          (item) => item.deploymentId === x.deploymentId,
-        );
-        const layerLabel =
-          x.priceLayer === "PROVIDER_OFFICIAL"
-            ? "供应商官方价"
-            : "渠道实际成本";
-        return {
-          label: `${layerLabel} · V${x.version} · ${x.currency} · 未命中输入 ${x.inputUnitPrice ?? "—"} / 缓存命中 ${x.cacheReadUnitPrice ?? cacheModeLabel(x.cacheReadMode)} / 缓存写入 ${x.cacheWriteUnitPrice ?? cacheModeLabel(x.cacheWriteMode)} / 输出 ${x.outputUnitPrice ?? "—"} · ${priceCompletenessLabel(x.priceCompletenessStatus)} · 每 ${x.billingQuantity ?? 1000000} ${x.billingBasis === "TOKEN" ? "Token" : x.billingBasis ?? "单位"}`,
-          value: x.id,
-          providerInstanceId: x.providerInstanceId || deployment?.providerInstanceId,
-          deploymentId: x.deploymentId,
-          providerModelName: x.providerModelName || deployment?.value,
-          priceLayer: x.priceLayer,
-        };
-      });
   } catch (e) {
     formError.value = `业务选项加载失败：${errorMessage(e)}`;
   }
@@ -393,13 +365,24 @@ async function loadOptions() {
 function deploymentOptions(id?: string) {
   return deployments.value.filter((x) => !id || x.providerInstanceId === id);
 }
-function priceOptions(id?: string, actualModel?: string) {
-  if (!id || !actualModel) return [];
-  return prices.value.filter(
-    (x) =>
-      x.providerInstanceId === id &&
-      String(x.providerModelName).toLowerCase() === actualModel.toLowerCase(),
+async function loadReferencePrice(candidate: Candidate) {
+  candidate.referencePriceLabel = undefined;
+  if (!candidate.providerInstanceId || !candidate.actualModel) return;
+  const deployment = deployments.value.find(
+    (item) => item.providerInstanceId === candidate.providerInstanceId && item.value === candidate.actualModel,
   );
+  if (!deployment?.deploymentId) return;
+  candidate.referencePriceLoading = true;
+  try {
+    const price = await get<Row>(`/api/model-deployment-governance/${deployment.deploymentId}/reference-price`);
+    candidate.referencePriceLabel = price.referencePriceStatus === "MATCHED_REFERENCE"
+      ? `参考价 · ${price.currency} · 入 ${price.inputUnitPrice ?? "—"} / 出 ${price.outputUnitPrice ?? "—"}`
+      : "暂无自动参考价（不影响路由）";
+  } catch {
+    candidate.referencePriceLabel = "参考价查询失败（不影响路由）";
+  } finally {
+    candidate.referencePriceLoading = false;
+  }
 }
 function addCandidate() {
   form.candidates.push({
@@ -442,7 +425,6 @@ async function openEdit(row: Row) {
       localId: crypto.randomUUID(),
       providerInstanceId: x.providerInstanceId,
       actualModel: x.actualModel,
-      priceVersionId: x.priceVersionId,
       rank: x.priority ?? x.weight ?? index + 1,
     })),
   });
@@ -456,10 +438,10 @@ async function save() {
     !form.modelAlias ||
     !form.candidates.length ||
     form.candidates.some(
-      (x) => !x.providerInstanceId || !x.actualModel || !x.priceVersionId,
+      (x) => !x.providerInstanceId || !x.actualModel,
     )
   ) {
-    formError.value = "请完整选择服务模型、渠道、实际模型和价格版本";
+    formError.value = "请完整选择服务模型、渠道和实际模型";
     return;
   }
   saving.value = true;
@@ -474,7 +456,6 @@ async function save() {
         candidates: form.candidates.map((x) => ({
           providerInstanceId: x.providerInstanceId,
           actualModel: x.actualModel,
-          priceVersionId: x.priceVersionId,
           [form.strategy === "weighted" ? "weight" : "priority"]: x.rank,
         })),
       }),
@@ -527,6 +508,16 @@ function candidateCount(raw: any) {
     return 0;
   }
 }
+function fallbackLabel(row: Row) {
+  return row.status === "RETIRED" ? "停用" : row.fallbackEnabled ? "启用" : "停用";
+}
+function fallbackClass(row: Row) {
+  if (row.status === "RETIRED") return "danger";
+  return row.fallbackEnabled ? "ok" : "info";
+}
+function fallbackHint(row: Row) {
+  return row.status === "RETIRED" ? "路由已退役，故障切换不生效。" : undefined;
+}
 function statusLabel(value: any) {
   return statusOptions.find((x) => x.value === value)?.label || value || "—";
 }
@@ -540,6 +531,14 @@ onMounted(async () => {
 </script>
 
 <style scoped>
+.row-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  min-width: 150px;
+}
+
 .candidate-row > div {
   min-width: 0;
 }
@@ -554,4 +553,19 @@ onMounted(async () => {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+.reference-price {
+  height: 32px;
+  padding: 6px 10px;
+  border: 1px solid #d9d9d9;
+  border-radius: 6px;
+  color: #36526f;
+  font-size: 13px;
+  line-height: 18px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.reference-price.loading { color: #1677ff; }
 </style>

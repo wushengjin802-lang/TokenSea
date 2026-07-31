@@ -13,6 +13,7 @@ public class ProviderSecret extends BaseEntity {
     private String providerId;
     private String providerInstanceId;
     private String secretName;
+    private String secretPurpose;
     @JsonIgnore
     private String secretCipher;
     private String secretLast4;

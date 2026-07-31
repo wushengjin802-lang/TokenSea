@@ -162,6 +162,7 @@ class EgressPolicy:
 
 Resolver = Callable[[str, int], Awaitable[Sequence[tuple]]]
 Connector = Callable[[str, int, int], Awaitable[tuple[asyncio.StreamReader, asyncio.StreamWriter]]]
+DynamicPolicyLoader = Callable[[], Awaitable[Iterable[str]]]
 
 
 async def system_resolver(host: str, port: int) -> Sequence[tuple]:
@@ -175,13 +176,18 @@ async def numeric_connector(address: str, port: int, family: int):
 
 class EgressProxy:
     def __init__(self, policy: EgressPolicy, *, resolver: Resolver = system_resolver,
-                 connector: Connector = numeric_connector, connect_timeout: float = 10,
-                 idle_timeout: float = 300, header_timeout: float = 10,
-                 max_header_bytes: int = 65536, max_headers: int = 100,
-                 max_request_bytes: int = 268435456, max_response_bytes: int = 268435456):
+                 connector: Connector = numeric_connector,
+                 dynamic_policy_loader: Optional[DynamicPolicyLoader] = None,
+                 connect_timeout: float = 10, idle_timeout: float = 300,
+                 header_timeout: float = 10, max_header_bytes: int = 65536,
+                 max_headers: int = 100, max_request_bytes: int = 268435456,
+                 max_response_bytes: int = 268435456):
         self.policy = policy
         self.resolver = resolver
         self.connector = connector
+        self.dynamic_policy_loader = dynamic_policy_loader
+        self.dynamic_policy_lock = asyncio.Lock()
+        self.last_forced_policy_refresh = 0.0
         self.connect_timeout = connect_timeout
         self.idle_timeout = idle_timeout
         self.header_timeout = header_timeout
@@ -190,20 +196,49 @@ class EgressProxy:
         self.max_request_bytes = max_request_bytes
         self.max_response_bytes = max_response_bytes
 
+    async def _validate_host_port(self, host: str, port: int) -> str:
+        try:
+            return self.policy.validate_host_port(host, port)
+        except ProxyError as exc:
+            if exc.code != "host_not_allowlisted" or self.dynamic_policy_loader is None:
+                raise
+        async with self.dynamic_policy_lock:
+            now = asyncio.get_running_loop().time()
+            if now - self.last_forced_policy_refresh >= 1:
+                try:
+                    hosts = await self.dynamic_policy_loader()
+                    self.policy.replace_dynamic_hosts(hosts)
+                    self.last_forced_policy_refresh = now
+                    LOGGER.info("dynamic_policy_refreshed_on_demand hosts=%s total_hosts=%s",
+                                len(self.policy.dynamic_hosts), len(self.policy.effective_hosts))
+                except Exception as refresh_error:
+                    LOGGER.warning("dynamic_policy_on_demand_refresh_failed error=%s",
+                                   type(refresh_error).__name__)
+        return self.policy.validate_host_port(host, port)
+
     async def resolve_and_connect(self, host: str, port: int):
-        normalized = self.policy.validate_host_port(host, port)
+        normalized = await self._validate_host_port(host, port)
         try:
             answers = await asyncio.wait_for(self.resolver(normalized, port), self.connect_timeout)
         except (asyncio.TimeoutError, socket.gaierror) as exc:
             raise ProxyError(502, "Bad Gateway", "dns_resolution_failed") from exc
         candidates: list[ipaddress.IPv4Address | ipaddress.IPv6Address] = []
+        rejected_addresses: list[ProxyError] = []
         for answer in answers:
             if len(answer) < 5 or not answer[4]:
                 continue
-            address = self.policy.validate_ip(answer[4][0])
+            try:
+                address = self.policy.validate_ip(answer[4][0])
+            except ProxyError as exc:
+                if exc.code not in {"invalid_resolved_address", "non_global_address"}:
+                    raise
+                rejected_addresses.append(exc)
+                continue
             if address not in candidates:
                 candidates.append(address)
         if not candidates:
+            if rejected_addresses:
+                raise rejected_addresses[0]
             raise ProxyError(403, "Forbidden", "no_safe_address")
         last_error: Optional[BaseException] = None
         for address in candidates:
@@ -411,7 +446,14 @@ async def refresh_dynamic_policy(policy: EgressPolicy, url: str, token: str, int
 async def run():
     policy = EgressPolicy(parse_allowed_hosts(os.getenv("TOKENSEA_ALLOWED_EGRESS_HOSTS", "")),
                           parse_allowed_ports(os.getenv("TOKENSEA_EGRESS_ALLOWED_PORTS", "80,443")))
+    policy_url = os.getenv("TOKENSEA_EGRESS_POLICY_URL", "").strip()
+    policy_token = os.getenv("TOKENSEA_EGRESS_POLICY_TOKEN", "").strip()
+    dynamic_policy_loader = None
+    if policy_url and policy_token:
+        async def dynamic_policy_loader():
+            return await asyncio.to_thread(fetch_dynamic_policy, policy_url, policy_token)
     proxy = EgressProxy(policy,
+                        dynamic_policy_loader=dynamic_policy_loader,
                         connect_timeout=positive_int("TOKENSEA_EGRESS_CONNECT_TIMEOUT_SECONDS", 10),
                         idle_timeout=positive_int("TOKENSEA_EGRESS_IDLE_TIMEOUT_SECONDS", 300),
                         header_timeout=positive_int("TOKENSEA_EGRESS_HEADER_TIMEOUT_SECONDS", 10),
@@ -422,8 +464,6 @@ async def run():
     host = os.getenv("TOKENSEA_EGRESS_LISTEN_HOST", "0.0.0.0")
     port = positive_int("TOKENSEA_EGRESS_LISTEN_PORT", 18080)
     server = await asyncio.start_server(proxy.handle_client, host, port, limit=proxy.max_header_bytes + 1)
-    policy_url = os.getenv("TOKENSEA_EGRESS_POLICY_URL", "").strip()
-    policy_token = os.getenv("TOKENSEA_EGRESS_POLICY_TOKEN", "").strip()
     refresh_task = None
     if policy_url and policy_token:
         refresh_task = asyncio.create_task(refresh_dynamic_policy(

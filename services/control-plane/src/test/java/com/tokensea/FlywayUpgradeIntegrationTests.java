@@ -1,23 +1,51 @@
 package com.tokensea;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.tokensea.audit.service.AuditService;
 import com.tokensea.config.LegacyV7PreflightCallback;
+import com.tokensea.governance.ProviderPriceSyncController;
+import com.tokensea.governance.ProviderPriceSyncService;
+import com.tokensea.governance.pricing.connector.AzureRetailPriceConnector;
+import com.tokensea.governance.pricing.connector.AwsPriceListConnector;
+import com.tokensea.governance.pricing.connector.GoogleCloudCatalogConnector;
+import com.tokensea.governance.pricing.connector.HttpDocumentConnector;
+import com.tokensea.governance.pricing.connector.LitellmReferenceConnector;
+import com.tokensea.governance.pricing.connector.ModelsDevReferenceConnector;
+import com.tokensea.governance.pricing.connector.PriceSourceConnectorRegistry;
+import com.tokensea.governance.pricing.extractor.ExtractionConfidenceCalculator;
+import com.tokensea.governance.pricing.extractor.PriceDocumentExtractionService;
+import com.tokensea.governance.pricing.extractor.PriceExtractionValidator;
+import com.tokensea.governance.pricing.reference.ReferencePriceBundleLoader;
+import com.tokensea.governance.pricing.reference.ReferencePriceHealthService;
 import org.flywaydb.core.Flyway;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.parallel.Execution;
+import org.junit.jupiter.api.parallel.ExecutionMode;
 
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.ResultSet;
+import java.math.BigDecimal;
 import java.sql.Statement;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
+
+import org.springframework.core.io.DefaultResourceLoader;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.jdbc.datasource.DriverManagerDataSource;
+
+import static org.mockito.Mockito.mock;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+@Execution(ExecutionMode.SAME_THREAD)
 class FlywayUpgradeIntegrationTests {
     private final List<String> databases = new ArrayList<>();
     private String host;
@@ -49,7 +77,7 @@ class FlywayUpgradeIntegrationTests {
         Flyway flyway = flyway(database, null);
         flyway.migrate();
         assertTrue(flyway.validateWithResult().validationSuccessful);
-        assertEquals("38", scalar(database, "select version from flyway_schema_history where success order by installed_rank desc limit 1"));
+        assertEquals("44", scalar(database, "select version from flyway_schema_history where success order by installed_rank desc limit 1"));
         assertEquals("1", scalar(database, "select count(*) from information_schema.tables where table_name='channel_model_deployment'"));
         assertEquals("1", scalar(database, "select count(*) from information_schema.tables where table_name='usage_cost_snapshot'"));
         assertEquals("1", scalar(database, "select count(*) from information_schema.tables where table_name='budget_rule_event'"));
@@ -97,6 +125,17 @@ class FlywayUpgradeIntegrationTests {
         assertEquals("3", scalar(database, "select count(*) from information_schema.tables where table_name in ('provider_billing_source','provider_billing_sync_run','provider_billing_record')"));
         assertEquals("4", scalar(database, "select count(*) from pg_constraint where conname in ('ck_provider_price_adapter','ck_provider_billing_adapter','ck_provider_billing_status','ck_provider_billing_run_status')"));
         assertEquals("2", scalar(database, "select count(*) from information_schema.columns where table_name='provider_reconciliation' and column_name in ('billing_source_id','billing_sync_run_id')"));
+        assertEquals("7", scalar(database, "select count(*) from information_schema.columns where table_name='provider_price_source' and column_name in ('connector_code','data_scope','trust_level','publish_policy','credential_ref','credential_purpose','mapping_profile')"));
+        assertEquals("7", scalar(database, "select count(*) from information_schema.columns where table_name='provider_price_source' and column_name in ('document_type','extraction_mode','minimum_confidence','require_manual_review','max_document_pages','max_document_bytes','llm_model')"));
+        assertEquals("3", scalar(database, "select count(*) from information_schema.tables where table_name in ('price_source_mapping_rule','price_source_unmapped_record','provider_billing_raw_snapshot')"));
+        assertEquals("3", scalar(database, "select count(*) from information_schema.tables where table_name in ('price_document_extraction_run','price_document_evidence','price_document_extracted_record')"));
+        assertEquals("2", scalar(database, "select count(*) from information_schema.columns where table_name='provider_price_diff' and column_name in ('extraction_run_id','evidence_id')"));
+        assertEquals("1", scalar(database, "select count(*) from information_schema.columns where table_name='provider_secret' and column_name='secret_purpose'"));
+        assertEquals("7", scalar(database, "select count(*) from information_schema.columns where table_name='provider_price_source' and column_name in ('managed_by','source_purpose','publish_target','bootstrap_version','stale_after_hours','last_checked_at','last_good_sync_at')"));
+        assertEquals("6", scalar(database, "select count(*) from information_schema.columns where table_name='public_model_price_reference' and column_name in ('bundle_version','source_rank','is_current','last_seen_at','stale_at','price_status')"));
+        assertEquals("1", scalar(database, "select count(*) from information_schema.views where table_name='v_current_public_model_price_reference'"));
+        assertEquals("2", scalar(database, "select count(*) from provider_price_source where id in ('builtin_litellm_cost_map','builtin_models_dev') and status='ACTIVE' and managed_by='SYSTEM' and source_purpose='REFERENCE' and publish_target='PUBLIC_REFERENCE_ONLY' and next_run_at is not null"));
+        assertEquals("1", scalar(database, "select count(*) from provider_price_source where id='builtin_reference_price_bundle' and status='ACTIVE' and managed_by='SYSTEM' and next_run_at is null"));
         execute(database, "insert into fx_rate(id,rate_month,from_currency,to_currency,rate,source_type,source_ref,source_date,status,version) values ('fx_test','2026-07-01','USD','CNY',7.2,'MANUAL','test://fx','2026-07-01','ACTIVE',1)");
         assertEquals("14.400000000000", scalar(database, "select tokensea_fx_amount(2,'USD','2026-07-15 12:00:00+00','CNY')"));
         assertEquals("2", scalar(database, "select tokensea_fx_amount(2,'CNY','2026-07-15 12:00:00+00','CNY')"));
@@ -104,6 +143,185 @@ class FlywayUpgradeIntegrationTests {
         assertEquals("0", scalar(database, "select count(*) from public_model_reference"));
         assertEquals("0", scalar(database, "select count(*) from provider where id='migration_quarantine_provider'"));
         assertEquals("0", scalar(database, "select count(*) from model where id='migration_quarantine_model'"));
+    }
+
+    @Test
+    void priceSourceControllerPersistsPhaseTwoConfiguration() throws Exception {
+        String database = createDatabase();
+        flyway(database, null).migrate();
+        DriverManagerDataSource dataSource = new DriverManagerDataSource(url(database), user, password);
+        JdbcTemplate jdbc = new JdbcTemplate(dataSource);
+        PriceSourceConnectorRegistry connectors = new PriceSourceConnectorRegistry(List.of(
+                new HttpDocumentConnector(), new AzureRetailPriceConnector(), new AwsPriceListConnector(),
+                new GoogleCloudCatalogConnector(), new LitellmReferenceConnector(), new ModelsDevReferenceConnector()));
+        ProviderPriceSyncController controller = new ProviderPriceSyncController(
+                jdbc, new ObjectMapper().findAndRegisterModules(), mock(ProviderPriceSyncService.class),
+                mock(AuditService.class), connectors);
+        ProviderPriceSyncController.PriceSourceRequest request = new ProviderPriceSyncController.PriceSourceRequest(
+                "Phase 2 Generic Document", "OFFICIAL", "GENERIC_DOCUMENT", "demo", null, null, "NONE",
+                "https://example.com/pricing.csv", List.of("example.com"), "global", "USD", "P1D", false,
+                new BigDecimal("0.2"), 1,
+                Map.of("recordsPath", "$.data[*]", "modelField", "model", "inputField", "input",
+                        "outputField", "output", "sourceBillingQuantity", 1_000_000),
+                "DRAFT", "2.0.0", "STRUCTURED_HTTP", 100, "ORIGINAL",
+                "HTTP_DOCUMENT", "DOCUMENT", "OFFICIAL_PUBLIC", "MANUAL_ONLY",
+                "price-record-v1", "NONE", "DEFAULT", "CSV", "DETERMINISTIC",
+                new BigDecimal("0.90000"), true, 80, 5_000_000, null);
+
+        Map<String,Object> created = controller.createSource(request, null).data();
+
+        String id = String.valueOf(created.get("id"));
+        assertEquals("CSV", scalar(database, "select document_type from provider_price_source where id='" + id + "'"));
+        assertEquals("DETERMINISTIC", scalar(database, "select extraction_mode from provider_price_source where id='" + id + "'"));
+        assertEquals("0.90000", scalar(database, "select minimum_confidence::text from provider_price_source where id='" + id + "'"));
+        assertEquals("true", scalar(database, "select require_manual_review::text from provider_price_source where id='" + id + "'"));
+        assertEquals("80", scalar(database, "select max_document_pages::text from provider_price_source where id='" + id + "'"));
+        assertEquals("5000000", scalar(database, "select max_document_bytes::text from provider_price_source where id='" + id + "'"));
+    }
+
+    @Test
+    void extractionReviewReadsPostgresJsonbAndReturnsAcceptedPrice() throws Exception {
+        String database = createDatabase();
+        flyway(database, null).migrate();
+        DriverManagerDataSource dataSource = new DriverManagerDataSource(url(database), user, password);
+        JdbcTemplate jdbc = new JdbcTemplate(dataSource);
+        ObjectMapper json = new ObjectMapper().findAndRegisterModules();
+        jdbc.update("""
+            insert into provider_price_source(
+              id,name,source_class,adapter_code,provider_type,auth_mode,endpoint,official_hosts,
+              default_currency,status,connector_code,data_scope,trust_level,publish_policy,
+              schema_version,credential_purpose,document_type,extraction_mode,require_manual_review)
+            values('source-review','Review Source','OFFICIAL','GENERIC_DOCUMENT','demo','NONE',
+              'https://example.com/pricing','[\"example.com\"]','USD','ACTIVE','HTTP_DOCUMENT',
+              'DOCUMENT','OFFICIAL_PUBLIC','MANUAL_ONLY','price-record-v1','NONE','JSON',
+              'DETERMINISTIC_LLM',true)
+            """);
+        jdbc.update("insert into provider_price_sync_run(id,price_source_id,status) values('sync-review','source-review','REVIEW_REQUIRED')");
+        jdbc.update("""
+            insert into provider_price_raw_snapshot(
+              id,price_source_id,sync_run_id,source_endpoint,final_endpoint,http_status,content_type,
+              checksum,response_bytes,raw_content,parser_version)
+            values('snapshot-review','source-review','sync-review','https://example.com/pricing',
+              'https://example.com/pricing',200,'application/json',repeat('a',64),100,'{}','2.0.0')
+            """);
+        jdbc.update("""
+            insert into price_document_extraction_run(
+              id,price_source_id,sync_run_id,raw_snapshot_id,document_type,extractor_code,
+              extraction_mode,status)
+            values('extract-review','source-review','sync-review','snapshot-review','JSON',
+              'GENERIC_DOCUMENT','DETERMINISTIC_LLM','REVIEW_REQUIRED')
+            """);
+        jdbc.update("""
+            insert into price_document_evidence(
+              id,extraction_run_id,record_key,page_number,row_index,source_text,source_hash)
+            values('evidence-review','extract-review','demo|demo-v1|global|standard|default|default',
+              1,1,'demo-v1 input 2 USD output 8 USD',repeat('b',64))
+            """);
+        Map<String,Object> normalized = new LinkedHashMap<>();
+        normalized.put("providerType", "demo");
+        normalized.put("providerModelName", "demo-v1");
+        normalized.put("displayName", "Demo V1");
+        normalized.put("currency", "USD");
+        normalized.put("billingBasis", "TOKEN");
+        normalized.put("billingQuantity", 1_000_000);
+        normalized.put("inputUnitPrice", new BigDecimal("2"));
+        normalized.put("outputUnitPrice", new BigDecimal("8"));
+        normalized.put("region", "global");
+        normalized.put("requestMode", "STANDARD");
+        normalized.put("serviceTier", "DEFAULT");
+        normalized.put("contextTier", "DEFAULT");
+        normalized.put("components", Map.of(
+                "INPUT_TOKEN", Map.of("unitPrice", new BigDecimal("2"), "unitBasis", "TOKEN", "unitQuantity", 1_000_000, "mode", "EXPLICIT"),
+                "OUTPUT_TOKEN", Map.of("unitPrice", new BigDecimal("8"), "unitBasis", "TOKEN", "unitQuantity", 1_000_000, "mode", "EXPLICIT")));
+        normalized.put("sourceRef", "https://example.com/pricing");
+        normalized.put("raw", Map.of());
+        jdbc.update("""
+            insert into price_document_extracted_record(
+              id,extraction_run_id,evidence_id,record_key,provider_type,provider_model_name,
+              normalized_record,extraction_method,confidence,validation_status,validation_result,review_status)
+            values('record-review','extract-review','evidence-review',
+              'demo|demo-v1|global|standard|default|default','demo','demo-v1',cast(? as jsonb),
+              'LLM_SCHEMA_MAPPING',0.95,'VALID','{}','PENDING')
+            """, json.writeValueAsString(normalized));
+        PriceDocumentExtractionService service = new PriceDocumentExtractionService(
+                jdbc, json, new PriceExtractionValidator(), new ExtractionConfidenceCalculator());
+
+        Map<String,Object> reviewed = service.reviewRecord(
+                "record-review", "ACCEPTED", Map.of(), "admin", "证据核对通过");
+        List<com.tokensea.governance.PriceSourceParser.NormalizedPrice> prices = service.acceptedPrices("extract-review");
+
+        assertEquals("ACCEPTED", reviewed.get("review_status"));
+        assertEquals(1, prices.size());
+        assertEquals("demo-v1", prices.getFirst().providerModelName());
+        assertEquals(new BigDecimal("2"), prices.getFirst().inputUnitPrice());
+    }
+
+    @Test
+    void bundledReferencePricesImportIdempotently() throws Exception {
+        String database = createDatabase();
+        flyway(database, null).migrate();
+        DriverManagerDataSource dataSource = new DriverManagerDataSource(url(database), user, password);
+        JdbcTemplate jdbc = new JdbcTemplate(dataSource);
+        ReferencePriceBundleLoader loader = new ReferencePriceBundleLoader(
+                jdbc,
+                new ObjectMapper().findAndRegisterModules(),
+                new DefaultResourceLoader(),
+                "classpath:reference-prices/reference-price-bootstrap.json",
+                720);
+
+        ReferencePriceBundleLoader.BundleLoadResult first = loader.load();
+        ReferencePriceBundleLoader.BundleLoadResult second = loader.load();
+
+        assertEquals("LOADED", first.status());
+        assertEquals(2, first.records());
+        assertEquals(2, first.changed());
+        assertEquals(0, second.changed());
+        assertEquals("2", scalar(database, "select count(*) from public_model_price_reference where price_source_id='builtin_reference_price_bundle'"));
+        assertEquals("2", scalar(database, "select count(*) from v_current_public_model_price_reference"));
+        assertEquals("2", scalar(database, "select count(*) from public_model_reference where source_type='BUNDLE_IMPORT'"));
+        assertEquals("0", scalar(database, "select count(*) from provider_price_diff where price_source_id='builtin_reference_price_bundle'"));
+        assertEquals("2026.07.29.1", scalar(database, "select bootstrap_version from provider_price_source where id='builtin_reference_price_bundle'"));
+        ReferencePriceHealthService health = new ReferencePriceHealthService(jdbc);
+        assertEquals(2L, health.overview().get("pricedModelCount"));
+        assertEquals(3, health.sources().size());
+        assertTrue(health.sources().get(0).containsKey("modelCount"));
+        var modelPage = health.models(1, 20, null, null, null, "updatedAt", "desc");
+        assertEquals(2L, modelPage.total());
+        assertTrue(modelPage.items().get(0).containsKey("providerType"));
+        assertTrue(modelPage.items().get(0).containsKey("inputUnitPrice"));
+
+        execute(database, """
+            insert into provider_price_sync_run(id,price_source_id,trigger_type,status,scheduled_for,started_at,completed_at)
+            values('online-reference-run','builtin_litellm_cost_map','SCHEDULED','SUCCEEDED',now(),now(),now());
+            insert into provider_price_raw_snapshot(
+              id,price_source_id,sync_run_id,source_endpoint,final_endpoint,http_status,content_type,
+              checksum,response_bytes,raw_content,parser_version)
+            values('online-reference-snapshot','builtin_litellm_cost_map','online-reference-run',
+              'https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json',
+              'https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json',
+              200,'application/json',repeat('c',64),2,'{}','1.0.0');
+            insert into public_model_price_reference(
+              id,price_source_id,raw_snapshot_id,sync_run_id,provider_type,provider_model_name,canonical_name,
+              display_name,currency,region,request_mode,service_tier,context_tier,input_unit_price,
+              output_unit_price,source_ref,evidence_hash,source_rank,is_current,last_seen_at,stale_at,price_status)
+            values('online-qwen-reference','builtin_litellm_cost_map','online-reference-snapshot',
+              'online-reference-run','qwen','qwen-plus','qwen/qwen-plus','Qwen Plus Online','CNY','cn',
+              'STANDARD','DEFAULT','DEFAULT',0.7,1.8,'https://reference.example/qwen-plus',repeat('d',64),
+              200,true,now(),now()+interval '7 days','CURRENT');
+            """);
+        assertEquals("builtin_litellm_cost_map", scalar(database, """
+            select price_source_id from v_current_public_model_price_reference
+            where provider_type='qwen' and provider_model_name='qwen-plus'
+            """));
+        execute(database, """
+            update public_model_price_reference set stale_at=now()-interval '1 minute'
+            where id='online-qwen-reference'
+            """);
+        health.refreshStaleStatus();
+        assertEquals("builtin_reference_price_bundle", scalar(database, """
+            select price_source_id from v_current_public_model_price_reference
+            where provider_type='qwen' and provider_model_name='qwen-plus'
+            """));
     }
 
     @Test
@@ -118,7 +336,7 @@ class FlywayUpgradeIntegrationTests {
         flyway.migrate();
         assertTrue(flyway.validateWithResult().validationSuccessful);
 
-        assertEquals("38", scalar(database, "select version from flyway_schema_history where success order by installed_rank desc limit 1"));
+        assertEquals("44", scalar(database, "select version from flyway_schema_history where success order by installed_rank desc limit 1"));
         assertTrue(Integer.parseInt(scalar(database, "select count(*) from migration_quarantine")) >= 4);
         assertTrue(Integer.parseInt(scalar(database, "select count(*) from audit_log where action='MIGRATION_QUARANTINE'")) >= 4);
         assertEquals("0", scalar(database, "select count(*) from provider_secret where num_nonnulls(provider_id,provider_instance_id)<>1"));

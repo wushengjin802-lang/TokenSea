@@ -7,6 +7,7 @@ import com.tokensea.governance.PriceSourceParser;
 import org.springframework.stereotype.Component;
 
 import java.math.BigDecimal;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
@@ -34,6 +35,7 @@ public class GoogleCloudCatalogPriceAdapter implements PriceSourceAdapter {
             if (!skus.isArray()) throw new IllegalArgumentException("Google Cloud Billing Catalog 响应缺少 skus 数组");
 
             Map<String,CatalogPriceAdapterSupport.Group> groups = new LinkedHashMap<>();
+            List<Map<String,Object>> unmapped = new ArrayList<>();
             int skipped = 0;
             for (JsonNode sku : skus) {
                 String evidence = String.join(" ",
@@ -46,35 +48,59 @@ public class GoogleCloudCatalogPriceAdapter implements PriceSourceAdapter {
                     skipped++;
                     continue;
                 }
-                String model = CatalogPriceAdapterSupport.model(evidence, context.config());
-                CatalogPriceAdapterSupport.ChargeType charge = CatalogPriceAdapterSupport.chargeType(evidence, context.config());
                 JsonNode pricingInfo = latestPricingInfo(sku.path("pricingInfo"));
                 JsonNode expression = pricingInfo == null ? null : pricingInfo.path("pricingExpression");
                 JsonNode tier = firstTier(expression == null ? null : expression.path("tieredRates"));
                 BigDecimal unitPrice = tier == null ? null : CatalogPriceAdapterSupport.decimal(tier.get("unitPrice"));
-                if (model.isBlank() || charge == CatalogPriceAdapterSupport.ChargeType.UNKNOWN || unitPrice == null) {
-                    skipped++;
-                    continue;
-                }
                 String unit = expression == null ? "" : String.join(" ",
                         CatalogPriceAdapterSupport.text(expression, "usageUnit"),
                         CatalogPriceAdapterSupport.text(expression, "usageUnitDescription"),
                         CatalogPriceAdapterSupport.text(expression, "baseUnit"));
-                BigDecimal normalized = charge == CatalogPriceAdapterSupport.ChargeType.REQUEST
-                        ? unitPrice
-                        : CatalogPriceAdapterSupport.perMillion(unitPrice, unit, context.config());
                 String currency = CatalogPriceAdapterSupport.value(
                         CatalogPriceAdapterSupport.text(pricingInfo, "currencyConversionRate.currencyCode"),
                         context.defaultCurrency());
                 String region = firstRegion(sku.path("serviceRegions"), context.region());
-                String requestMode = mode(evidence, context);
-                String key = String.join("|", model.toLowerCase(Locale.ROOT), region.toLowerCase(Locale.ROOT),
-                        currency.toUpperCase(Locale.ROOT), requestMode);
+                Map<String,Object> raw = json.convertValue(sku, new TypeReference<>() {});
+                String service = CatalogPriceAdapterSupport.text(sku, "category.serviceDisplayName");
+                String product = CatalogPriceAdapterSupport.text(sku, "description");
+                String externalSku = CatalogPriceAdapterSupport.text(sku, "skuId", "name");
+                String meter = CatalogPriceAdapterSupport.text(sku, "category.resourceGroup", "category.usageType");
+                CatalogPriceAdapterSupport.ExternalRecord external = new CatalogPriceAdapterSupport.ExternalRecord(
+                        externalSku, service, product, externalSku, meter, product, region, currency, unit, unitPrice, raw);
+                CatalogPriceAdapterSupport.MappingDecision mapping = CatalogPriceAdapterSupport.mapping(external, context.config());
+                String model = mapping == null
+                        ? CatalogPriceAdapterSupport.model(evidence, context.config()) : mapping.model();
+                CatalogPriceAdapterSupport.ChargeType charge = CatalogPriceAdapterSupport.chargeType(evidence, context.config());
+                String component = mapping == null ? charge.componentType() : mapping.componentType();
+                if (model.isBlank() || component.isBlank() || "UNKNOWN".equals(component) || unitPrice == null) {
+                    skipped++;
+                    if (unmapped.size() < 200) {
+                        String reason = unitPrice == null ? "PRICE_MISSING"
+                                : model.isBlank() ? "MODEL_NOT_MAPPED" : "COMPONENT_NOT_MAPPED";
+                        unmapped.add(CatalogPriceAdapterSupport.unmapped(external, reason,
+                                "Google Cloud SKU 未匹配到完整的模型与计费组件"));
+                    }
+                    continue;
+                }
+                String requestMode = mapping == null ? mode(evidence, context) : mapping.requestMode();
+                String serviceTier = mapping == null ? "DEFAULT" : mapping.serviceTier();
+                String contextTier = mapping == null ? "DEFAULT" : mapping.contextTier();
+                String targetRegion = mapping == null ? region : CatalogPriceAdapterSupport.value(mapping.region(), region);
+                String basis = mapping == null
+                        ? "REQUEST".equals(component) ? "REQUEST" : "TOKEN" : mapping.billingBasis();
+                long quantity = mapping == null
+                        ? "REQUEST".equals(component) ? 1L : CatalogPriceAdapterSupport.billingQuantity(unit, context.config())
+                        : mapping.billingQuantity();
+                BigDecimal normalized = CatalogPriceAdapterSupport.normalizedAmount(
+                        unitPrice, basis, quantity, unit, context.config());
+                String key = String.join("|", model.toLowerCase(Locale.ROOT), targetRegion.toLowerCase(Locale.ROOT),
+                        currency.toUpperCase(Locale.ROOT), requestMode, serviceTier, contextTier);
                 CatalogPriceAdapterSupport.Group group = groups.computeIfAbsent(key, ignored ->
-                        new CatalogPriceAdapterSupport.Group(model, model, currency, region, requestMode,
-                                new LinkedHashMap<>(), new LinkedHashMap<>()));
-                group.prices().put(charge.componentType(), normalized);
-                group.raw().put(charge.componentType(), json.convertValue(sku, new TypeReference<>() {}));
+                        new CatalogPriceAdapterSupport.Group(model, model, currency, targetRegion, requestMode,
+                                serviceTier, contextTier, new LinkedHashMap<>(), new LinkedHashMap<>()));
+                group.prices().put(component, normalized);
+                if (mapping != null) raw.put("mappingRuleId", mapping.ruleId());
+                group.raw().put(component, raw);
             }
 
             List<PriceSourceParser.NormalizedPrice> prices = CatalogPriceAdapterSupport.buildGrouped(
@@ -84,6 +110,10 @@ public class GoogleCloudCatalogPriceAdapter implements PriceSourceAdapter {
             sourceEvidence.put("recordCount", skus.size());
             sourceEvidence.put("skippedRecordCount", skipped);
             sourceEvidence.put("generatedPriceCount", prices.size());
+            sourceEvidence.put("unmappedRecordCount", unmapped.size());
+            sourceEvidence.put("mappingCoverageRatio", skus.isEmpty() ? 0D
+                    : (double) Math.max(0, skus.size() - unmapped.size()) / skus.size());
+            sourceEvidence.put("unmappedRecords", unmapped);
             sourceEvidence.put("paginationPages", root.path("_tokenseaPageCount").asInt(1));
             sourceEvidence.put("adapter", ADAPTER_CODE);
             List<String> warnings = prices.isEmpty()

@@ -31,7 +31,7 @@ class Phase4CContractTests {
         when(jdbc.queryForList(startsWith("select * from approval_request"),eq("approval"))).thenReturn(List.of(new HashMap<>(Map.of("id","approval","status","PENDING","resource_type","BUDGET_RULE","resource_id","rule"))));
         when(jdbc.queryForMap(startsWith("select * from approval_request"),eq("approval"))).thenReturn(new HashMap<>(Map.of("id","approval","status","REJECTED")));
         controller.reject("approval",new GovernanceController.ApprovalDecisionRequest("额度依据不足"),null);
-        verify(jdbc).update(contains("budget_rule set approval_status='REJECTED'"),eq("rule"));
+        verify(jdbc).update(contains("budget_rule set approval_status=?"),eq("REJECTED"),eq("rule"));
     }
 
     @Test void reconciliationRequiresCompleteBillClassificationInputs(){

@@ -37,9 +37,25 @@ public class ModelDeploymentGovernanceController {
               (select v.status from capability_validation v where v.deployment_id=d.id and v.test_type='LIVE_PROBE'
                order by v.validated_at desc limit 1) latest_probe_status,
               (select v.validated_at from capability_validation v where v.deployment_id=d.id and v.test_type='LIVE_PROBE'
-               order by v.validated_at desc limit 1) latest_probe_at
+               order by v.validated_at desc limit 1) latest_probe_at,
+              case rp.match_type
+                when 'OFFICIAL_EXACT' then 'OFFICIAL_REFERENCE'
+                when 'VENDOR_EXACT' then 'VENDOR_REFERENCE'
+                when 'AGGREGATOR_EXACT' then 'AGGREGATOR_REFERENCE'
+                when 'BUNDLED_EXACT' then 'BUNDLED_REFERENCE'
+                else 'MISSING_REFERENCE'
+              end reference_price_status,
+              rp.match_type reference_match_type,rp.match_confidence reference_match_confidence,
+              rp.match_reason reference_match_reason,rp.origin_provider_type reference_origin_provider_type,
+              rp.source_provider_type reference_source_provider_type,rp.source_region reference_source_region,
+              rp.price_source_id reference_price_source_id,rp.source_name reference_price_source_name,
+              rp.currency reference_currency,rp.input_unit_price reference_input_unit_price,
+              rp.output_unit_price reference_output_unit_price,rp.billing_quantity reference_billing_quantity,
+              rp.region reference_region,rp.observed_at reference_observed_at
             from channel_model_deployment d
-            join provider_instance p on p.id=d.provider_instance_id where 1=1
+            join provider_instance p on p.id=d.provider_instance_id
+            left join v_effective_deployment_reference_price rp on rp.deployment_id=d.id
+            where 1=1
             """);
         java.util.ArrayList<Object> args = new java.util.ArrayList<>();
         if (providerInstanceId != null && !providerInstanceId.isBlank()) {
@@ -70,6 +86,36 @@ public class ModelDeploymentGovernanceController {
             """, deployment.get("provider_instance_id"), deployment.get("provider_model_name"),
                 deployment.get("provider_model_name")));
         return ApiResponse.ok(deployment);
+    }
+
+    @GetMapping("/{id}/reference-price")
+    public ApiResponse<Map<String,Object>> referencePrice(@PathVariable("id") String id) {
+        Map<String,Object> deployment = lifecycle.deployment(id);
+        List<Map<String,Object>> rows = jdbc.queryForList("""
+            select * from v_effective_deployment_reference_price
+            where deployment_id=?
+            limit 1
+            """, id);
+        if (rows.isEmpty()) {
+            String providerType = jdbc.queryForObject(
+                    "select provider_type from provider_instance where id=?",
+                    String.class, deployment.get("provider_instance_id"));
+            return ApiResponse.ok(Map.of(
+                    "referencePriceStatus", "MISSING_REFERENCE",
+                    "providerType", providerType,
+                    "providerModelName", deployment.get("provider_model_name"),
+                    "message", "公共参考库暂无精确匹配价格；该状态不影响模型生产准入和调用"
+            ));
+        }
+        Map<String,Object> result = new java.util.LinkedHashMap<>(rows.getFirst());
+        result.put("referencePriceStatus", switch (String.valueOf(result.get("match_type"))) {
+            case "OFFICIAL_EXACT" -> "OFFICIAL_REFERENCE";
+            case "VENDOR_EXACT" -> "VENDOR_REFERENCE";
+            case "AGGREGATOR_EXACT" -> "AGGREGATOR_REFERENCE";
+            case "BUNDLED_EXACT" -> "BUNDLED_REFERENCE";
+            default -> "MISSING_REFERENCE";
+        });
+        return ApiResponse.ok(result);
     }
 
     @GetMapping("/{id}/effective-cost-price")

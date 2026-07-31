@@ -103,11 +103,10 @@ public class ModelLifecycleService {
         Map<String,Object> before = deployment(deploymentId);
         String discovery = text(before.get("discovery_status"));
         int streak = integer(before.get("missing_streak"));
-        String priceStatus = text(before.get("price_status"));
         String productionStatus = text(before.get("production_status"));
         if (passed) {
             if ("RECOVERED".equals(discovery)) {
-                String nextProduction = hasFormalPrice(priceStatus) ? "READY_FOR_REVIEW" : "CANDIDATE";
+                String nextProduction = "READY_FOR_REVIEW";
                 jdbc.update("""
                     update channel_model_deployment set health_status='HEALTHY',last_probe_at=now(),
                       last_probe_status='PASSED',review_status='PENDING_REVIEW',routing_status='INELIGIBLE',
@@ -120,7 +119,7 @@ public class ModelLifecycleService {
                     """, deploymentId);
                 ensureDirectoryAnomalyAlert(deploymentId, before);
             } else {
-                String nextProduction = hasFormalPrice(priceStatus) ? "READY_FOR_REVIEW" : "CANDIDATE";
+                String nextProduction = "READY_FOR_REVIEW";
                 if ("APPROVED".equals(productionStatus)) nextProduction = "APPROVED";
                 jdbc.update("""
                     update channel_model_deployment set health_status='HEALTHY',last_probe_at=now(),
@@ -166,13 +165,8 @@ public class ModelLifecycleService {
         Map<String,Object> before = deployment(deploymentId);
         String status = Set.of("MISSING","MATCHED_OFFICIAL","MATCHED_CHANNEL","MATCHED_CONTRACT","CONFLICT")
                 .contains(requestedStatus) ? requestedStatus : "MISSING";
-        String production = text(before.get("production_status"));
-        if (!"APPROVED".equals(production) && !"SUSPENDED".equals(production)) {
-            production = "HEALTHY".equals(text(before.get("health_status"))) && hasFormalPrice(status)
-                    ? "READY_FOR_REVIEW" : "CANDIDATE";
-        }
-        jdbc.update("update channel_model_deployment set price_status=?,production_status=?,updated_at=now() where id=?",
-                status, production, deploymentId);
+        jdbc.update("update channel_model_deployment set price_status=?,updated_at=now() where id=?",
+                status, deploymentId);
         if (!status.equals(text(before.get("price_status")))) {
             auditChange("MODEL_DEPLOYMENT_PRICE_STATUS_CHANGED", deploymentId, before,
                     Map.of("priceStatus", status));
@@ -236,16 +230,7 @@ public class ModelLifecycleService {
         if (!"HEALTHY".equals(text(deployment.get("health_status")))) {
             notReady("模型真实能力探测尚未通过");
         }
-        if (!hasFormalPrice(text(deployment.get("price_status")))) {
-            notReady("模型缺少正式有效成本价格");
-        }
         String deploymentId = text(deployment.get("id"));
-        Integer formalPrice = jdbc.queryForObject("""
-            select count(*) from price_version where deployment_id=?
-              and price_layer in ('CONTRACT_PRICE','CHANNEL_ACTUAL','PROVIDER_OFFICIAL')
-              and status='ACTIVE' and effective_from<=now() and (effective_to is null or effective_to>now())
-            """, Integer.class, deploymentId);
-        if (formalPrice == null || formalPrice == 0) notReady("模型价格状态与有效价格版本不一致");
         List<String> statuses = jdbc.queryForList("""
             select status from capability_validation where deployment_id=? and test_type='LIVE_PROBE'
             order by validated_at desc limit 1
@@ -346,10 +331,6 @@ public class ModelLifecycleService {
         }
     }
 
-    private static boolean hasFormalPrice(String status) {
-        return Set.of("MATCHED_OFFICIAL","MATCHED_CHANNEL","MATCHED_CONTRACT").contains(status);
-    }
-
     private static int integer(Object value) {
         if (value instanceof Number number) return number.intValue();
         try { return value == null ? 0 : Integer.parseInt(String.valueOf(value)); }
@@ -361,6 +342,6 @@ public class ModelLifecycleService {
     private static String id() { return UUID.randomUUID().toString().replace("-", ""); }
     private static void notReady(String problem) {
         throw OperationException.conflict("MODEL_PRODUCTION_NOT_READY", "模型部署 / 生产确认",
-                problem, "完成真实能力探测、正式价格匹配和渠道检查后，再由管理员确认进入生产");
+                problem, "完成真实能力探测并确认供应商渠道已启用后，再由管理员确认进入生产");
     }
 }

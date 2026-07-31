@@ -59,9 +59,11 @@ public class RoutePolicyController {
     }
     @PutMapping("/{id}") @Transactional
     public ApiResponse<RoutePolicy> update(@PathVariable String id, @RequestBody RouteRequest request) {
-        validate(request, false); RoutePolicy value=require(id), before=require(id);
-        if (!"DRAFT".equals(value.getStatus())) throw new ResponseStatusException(HttpStatus.CONFLICT, "仅草稿路由可修改");
-        apply(value, request); mapper.updateById(value); audit("ROUTE_UPDATE", value, before); return ApiResponse.ok(value);
+        RoutePolicy value=require(id), before=require(id);
+        boolean active = "ACTIVE".equals(value.getStatus());
+        if (!"DRAFT".equals(value.getStatus()) && !active) throw new ResponseStatusException(HttpStatus.CONFLICT, "仅草稿或生效路由可修改");
+        validate(request, active);
+        apply(value, request); mapper.updateById(value); syncBoundModelRouteName(value); audit("ROUTE_UPDATE", value, before); return ApiResponse.ok(value);
     }
     @PostMapping("/{id}/activate") @Transactional
     public ApiResponse<RoutePolicy> activate(@PathVariable String id, Authentication authentication) {
@@ -87,7 +89,7 @@ public class RoutePolicyController {
                     "ROUTE_ACTIVATION_VALIDATION_FAILED",
                     "路由策略 / 校验并生效",
                     exception.getReason() == null ? "路由生效校验未通过" : exception.getReason(),
-                    "检查企业服务模型映射、候选部署的能力验证结果和生效价格版本，修正后再次点击“校验并生效”");
+                    "检查企业服务模型映射、候选部署的能力验证结果和生产准入状态，修正后再次点击“校验并生效”");
         }
         value.setStatus("ACTIVE");
         mapper.updateById(value);
@@ -129,7 +131,7 @@ public class RoutePolicyController {
                     "ROUTE_CONFIG_INVALID",
                     "路由策略 / 校验并生效 / 路由配置",
                     "路由候选配置不是有效 JSON",
-                    "编辑路由策略并重新保存候选渠道、实际模型和价格版本");
+                    "编辑路由策略并重新保存候选渠道和实际模型");
         }
         Object raw = config.get("candidates");
         if (!(raw instanceof List<?> candidates) || candidates.isEmpty()) return;
@@ -164,23 +166,20 @@ public class RoutePolicyController {
             PlatformModel model=models.selectOne(new com.baomidou.mybatisplus.core.conditions.query.QueryWrapper<PlatformModel>()
                     .eq("platform_model_name",r.modelAlias()).last("limit 1"));
             if(model==null) throw new ResponseStatusException(HttpStatus.CONFLICT,"路由关联的服务模型不存在");
-            Set<String> allowed=mappings(model);
-            if(!allowed.containsAll(pairs)) throw new ResponseStatusException(HttpStatus.CONFLICT,"路由候选不属于服务模型映射");
             RoutePolicy pending=new RoutePolicy();apply(pending,r);pending.setStatus("DRAFT");candidateValidator.validate(model,pending,false);
         }
-    }
-    private Set<String> mappings(PlatformModel model){
-        try{
-            List<String> providers=json.readValue(model.getProviderInstanceIds(),new TypeReference<>(){});
-            List<String> actual=json.readValue(model.getActualModels(),new TypeReference<>(){});
-            Set<String> result=new HashSet<>();
-            for(int i=0;i<actual.size();i++) result.add((providers.size()==1?providers.get(0):providers.get(i))+"\u0000"+actual.get(i));
-            return result;
-        }catch(Exception e){throw new ResponseStatusException(HttpStatus.CONFLICT,"服务模型映射无效");}
     }
     private static void bounded(Object raw,int min,int max,String field){
         if(raw==null)return; try{int value=Integer.parseInt(String.valueOf(raw));if(value<min||value>max)throw new Exception();}
         catch(Exception e){throw new ResponseStatusException(HttpStatus.BAD_REQUEST,field+" 超出允许范围");}
+    }
+    private void syncBoundModelRouteName(RoutePolicy route) {
+        models.selectList(new com.baomidou.mybatisplus.core.conditions.query.QueryWrapper<PlatformModel>()
+                .eq("route_policy_id", route.getId()))
+                .forEach(model -> {
+                    model.setRoutePolicy(route.getName());
+                    models.updateById(model);
+                });
     }
     private void apply(RoutePolicy v,RouteRequest r){v.setName(r.name());v.setModelAlias(r.modelAlias());v.setStrategy(r.strategy());v.setFallbackEnabled(Boolean.TRUE.equals(r.fallbackEnabled()));v.setConfig(r.config());}
     private RoutePolicy require(String id){RoutePolicy v=mapper.selectById(id);if(v==null)throw new ResponseStatusException(HttpStatus.NOT_FOUND,"路由策略不存在");return v;}

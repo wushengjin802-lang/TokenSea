@@ -7,6 +7,7 @@ import com.tokensea.governance.PriceSourceParser;
 import org.springframework.stereotype.Component;
 
 import java.math.BigDecimal;
+import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -38,6 +39,7 @@ public class AwsPriceListBulkAdapter implements PriceSourceAdapter {
             }
 
             Map<String,CatalogPriceAdapterSupport.Group> groups = new LinkedHashMap<>();
+            List<Map<String,Object>> unmapped = new ArrayList<>();
             int dimensions = 0;
             int skipped = 0;
             Iterator<Map.Entry<String,JsonNode>> productFields = products.fields();
@@ -74,35 +76,57 @@ public class AwsPriceListBulkAdapter implements PriceSourceAdapter {
                         dimensions++;
                         String description = CatalogPriceAdapterSupport.text(dimension, "description");
                         String evidence = productEvidence + " " + description;
-                        String model = CatalogPriceAdapterSupport.model(evidence, context.config());
-                        CatalogPriceAdapterSupport.ChargeType charge = CatalogPriceAdapterSupport.chargeType(evidence, context.config());
                         String currency = CatalogPriceAdapterSupport.value(context.defaultCurrency(), "USD").toUpperCase(Locale.ROOT);
                         BigDecimal amount = CatalogPriceAdapterSupport.decimal(dimension.path("pricePerUnit").get(currency));
                         if (amount == null && dimension.path("pricePerUnit").isObject()) {
                             Iterator<JsonNode> prices = dimension.path("pricePerUnit").elements();
                             amount = prices.hasNext() ? CatalogPriceAdapterSupport.decimal(prices.next()) : null;
                         }
-                        if (model.isBlank() || charge == CatalogPriceAdapterSupport.ChargeType.UNKNOWN || amount == null) {
-                            skipped++;
-                            continue;
-                        }
                         String unit = CatalogPriceAdapterSupport.text(dimension, "unit");
-                        BigDecimal normalized = charge == CatalogPriceAdapterSupport.ChargeType.REQUEST
-                                ? amount
-                                : CatalogPriceAdapterSupport.perMillion(amount, unit, context.config());
                         String region = CatalogPriceAdapterSupport.value(
                                 CatalogPriceAdapterSupport.text(attributes, "regionCode", "location"), context.region());
-                        String requestMode = mode(evidence, context);
-                        String key = String.join("|", model.toLowerCase(Locale.ROOT), region.toLowerCase(Locale.ROOT),
-                                currency, requestMode);
-                        CatalogPriceAdapterSupport.Group group = groups.computeIfAbsent(key, ignored ->
-                                new CatalogPriceAdapterSupport.Group(model, model, currency, region, requestMode,
-                                        new LinkedHashMap<>(), new LinkedHashMap<>()));
-                        group.prices().put(charge.componentType(), normalized);
                         Map<String,Object> raw = new LinkedHashMap<>();
                         raw.put("product", json.convertValue(product, new TypeReference<Map<String,Object>>() {}));
                         raw.put("dimension", json.convertValue(dimension, new TypeReference<Map<String,Object>>() {}));
-                        group.raw().put(charge.componentType(), raw);
+                        String externalModel = CatalogPriceAdapterSupport.text(attributes, "model", "modelId");
+                        CatalogPriceAdapterSupport.ExternalRecord external = new CatalogPriceAdapterSupport.ExternalRecord(
+                                sku + ":" + CatalogPriceAdapterSupport.text(dimension, "rateCode"),
+                                "AmazonBedrock", CatalogPriceAdapterSupport.text(product, "productFamily"), sku,
+                                description, externalModel, region, currency, unit, amount, raw);
+                        CatalogPriceAdapterSupport.MappingDecision mapping = CatalogPriceAdapterSupport.mapping(external, context.config());
+                        String model = mapping == null
+                                ? CatalogPriceAdapterSupport.model(evidence, context.config()) : mapping.model();
+                        CatalogPriceAdapterSupport.ChargeType charge = CatalogPriceAdapterSupport.chargeType(evidence, context.config());
+                        String component = mapping == null ? charge.componentType() : mapping.componentType();
+                        if (model.isBlank() || component.isBlank() || "UNKNOWN".equals(component) || amount == null) {
+                            skipped++;
+                            if (unmapped.size() < 200) {
+                                String reason = amount == null ? "PRICE_MISSING"
+                                        : model.isBlank() ? "MODEL_NOT_MAPPED" : "COMPONENT_NOT_MAPPED";
+                                unmapped.add(CatalogPriceAdapterSupport.unmapped(external, reason,
+                                        "AWS Price List 计费维度未匹配到完整的模型与计费组件"));
+                            }
+                            continue;
+                        }
+                        String requestMode = mapping == null ? mode(evidence, context) : mapping.requestMode();
+                        String serviceTier = mapping == null ? "DEFAULT" : mapping.serviceTier();
+                        String contextTier = mapping == null ? "DEFAULT" : mapping.contextTier();
+                        String targetRegion = mapping == null ? region : CatalogPriceAdapterSupport.value(mapping.region(), region);
+                        String basis = mapping == null
+                                ? "REQUEST".equals(component) ? "REQUEST" : "TOKEN" : mapping.billingBasis();
+                        long quantity = mapping == null
+                                ? "REQUEST".equals(component) ? 1L : CatalogPriceAdapterSupport.billingQuantity(unit, context.config())
+                                : mapping.billingQuantity();
+                        BigDecimal normalized = CatalogPriceAdapterSupport.normalizedAmount(
+                                amount, basis, quantity, unit, context.config());
+                        String key = String.join("|", model.toLowerCase(Locale.ROOT), targetRegion.toLowerCase(Locale.ROOT),
+                                currency, requestMode, serviceTier, contextTier);
+                        CatalogPriceAdapterSupport.Group group = groups.computeIfAbsent(key, ignored ->
+                                new CatalogPriceAdapterSupport.Group(model, model, currency, targetRegion, requestMode,
+                                        serviceTier, contextTier, new LinkedHashMap<>(), new LinkedHashMap<>()));
+                        group.prices().put(component, normalized);
+                        if (mapping != null) raw.put("mappingRuleId", mapping.ruleId());
+                        group.raw().put(component, raw);
                     }
                 }
             }
@@ -115,6 +139,10 @@ public class AwsPriceListBulkAdapter implements PriceSourceAdapter {
             evidence.put("priceDimensionCount", dimensions);
             evidence.put("skippedRecordCount", skipped);
             evidence.put("generatedPriceCount", prices.size());
+            evidence.put("unmappedRecordCount", unmapped.size());
+            evidence.put("mappingCoverageRatio", dimensions == 0 ? 0D
+                    : (double) Math.max(0, dimensions - unmapped.size()) / dimensions);
+            evidence.put("unmappedRecords", unmapped);
             evidence.put("adapter", ADAPTER_CODE);
             List<String> warnings = prices.isEmpty()
                     ? List.of("AWS Price List 文件已读取，但未匹配出模型价格；请配置 includePattern、modelPattern 及输入/输出计费项规则")

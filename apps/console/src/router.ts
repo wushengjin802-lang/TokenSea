@@ -15,6 +15,8 @@ import FxRates from './pages/FxRates.vue'
 import TenantWorkspace from './pages/TenantWorkspace.vue'
 import AccessControl from './pages/AccessControl.vue'
 import Alerts from './pages/Alerts.vue'
+import PriceExtractionReview from './pages/PriceExtractionReview.vue'
+import ReferencePriceOverview from './pages/ReferencePriceOverview.vue'
 import NotFound from './pages/NotAvailable.vue'
 import { identity, isAdmin } from './api/client'
 import { resources, resourceRoutes } from './config/resources'
@@ -30,6 +32,8 @@ const routes=[
     {path:'',component:Landing},
     {path:'dashboard',component:Dashboard,meta:admin},
     {path:'alerts',component:Alerts,meta:admin},
+    {path:'price-document-extractions',component:PriceExtractionReview,meta:admin},
+    {path:'reference-prices',component:ReferencePriceOverview,meta:admin},
     {path:'workspace',component:TenantWorkspace},
     {path:'accounts',component:AccessControl,props:{mode:'users'},meta:admin},
     {path:'roles',component:AccessControl,props:{mode:'roles'},meta:admin},

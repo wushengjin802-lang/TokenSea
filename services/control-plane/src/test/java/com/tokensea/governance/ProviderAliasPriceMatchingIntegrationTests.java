@@ -84,8 +84,20 @@ class ProviderAliasPriceMatchingIntegrationTests {
             insert into channel_model_deployment(id,provider_instance_id,provider_model_name,raw_model,source_snapshot_id)
             values('missing-price-deployment','alias-channel','unpriced-model','{}','alias-snapshot')
             """);
+        jdbc.update("""
+            update channel_model_deployment
+            set health_status='HEALTHY',review_status='APPROVED',production_status='APPROVED',routing_status='ELIGIBLE'
+            where id='missing-price-deployment'
+            """);
         new TransactionTemplate(new DataSourceTransactionManager(jdbc.getDataSource()))
                 .executeWithoutResult(status -> service.autoFill(instance, "missing-price-deployment", "unpriced-model"));
+
+        assertThat(jdbc.queryForObject("select price_status from channel_model_deployment where id='missing-price-deployment'",
+                String.class)).isEqualTo("MISSING");
+        assertThat(jdbc.queryForObject("select production_status from channel_model_deployment where id='missing-price-deployment'",
+                String.class)).isEqualTo("APPROVED");
+        assertThat(jdbc.queryForObject("select routing_status from channel_model_deployment where id='missing-price-deployment'",
+                String.class)).isEqualTo("ELIGIBLE");
 
         assertThat(jdbc.queryForObject("""
             select count(*) from alert_event where alert_type='PROVIDER_PRICE_COVERAGE_GAP'

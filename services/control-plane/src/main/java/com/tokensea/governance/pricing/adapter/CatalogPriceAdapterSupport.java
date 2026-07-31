@@ -24,6 +24,29 @@ final class CatalogPriceAdapterSupport {
 
     private CatalogPriceAdapterSupport() {}
 
+    record ExternalRecord(String recordId,
+                          String service,
+                          String product,
+                          String sku,
+                          String meter,
+                          String model,
+                          String region,
+                          String currency,
+                          String unit,
+                          BigDecimal price,
+                          Map<String,Object> rawPayload) {}
+
+    record MappingDecision(String ruleId,
+                           String providerType,
+                           String model,
+                           String componentType,
+                           String requestMode,
+                           String serviceTier,
+                           String contextTier,
+                           String region,
+                           String billingBasis,
+                           long billingQuantity) {}
+
     enum ChargeType {
         INPUT_TOKEN("INPUT_TOKEN"),
         OUTPUT_TOKEN("OUTPUT_TOKEN"),
@@ -146,6 +169,93 @@ final class CatalogPriceAdapterSupport {
         return exclude.isBlank() || !Pattern.compile(exclude, Pattern.CASE_INSENSITIVE).matcher(evidence).find();
     }
 
+    static MappingDecision mapping(ExternalRecord record, Map<String,Object> config) {
+        Object rawRules = config == null ? null : config.get("mappingRules");
+        if (!(rawRules instanceof Collection<?> rules)) return null;
+        for (Object item : rules) {
+            Map<String,Object> rule = object(item);
+            if (!ruleMatches(rule, record)) continue;
+            String model = Objects.toString(rule.get("targetModelName"), "").trim();
+            String component = Objects.toString(rule.get("targetComponentType"), "").trim().toUpperCase(Locale.ROOT);
+            if (model.isBlank() || component.isBlank()) continue;
+            long quantity = longValue(rule.get("billingQuantity"),
+                    "REQUEST".equals(component) ? 1L : MILLION_TOKENS);
+            return new MappingDecision(
+                    Objects.toString(rule.get("id"), ""),
+                    nullable(rule.get("targetProviderType")),
+                    model,
+                    component,
+                    value(nullable(rule.get("targetRequestMode")), "STANDARD"),
+                    value(nullable(rule.get("targetServiceTier")), "DEFAULT"),
+                    value(nullable(rule.get("targetContextTier")), "DEFAULT"),
+                    value(nullable(rule.get("targetRegion")), record.region()),
+                    value(nullable(rule.get("billingBasis")), "TOKEN"),
+                    Math.max(1L, quantity));
+        }
+        return null;
+    }
+
+    static Map<String,Object> unmapped(ExternalRecord record, String reasonCode, String reasonMessage) {
+        Map<String,Object> value = new LinkedHashMap<>();
+        value.put("externalRecordId", record.recordId());
+        value.put("externalService", record.service());
+        value.put("externalProduct", record.product());
+        value.put("externalSku", record.sku());
+        value.put("externalMeter", record.meter());
+        value.put("externalModel", record.model());
+        value.put("externalRegion", record.region());
+        value.put("externalCurrency", record.currency());
+        value.put("externalUnit", record.unit());
+        value.put("externalPrice", record.price());
+        value.put("reasonCode", reasonCode);
+        value.put("reasonMessage", reasonMessage);
+        value.put("rawPayload", record.rawPayload() == null ? Map.of() : record.rawPayload());
+        return value;
+    }
+
+    static BigDecimal normalizedAmount(BigDecimal price, String basis, long billingQuantity,
+                                       String unitText, Map<String,Object> config) {
+        if (price == null) return null;
+        if (!"TOKEN".equalsIgnoreCase(value(basis, "TOKEN"))) return price;
+        if (billingQuantity > 0) {
+            return price.multiply(BigDecimal.valueOf(MILLION_TOKENS))
+                    .divide(BigDecimal.valueOf(billingQuantity), 12, RoundingMode.HALF_UP)
+                    .stripTrailingZeros();
+        }
+        return perMillion(price, unitText, config);
+    }
+
+    private static boolean ruleMatches(Map<String,Object> rule, ExternalRecord record) {
+        return patternMatches(rule.get("externalServicePattern"), record.service())
+                && patternMatches(rule.get("externalProductPattern"), record.product())
+                && patternMatches(rule.get("externalSkuPattern"), record.sku())
+                && patternMatches(rule.get("externalMeterPattern"), record.meter())
+                && patternMatches(rule.get("externalModelPattern"), record.model());
+    }
+
+    private static boolean patternMatches(Object expression, String value) {
+        String pattern = Objects.toString(expression, "").trim();
+        if (pattern.isBlank()) return true;
+        try {
+            return Pattern.compile(pattern, Pattern.CASE_INSENSITIVE).matcher(Objects.toString(value, "")).find();
+        } catch (Exception ignored) {
+            return false;
+        }
+    }
+
+    private static String nullable(Object value) {
+        String result = Objects.toString(value, "").trim();
+        return result.isBlank() ? null : result;
+    }
+
+    private static long longValue(Object value, long fallback) {
+        try {
+            return value == null ? fallback : Long.parseLong(String.valueOf(value));
+        } catch (Exception ignored) {
+            return fallback;
+        }
+    }
+
     static BigDecimal perMillion(BigDecimal price, String unitText, Map<String,Object> config) {
         if (price == null) return null;
         long quantity = billingQuantity(unitText, config);
@@ -201,6 +311,8 @@ final class CatalogPriceAdapterSupport {
                                                          String currency,
                                                          String region,
                                                          String requestMode,
+                                                         String serviceTier,
+                                                         String contextTier,
                                                          Map<String,BigDecimal> prices,
                                                          String sourceRef,
                                                          Map<String,Object> raw) {
@@ -221,8 +333,8 @@ final class CatalogPriceAdapterSupport {
                 prices.get("OUTPUT_TOKEN"),
                 value(region, value(context.region(), "global")),
                 value(requestMode, value(context.requestMode(), "STANDARD")),
-                "DEFAULT",
-                "DEFAULT",
+                value(serviceTier, "DEFAULT"),
+                value(contextTier, "DEFAULT"),
                 components,
                 sourceRef,
                 OffsetDateTime.now(),
@@ -237,7 +349,7 @@ final class CatalogPriceAdapterSupport {
         for (Group group : groups) {
             if (group.model().isBlank() || group.prices().isEmpty()) continue;
             result.add(normalized(context, group.model(), group.displayName(), group.currency(), group.region(),
-                    group.requestMode(), group.prices(), sourceRef, group.raw()));
+                    group.requestMode(), group.serviceTier(), group.contextTier(), group.prices(), sourceRef, group.raw()));
         }
         return result;
     }
@@ -266,8 +378,20 @@ final class CatalogPriceAdapterSupport {
                  String currency,
                  String region,
                  String requestMode,
+                 String serviceTier,
+                 String contextTier,
                  Map<String,BigDecimal> prices,
                  Map<String,Object> raw) {
+        Group(String model,
+              String displayName,
+              String currency,
+              String region,
+              String requestMode,
+              Map<String,BigDecimal> prices,
+              Map<String,Object> raw) {
+            this(model, displayName, currency, region, requestMode, "DEFAULT", "DEFAULT", prices, raw);
+        }
+
         Group {
             prices = prices == null ? new LinkedHashMap<>() : prices;
             raw = raw == null ? new LinkedHashMap<>() : raw;

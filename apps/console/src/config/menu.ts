@@ -12,11 +12,9 @@ export const menuGroups:MenuGroup[]=[
  {key:'model-config',title:'模型配置',icon:'box',roles:['ADMIN'],items:[
   {path:'/provider-channels',title:'供应商渠道'},
   {path:'/model-deployments',title:'模型部署'},
-  {path:'/model-discovery-candidates',title:'模型候选'},
-  {path:'/provider-model-aliases',title:'模型别名审核'},
-  {path:'/price-versions',title:'模型生效价格'},
   {path:'/service-models',title:'企业服务模型'},
-  {path:'/routes',title:'路由策略'}
+  {path:'/routes',title:'路由策略'},
+  {path:'/reference-prices',title:'参考价格状态'}
  ]},
  {key:'org',title:'组织与权限',icon:'users',roles:['ADMIN'],items:[
   {path:'/accounts',title:'账户管理'},
@@ -32,12 +30,10 @@ export const menuGroups:MenuGroup[]=[
   {path:'/provider-billing-sources',title:'供应商账单源'},
   {path:'/provider-billing-sync-runs',title:'账单同步任务'},
   {path:'/provider-billing-records',title:'供应商账单明细'},
+  {path:'/provider-billing-snapshots',title:'账单原始快照'},
   {path:'/provider-reconciliations',title:'供应商对账'}
  ]},
  {key:'governance',title:'高级治理',icon:'settings',roles:['ADMIN'],items:[
-  {path:'/provider-price-sources',title:'价格源管理'},
-  {path:'/provider-price-catalog',title:'供应商官方价格'},
-  {path:'/provider-price-diffs',title:'价格差异审核'},
   {path:'/approvals',title:'治理审批'},
   {path:'/audit',title:'操作审计'},
   {path:'/system-settings',title:'系统基础设置'}

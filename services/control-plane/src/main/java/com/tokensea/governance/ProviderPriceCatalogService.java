@@ -206,15 +206,11 @@ public class ProviderPriceCatalogService {
         jdbc.update("""
             update channel_model_deployment set price_status=?,
               production_status=case
-                when ?='MISSING' and production_status='APPROVED' then 'SUSPENDED'
                 when production_status in ('APPROVED','SUSPENDED','REJECTED') then production_status
-                when health_status='HEALTHY' and ?<>'MISSING' then 'READY_FOR_REVIEW'
+                when health_status='HEALTHY' then 'READY_FOR_REVIEW'
                 else 'CANDIDATE' end,
-              routing_status=case
-                when ?='MISSING' and routing_status='ELIGIBLE' then 'SUSPENDED'
-                else routing_status end,
               updated_at=now() where id=?
-            """, priceStatus, priceStatus, priceStatus, priceStatus, deploymentId);
+            """, priceStatus, deploymentId);
     }
 
     @Scheduled(initialDelayString = "${tokensea.price-alert-reconcile.initial-delay-ms:10000}",

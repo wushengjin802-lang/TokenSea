@@ -8,6 +8,7 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.tokensea.asset.entity.ProviderInstance;
 import com.tokensea.asset.service.ProviderConnectionService;
 import com.tokensea.audit.service.AuditService;
+import com.tokensea.provider.service.ManagedPurposeCredentialService;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.scheduling.annotation.Scheduled;
@@ -21,6 +22,7 @@ import java.net.InetSocketAddress;
 import java.net.ProxySelector;
 import java.net.URI;
 import java.net.URISyntaxException;
+import java.net.URLDecoder;
 import java.net.URLEncoder;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -30,8 +32,6 @@ import java.security.MessageDigest;
 import java.time.Duration;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
-import java.util.ArrayList;
-import java.util.Base64;
 import java.util.HashSet;
 import java.util.HexFormat;
 import java.util.LinkedHashMap;
@@ -50,6 +50,7 @@ public class ProviderBillingSyncService {
     private final ObjectMapper json;
     private final ProviderBillingParser parser;
     private final ProviderConnectionService connections;
+    private final ManagedPurposeCredentialService credentials;
     private final AuditService audits;
     private final HttpClient http;
     private final Set<String> globalAllowedHosts;
@@ -59,6 +60,7 @@ public class ProviderBillingSyncService {
                                       ObjectMapper json,
                                       ProviderBillingParser parser,
                                       ProviderConnectionService connections,
+                                      ManagedPurposeCredentialService credentials,
                                       AuditService audits,
                                       @Value("${tokensea.egress.proxy-host:}") String proxyHost,
                                       @Value("${tokensea.egress.proxy-port:18080}") int proxyPort,
@@ -67,6 +69,7 @@ public class ProviderBillingSyncService {
         this.json = json;
         this.parser = parser;
         this.connections = connections;
+        this.credentials = credentials;
         this.audits = audits;
         this.globalAllowedHosts = parseHosts(allowedHosts);
         this.proxyConfigured = proxyHost != null && !proxyHost.isBlank();
@@ -124,6 +127,7 @@ public class ProviderBillingSyncService {
             """, runId, sourceId, value(triggerType, "MANUAL"), period.from(), period.to());
         try {
             FetchResult fetched = fetch(source, period);
+            String snapshotId = saveSnapshot(source, runId, fetched);
             List<ProviderBillingParser.BillingRecord> records = parse(source, fetched.content());
             int inserted = persistRecords(source, runId, records);
             BigDecimal amount = records.stream().map(ProviderBillingParser.BillingRecord::amount)
@@ -137,7 +141,8 @@ public class ProviderBillingSyncService {
                   completed_at=now(),execution_log=cast(? as jsonb),updated_at=now() where id=?
                 """, state, records.size(), amount, currency,
                     write(List.of(Map.of("event", "BILLING_FETCHED", "pages", fetched.pages(),
-                            "records", records.size(), "inserted", inserted))), runId);
+                            "records", records.size(), "inserted", inserted, "snapshotId", snapshotId,
+                            "checksum", fetched.checksum()))), runId);
             jdbc.update("""
                 update provider_billing_source set
                   status=case when status in ('PAUSED','DISABLED') then status else 'ACTIVE' end,
@@ -182,7 +187,7 @@ public class ProviderBillingSyncService {
 
     private FetchResult fetch(Map<String,Object> source, Period period) throws Exception {
         ProviderInstance instance = providerInstance(source);
-        String managedKey = connections.resolveManagedApiKey(instance);
+        String managedKey = credentials.resolve(text(source.get("credential_ref")), instance.getId(), "BILLING_READ");
         String adapter = text(source.get("adapter_code"));
         URI endpoint = URI.create(text(source.get("endpoint")));
         URI current = requestUri(endpoint, adapter, period, null, readMap(source.get("config")));
@@ -191,11 +196,15 @@ public class ProviderBillingSyncService {
         int pages = 0;
         int totalBytes = 0;
         int statusCode = 200;
+        URI finalEndpoint = current;
+        String contentType = "application/json";
         while (current != null) {
             if (pages >= MAX_PAGES) throw new IllegalStateException("供应商账单分页超过 " + MAX_PAGES + " 页");
             HttpPage page = fetchPage(source, current, originalHost, instance, managedKey);
             pages++;
             statusCode = page.statusCode();
+            finalEndpoint = page.finalUri();
+            contentType = page.contentType();
             totalBytes += page.body().length;
             if (totalBytes > MAX_RESPONSE_BYTES) throw new IllegalStateException("供应商账单累计响应超过 5MB");
             JsonNode root = json.readTree(page.body());
@@ -216,7 +225,9 @@ public class ProviderBillingSyncService {
         ObjectNode aggregate = json.createObjectNode();
         aggregate.set("data", combined);
         aggregate.put("_tokenseaPageCount", pages);
-        return new FetchResult(statusCode, json.writeValueAsString(aggregate), pages);
+        byte[] aggregateBytes = json.writeValueAsBytes(aggregate);
+        return new FetchResult(statusCode, new String(aggregateBytes, StandardCharsets.UTF_8), pages,
+                aggregateBytes.length, sha256(aggregateBytes), finalEndpoint.toString(), contentType);
     }
 
     private HttpPage fetchPage(Map<String,Object> source,
@@ -233,7 +244,7 @@ public class ProviderBillingSyncService {
                     .header("User-Agent", "TokenSea-BillingSync/1.0")
                     .GET();
             if (uri.getHost().equalsIgnoreCase(originalHost)) {
-                connections.applyManagedAuthentication(builder, instance, managedKey);
+                applyBillingAuthentication(builder, source, managedKey);
             }
             HttpResponse<byte[]> response = http.send(builder.build(), HttpResponse.BodyHandlers.ofByteArray());
             if (Set.of(301,302,303,307,308).contains(response.statusCode())) {
@@ -251,9 +262,40 @@ public class ProviderBillingSyncService {
             if (!contentType.toLowerCase(Locale.ROOT).contains("json")) {
                 throw new IllegalStateException("供应商账单接口未返回 JSON: " + contentType);
             }
-            return new HttpPage(response.statusCode(), response.body(), uri);
+            return new HttpPage(response.statusCode(), response.body(), uri, contentType);
         }
         throw new IllegalStateException("供应商账单接口获取失败");
+    }
+
+    private void applyBillingAuthentication(HttpRequest.Builder builder,
+                                            Map<String,Object> source,
+                                            String credential) {
+        String adapter = text(source.get("adapter_code"));
+        if ("OPENAI_COSTS_API".equals(adapter)) {
+            builder.header("Authorization", "Bearer " + credential);
+            return;
+        }
+        Map<String,Object> config = readMap(source.get("config"));
+        String header = value(text(config.get("authHeader")), "Authorization");
+        if (!Set.of("authorization", "api-key", "x-api-key", "x-goog-api-key")
+                .contains(header.toLowerCase(Locale.ROOT))) {
+            throw new IllegalStateException("供应商账单认证头不在允许列表中");
+        }
+        String scheme = text(config.get("authScheme"));
+        builder.header(header, blank(scheme) ? credential : scheme + " " + credential);
+    }
+
+    private String saveSnapshot(Map<String,Object> source, String runId, FetchResult fetched) {
+        String id = id();
+        jdbc.update("""
+            insert into provider_billing_raw_snapshot(
+              id,billing_source_id,sync_run_id,source_endpoint,final_endpoint,http_status,
+              content_type,checksum,response_bytes,page_count,raw_content)
+            values(?,?,?,?,?,?,?,?,?,?,?)
+            """, id, source.get("id"), runId, source.get("endpoint"), fetched.finalEndpoint(),
+                fetched.httpStatus(), fetched.contentType(), fetched.checksum(), fetched.responseBytes(),
+                fetched.pages(), fetched.content());
+        return id;
     }
 
     private URI requestUri(URI endpoint,
@@ -293,7 +335,11 @@ public class ProviderBillingSyncService {
         if (rawQuery == null || rawQuery.isBlank()) return values;
         for (String pair : rawQuery.split("&")) {
             String[] parts = pair.split("=", 2);
-            values.put(parts[0], parts.length == 2 ? parts[1] : "");
+            String key = URLDecoder.decode(parts[0], StandardCharsets.UTF_8);
+            String value = parts.length == 2
+                    ? URLDecoder.decode(parts[1], StandardCharsets.UTF_8)
+                    : "";
+            values.put(key, value);
         }
         return values;
     }
@@ -399,7 +445,56 @@ public class ProviderBillingSyncService {
                 """, currency, internalCost, providerAmount, difference, difference,
                     text(source.get("endpoint")), difference, write(classification), runId, id);
         }
+        updateVarianceAlert(source, id, providerAmount, internalCost, difference);
         return id;
+    }
+
+    private void updateVarianceAlert(Map<String,Object> source,
+                                     String reconciliationId,
+                                     BigDecimal providerAmount,
+                                     BigDecimal internalCost,
+                                     BigDecimal difference) {
+        BigDecimal baseline = providerAmount.abs().max(internalCost.abs());
+        BigDecimal ratio = baseline.signum() == 0 ? BigDecimal.ZERO
+                : difference.abs().divide(baseline, 8, java.math.RoundingMode.HALF_UP);
+        BigDecimal threshold = decimal(source.get("variance_alert_ratio"));
+        boolean observationMode = source.get("observation_mode") == null
+                || Boolean.TRUE.equals(source.get("observation_mode"));
+        if (observationMode || ratio.compareTo(threshold) <= 0) {
+            jdbc.update("""
+                update alert_event set status='RESOLVED',resolved_at=coalesce(resolved_at,now()),updated_at=now()
+                where alert_type='PROVIDER_COST_VARIANCE' and resource_type='PROVIDER_RECONCILIATION'
+                  and resource_id=? and status in ('OPEN','ACKNOWLEDGED')
+                """, reconciliationId);
+            return;
+        }
+        Integer existing = jdbc.queryForObject("""
+            select count(*) from alert_event
+            where alert_type='PROVIDER_COST_VARIANCE' and resource_type='PROVIDER_RECONCILIATION'
+              and resource_id=? and status in ('OPEN','ACKNOWLEDGED')
+            """, Integer.class, reconciliationId);
+        Map<String,Object> detail = Map.of(
+                "billingSourceId", source.get("id"),
+                "providerInstanceId", source.get("provider_instance_id"),
+                "currency", source.get("default_currency"),
+                "providerAmount", providerAmount,
+                "internalCost", internalCost,
+                "difference", difference,
+                "differenceRatio", ratio,
+                "threshold", threshold);
+        if (existing != null && existing > 0) {
+            jdbc.update("""
+                update alert_event set detail=cast(? as jsonb),updated_at=now()
+                where alert_type='PROVIDER_COST_VARIANCE' and resource_type='PROVIDER_RECONCILIATION'
+                  and resource_id=? and status in ('OPEN','ACKNOWLEDGED')
+                """, write(detail), reconciliationId);
+            return;
+        }
+        jdbc.update("""
+            insert into alert_event(id,alert_type,severity,resource_type,resource_id,title,detail)
+            values(?,'PROVIDER_COST_VARIANCE','WARNING','PROVIDER_RECONCILIATION',?,
+              '供应商实际成本与 TokenSea 估算成本差异超过阈值',cast(? as jsonb))
+            """, id(), reconciliationId, write(detail));
     }
 
     private ProviderInstance providerInstance(Map<String,Object> source) {
@@ -512,16 +607,6 @@ public class ProviderBillingSyncService {
         return Set.copyOf(result);
     }
 
-    private Map<String,String> parseQueryPairs(String raw) {
-        Map<String,String> result = new LinkedHashMap<>();
-        if (raw == null || raw.isBlank()) return result;
-        for (String pair : raw.split("&")) {
-            String[] values = pair.split("=", 2);
-            result.put(values[0], values.length > 1 ? values[1] : "");
-        }
-        return result;
-    }
-
     private String write(Object value) {
         try {
             return json.writeValueAsString(value);
@@ -586,6 +671,7 @@ public class ProviderBillingSyncService {
     }
 
     private record Period(OffsetDateTime from, OffsetDateTime to) {}
-    private record HttpPage(int statusCode, byte[] body, URI finalUri) {}
-    private record FetchResult(int httpStatus, String content, int pages) {}
+    private record HttpPage(int statusCode, byte[] body, URI finalUri, String contentType) {}
+    private record FetchResult(int httpStatus, String content, int pages, int responseBytes,
+                               String checksum, String finalEndpoint, String contentType) {}
 }

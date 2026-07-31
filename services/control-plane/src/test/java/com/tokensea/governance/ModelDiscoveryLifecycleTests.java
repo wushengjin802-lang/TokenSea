@@ -45,14 +45,9 @@ class ModelDiscoveryLifecycleTests {
         lifecycle.markNewDeployment("deployment-life");
         assertState(jdbc, "PROBE_PENDING", "CANDIDATE", "INELIGIBLE", "DISCOVERED", 0);
 
-        jdbc.update("""
-            insert into price_version(
-              id,price_layer,deployment_id,currency,billing_basis,billing_quantity,input_unit_price,output_unit_price,
-              source_type,source_ref,version,effective_from,status,region,request_mode,service_tier,context_tier)
-            values('price-life','PROVIDER_OFFICIAL','deployment-life','CNY','TOKEN',1000000,1,2,
-              'OFFICIAL_REFERENCE','https://platform.kimi.com/docs/pricing/test',1,now(),'ACTIVE','cn','STANDARD','DEFAULT','DEFAULT')
-            """);
-        lifecycle.updatePriceStatus("deployment-life", "MATCHED_OFFICIAL");
+        assertThat(jdbc.queryForObject(
+                "select price_status from channel_model_deployment where id='deployment-life'", String.class))
+                .isEqualTo("MISSING");
         insertProbe(jdbc, "probe-life-1", "PASSED");
         lifecycle.markProbeResult("deployment-life", true);
         assertState(jdbc, "HEALTHY", "READY_FOR_REVIEW", "INELIGIBLE", "DISCOVERED", 0);

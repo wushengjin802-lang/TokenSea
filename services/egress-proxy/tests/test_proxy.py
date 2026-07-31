@@ -140,6 +140,45 @@ def test_committed_connect_timeout_closes_without_plaintext_408():
     assert upstream.closed is True
 
 
+def test_host_miss_refreshes_dynamic_policy_before_rejecting():
+    refreshes = []
+
+    async def loader():
+        refreshes.append("refresh")
+        return ["prices.example.com"]
+
+    async def resolver(host, port):
+        return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("8.8.8.8", port))]
+
+    async def connector(address, port, family):
+        return object(), object()
+
+    proxy = EgressProxy(
+        EgressPolicy(frozenset(), frozenset({443})),
+        resolver=resolver,
+        connector=connector,
+        dynamic_policy_loader=loader,
+    )
+    normalized, pinned, _ = asyncio.run(proxy.resolve_and_connect("prices.example.com", 443))
+    assert normalized == "prices.example.com"
+    assert pinned == "8.8.8.8"
+    assert refreshes == ["refresh"]
+    assert proxy.policy.dynamic_hosts == frozenset({"prices.example.com"})
+
+
+def test_host_miss_remains_denied_when_refreshed_policy_does_not_include_it():
+    async def loader():
+        return ["other.example.com"]
+
+    proxy = EgressProxy(
+        EgressPolicy(frozenset(), frozenset({443})),
+        dynamic_policy_loader=loader,
+    )
+    with pytest.raises(ProxyError) as error:
+        asyncio.run(proxy.resolve_and_connect("prices.example.com", 443))
+    assert error.value.code == "host_not_allowlisted"
+
+
 def test_dns_resolution_is_pinned_to_numeric_ip():
     calls = []
 
@@ -159,8 +198,8 @@ def test_dns_resolution_is_pinned_to_numeric_ip():
     assert calls == [("resolve", "api.example.com", 443), ("connect", "8.8.8.8", 443, socket.AF_INET)]
 
 
-def test_mixed_dns_answer_rejects_before_connect():
-    connected = False
+def test_mixed_dns_answer_skips_unsafe_address_and_pins_global_address():
+    calls = []
 
     async def resolver(host, port):
         return [
@@ -169,13 +208,26 @@ def test_mixed_dns_answer_rejects_before_connect():
         ]
 
     async def connector(address, port, family):
-        nonlocal connected
-        connected = True
+        calls.append((address, port, family))
         return object(), object()
 
     proxy = EgressProxy(EgressPolicy(frozenset({"api.example.com"}), frozenset({443})),
                         resolver=resolver, connector=connector)
+    normalized, pinned, _ = asyncio.run(proxy.resolve_and_connect("api.example.com", 443))
+    assert normalized == "api.example.com"
+    assert pinned == "8.8.8.8"
+    assert calls == [("8.8.8.8", 443, socket.AF_INET)]
+
+
+def test_dns_resolution_rejects_when_all_addresses_are_unsafe():
+    async def resolver(host, port):
+        return [
+            (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("169.254.169.254", port)),
+            (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("127.0.0.1", port)),
+        ]
+
+    proxy = EgressProxy(EgressPolicy(frozenset({"api.example.com"}), frozenset({443})),
+                        resolver=resolver)
     with pytest.raises(ProxyError) as error:
         asyncio.run(proxy.resolve_and_connect("api.example.com", 443))
     assert error.value.code == "non_global_address"
-    assert connected is False

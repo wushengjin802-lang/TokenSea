@@ -156,9 +156,12 @@
         <div class="response-panel">
           <div class="response-head">
             <strong>网关响应</strong>
-            <span v-if="requestResult" class="status ok">调用成功</span>
+            <span v-if="requestLoading" class="status warn">请求中</span>
+            <span v-else-if="requestResult" class="status ok">调用成功</span>
+            <span v-else-if="requestError" class="status danger">调用失败</span>
           </div>
-          <div v-if="requestResult" class="response-content">
+          <div v-if="requestLoading" class="state-panel empty-state">正在发送真实请求，请等待网关响应</div>
+          <div v-else-if="requestResult" class="response-content">
             <div class="response-metrics">
               <div><span>耗时</span><strong>{{ requestResult.elapsedMs }} ms</strong></div>
               <div><span>输入 Token</span><strong>{{ requestResult.promptTokens }}</strong></div>
@@ -175,6 +178,7 @@
               <pre class="code-block compact-code">{{ requestResult.raw }}</pre>
             </details>
           </div>
+          <div v-else-if="requestError" class="state-panel empty-state">请求失败，请根据左侧错误信息检查配置后重试</div>
           <div v-else class="state-panel empty-state">尚未发送真实请求</div>
         </div>
       </div>

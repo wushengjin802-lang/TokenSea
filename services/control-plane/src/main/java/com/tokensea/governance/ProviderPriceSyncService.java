@@ -10,6 +10,10 @@ import com.tokensea.governance.pricing.adapter.KimiOfficialPriceAdapter;
 import com.tokensea.governance.pricing.adapter.PriceSourceAdapterContext;
 import com.tokensea.governance.pricing.adapter.PriceSourceDocument;
 import com.tokensea.governance.pricing.adapter.PriceSourceParseResult;
+import com.tokensea.governance.pricing.mapping.PriceSourceMappingService;
+import com.tokensea.governance.pricing.extractor.PriceDocumentExtractionService;
+import com.tokensea.governance.pricing.reference.ReferenceModelMatcher;
+import com.tokensea.provider.service.ManagedPurposeCredentialService;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpStatus;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -35,6 +39,7 @@ import java.security.MessageDigest;
 import java.time.Duration;
 import java.time.OffsetDateTime;
 import java.util.*;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.zip.GZIPInputStream;
 import java.util.zip.InflaterInputStream;
 
@@ -49,6 +54,9 @@ public class ProviderPriceSyncService {
     private final AuditService audits;
     private final ProviderConnectionService providerConnections;
     private final PricingComponentService pricingComponents;
+    private final ManagedPurposeCredentialService purposeCredentials;
+    private final PriceSourceMappingService mappings;
+    private final PriceDocumentExtractionService extractions;
     private final TransactionTemplate transactions;
     private final HttpClient http;
     private final HttpClient internalHttp;
@@ -63,6 +71,9 @@ public class ProviderPriceSyncService {
                                     ProviderPriceCatalogService matcher, AuditService audits,
                                     ProviderConnectionService providerConnections,
                                     PricingComponentService pricingComponents,
+                                    ManagedPurposeCredentialService purposeCredentials,
+                                    PriceSourceMappingService mappings,
+                                    PriceDocumentExtractionService extractions,
                                     PlatformTransactionManager transactionManager,
                                     @Value("${tokensea.egress.proxy-host:}") String proxyHost,
                                     @Value("${tokensea.egress.proxy-port:18080}") int proxyPort,
@@ -76,6 +87,9 @@ public class ProviderPriceSyncService {
         this.audits = audits;
         this.providerConnections = providerConnections;
         this.pricingComponents = pricingComponents;
+        this.purposeCredentials = purposeCredentials;
+        this.mappings = mappings;
+        this.extractions = extractions;
         this.transactions = new TransactionTemplate(transactionManager);
         this.globalAllowedHosts = parseHosts(allowedHosts);
         this.proxyConfigured = proxyHost != null && !proxyHost.isBlank();
@@ -104,7 +118,7 @@ public class ProviderPriceSyncService {
                              PlatformTransactionManager transactionManager,
                              String proxyHost, int proxyPort, String allowedHosts) {
         this(jdbc, json, parser, matcher, audits, providerConnections, pricingComponents,
-                transactionManager, proxyHost, proxyPort, allowedHosts, "", "");
+                null, null, null, transactionManager, proxyHost, proxyPort, allowedHosts, "", "");
     }
 
     public record FetchPreview(int httpStatus, String contentType, String checksum, int responseBytes,
@@ -145,6 +159,14 @@ public class ProviderPriceSyncService {
             """, String.class, sourceId);
     }
 
+    public String enqueueScheduledNow(String sourceId) {
+        Map<String,Object> source = requireSource(sourceId);
+        String runId = enqueue(sourceId, "SCHEDULED");
+        jdbc.update("update provider_price_source set next_run_at=?,updated_at=now() where id=?",
+                nextRun(text(source.get("schedule_expression")), isSystemReference(source)), sourceId);
+        return runId;
+    }
+
     public FetchPreview preview(String sourceId) {
         Map<String,Object> source = requireSource(sourceId);
         try {
@@ -164,8 +186,61 @@ public class ProviderPriceSyncService {
                     parsed.sourceEvidence(), parsed.warnings(), parsed.headlessRecommended(),
                     parsed.discoveredPricePages(), sample);
         } catch (Exception e) {
-            throw new ResponseStatusException(HttpStatus.BAD_GATEWAY, safe(e.getMessage()));
+            String message = safe(e.getMessage());
+            if (message.contains("Tunnel failed, got: 403")) {
+                message = "出口代理拒绝目标域名，请确认官方域名已保存并属于当前价格源";
+            }
+            throw new ResponseStatusException(HttpStatus.BAD_GATEWAY, message);
         }
+    }
+
+    @Transactional
+    public Map<String,Object> submitExtractionRun(String extractionRunId, String actor, String reason) {
+        if (extractions == null) throw new ResponseStatusException(HttpStatus.SERVICE_UNAVAILABLE, "价格文档抽取服务未启用");
+        Map<String,Object> extraction = extractions.requireRun(extractionRunId);
+        if (!"REVIEW_REQUIRED".equals(text(extraction.get("status")))) {
+            conflict("仅待审核的价格文档抽取运行可以提交");
+        }
+        int pending = extractions.pendingCount(extractionRunId);
+        if (pending > 0) {
+            throw new ResponseStatusException(HttpStatus.CONFLICT,
+                    "仍有 " + pending + " 条抽取记录待审核，全部处理后才能提交");
+        }
+        List<PriceSourceParser.NormalizedPrice> accepted = extractions.reviewedPrices(extractionRunId);
+        if (accepted.isEmpty()) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "没有已接受或已修正的抽取记录可提交");
+        }
+        String sourceId = text(extraction.get("source_id"));
+        String syncRunId = text(extraction.get("sync_run_id"));
+        String snapshotId = text(extraction.get("raw_snapshot_id"));
+        Map<String,Object> source = requireSource(sourceId);
+        boolean publicReference = "PUBLIC_REFERENCE".equals(text(source.get("source_class")));
+        ProcessResult processed = publicReference
+                ? processReferences(source, syncRunId, snapshotId, text(extraction.get("snapshot_checksum")), accepted)
+                : processOfficial(source, syncRunId, snapshotId, text(extraction.get("snapshot_checksum")), accepted,
+                        false, text(source.get("structure_fingerprint")));
+        if (publicReference) refreshReferencePriceBindings();
+        extractions.linkDiffEvidence(syncRunId, extractionRunId);
+        extractions.markSubmitted(extractionRunId);
+        String state = processed.reviewRequired() > 0 ? "REVIEW_REQUIRED" : "SUCCEEDED";
+        jdbc.update("""
+            update provider_price_sync_run set status=?,records_changed=records_changed+?,
+              records_auto_published=records_auto_published+?,records_review_required=?,updated_at=now()
+            where id=?
+            """, state, processed.changed(), processed.autoPublished(), processed.reviewRequired(), syncRunId);
+        audits.record("PRICE_DOCUMENT_EXTRACTION_SUBMITTED", "PriceDocumentExtractionRun", extractionRunId,
+                extraction, Map.of("actor", actor, "reason", value(reason, ""), "syncRunId", syncRunId,
+                        "accepted", accepted.size(), "changed", processed.changed(),
+                        "autoPublished", processed.autoPublished(), "reviewRequired", processed.reviewRequired()));
+        Map<String,Object> result = new LinkedHashMap<>();
+        result.put("extractionRunId", extractionRunId);
+        result.put("syncRunId", syncRunId);
+        result.put("accepted", accepted.size());
+        result.put("changed", processed.changed());
+        result.put("autoPublished", processed.autoPublished());
+        result.put("reviewRequired", processed.reviewRequired());
+        result.put("status", state);
+        return result;
     }
 
     @Transactional
@@ -254,10 +329,7 @@ public class ProviderPriceSyncService {
             order by next_run_at limit 20
             """);
         for (Map<String,Object> source : due) {
-            String sourceId = text(source.get("id"));
-            enqueue(sourceId, "SCHEDULED");
-            jdbc.update("update provider_price_source set next_run_at=?,updated_at=now() where id=?",
-                    nextRun(text(source.get("schedule_expression"))), sourceId);
+            enqueueScheduledNow(text(source.get("id")));
         }
     }
 
@@ -321,45 +393,76 @@ public class ProviderPriceSyncService {
                     "generatedPriceCount", parseDiagnostics.generatedPriceCount(),
                     "diagnosticSnapshot", parseDiagnostics.snapshot()
             )));
+            PriceDocumentExtractionService.PersistenceResult extraction = null;
             List<PriceSourceParser.NormalizedPrice> prices = parsed.prices();
-            if (prices.isEmpty()) throw new IllegalStateException("价格来源未解析出任何有效价格记录");
+            if (extractions != null && "GENERIC_DOCUMENT".equals(text(source.get("adapter_code")))) {
+                extraction = extractions.persist(source, runId, snapshotId, parsed);
+                prices = extraction.acceptedPrices();
+                logs.add(log("DOCUMENT_EXTRACTION_SAVED", Map.of(
+                        "extractionRunId", extraction.runId(),
+                        "accepted", prices.size(),
+                        "pendingReview", extraction.pendingReview(),
+                        "rejected", extraction.rejected(),
+                        "status", extraction.status())));
+                if (prices.isEmpty() && extraction.pendingReview() > 0) {
+                    finishExtractionReview(runId, source, fetched, sourceChecksum, parsed, parseDiagnostics,
+                            extraction, logs);
+                    return new SyncSummary(runId, "REVIEW_REQUIRED", parsed.prices().size(),
+                            parsed.prices().size(), 0, 0, extraction.pendingReview(), snapshotId);
+                }
+            }
+            if (prices.isEmpty()) throw new IllegalStateException("价格来源未解析出任何可进入价格差异流程的有效记录");
             StructureChange structure = updateStructureFingerprint(source, runId, snapshotId, parsed.structureFingerprint());
+            int unmappedChanged = mappings == null ? 0
+                    : mappings.persistUnmapped(text(source.get("id")), runId, snapshotId, parsed.sourceEvidence());
             int aliasesChanged = persistAliasCandidates(source, snapshotId, parsed.aliases());
             int candidatesChanged = upsertOfficialModelCandidates(source, snapshotId, parsed.prices());
             int childSourcesChanged = persistDiscoveredPriceSources(source, parsed.discoveredPricePages());
             if (!parsed.warnings().isEmpty()) logs.add(log("PARSE_WARNINGS", Map.of("warnings", parsed.warnings())));
             if (!parsed.discoveredPricePages().isEmpty()) logs.add(log("PRICING_PAGES_DISCOVERED",
                     Map.of("count", parsed.discoveredPricePages().size(), "pages", parsed.discoveredPricePages())));
+            if (unmappedChanged > 0) logs.add(log("UNMAPPED_PRICE_RECORDS_SAVED", Map.of("count", unmappedChanged)));
             if (aliasesChanged > 0) logs.add(log("MODEL_ALIAS_CANDIDATES_SAVED", Map.of("count", aliasesChanged)));
             if (candidatesChanged > 0) logs.add(log("MODEL_DISCOVERY_CANDIDATES_SAVED", Map.of("count", candidatesChanged)));
             if (childSourcesChanged > 0) logs.add(log("PRICING_CHILD_SOURCES_SAVED", Map.of("count", childSourcesChanged)));
-            ProcessResult processed = "PUBLIC_REFERENCE".equals(text(source.get("source_class")))
+            boolean publicReference = "PUBLIC_REFERENCE".equals(text(source.get("source_class")));
+            ProcessResult processed = publicReference
                     ? processReferences(source, runId, snapshotId, sourceChecksum, prices)
                     : processOfficial(source, runId, snapshotId, sourceChecksum, prices,
                             structure.changed(), structure.currentFingerprint());
-            String state = processed.reviewRequired() > 0 ? "REVIEW_REQUIRED" : "SUCCEEDED";
+            if (publicReference) {
+                int activeBindings = refreshReferencePriceBindings();
+                logs.add(log(activeBindings >= 0 ? "REFERENCE_BINDINGS_REFRESHED" : "REFERENCE_BINDINGS_REFRESH_DEFERRED",
+                        activeBindings >= 0 ? Map.of("activeBindings", activeBindings)
+                                : Map.of("message", "绑定刷新失败，后台定时任务将自动重试")));
+            }
+            if (extraction != null) extractions.linkDiffEvidence(runId, extraction);
+            int extractionReview = extraction == null ? 0 : extraction.pendingReview();
+            int totalReviewRequired = processed.reviewRequired() + extractionReview;
+            String state = totalReviewRequired > 0 ? "REVIEW_REQUIRED" : "SUCCEEDED";
             logs.add(log("COMPLETED", Map.of("normalized", prices.size(), "changed", processed.changed(),
-                    "autoPublished", processed.autoPublished(), "reviewRequired", processed.reviewRequired())));
+                    "autoPublished", processed.autoPublished(), "reviewRequired", totalReviewRequired)));
             jdbc.update("""
                 update provider_price_sync_run set status=?,http_status=?,records_fetched=?,records_normalized=?,
                   records_changed=?,records_auto_published=?,records_review_required=?,parse_status=?,
                   parsed_table_count=?,matched_table_count=?,generated_price_count=?,diagnostic_snapshot=cast(? as jsonb),
                   completed_at=now(),execution_log=cast(? as jsonb),heartbeat_at=now(),updated_at=now() where id=?
-                """, state, fetched.statusCode(), prices.size(), prices.size(), processed.changed(),
-                    processed.autoPublished(), processed.reviewRequired(), parseDiagnostics.status(),
+                """, state, fetched.statusCode(), parsed.prices().size(), parsed.prices().size(), processed.changed(),
+                    processed.autoPublished(), totalReviewRequired, parseDiagnostics.status(),
                     parseDiagnostics.tableCount(), parseDiagnostics.matchedTableCount(),
                     parseDiagnostics.generatedPriceCount(), write(parseDiagnostics.snapshot()), write(logs), runId);
             jdbc.update("""
                 update provider_price_source set
                   status=case when status in ('PAUSED','DISABLED') then status else 'ACTIVE' end,
-                  last_success_at=now(),last_error=null,etag=?,last_modified=?,last_content_hash=?,updated_at=now() where id=?
+                  last_checked_at=now(),last_success_at=now(),last_good_sync_at=now(),last_error=null,
+                  etag=?,last_modified=?,last_content_hash=?,updated_at=now() where id=?
                 """, fetched.etag(), fetched.lastModified(), sourceChecksum, source.get("id"));
             audits.record("PROVIDER_PRICE_SYNC_COMPLETE", "ProviderPriceSyncRun", runId, null,
                     Map.of("status", state, "sourceId", source.get("id"), "snapshotId", snapshotId,
                             "changed", processed.changed(), "autoPublished", processed.autoPublished(),
-                            "reviewRequired", processed.reviewRequired()));
-            return new SyncSummary(runId, state, prices.size(), prices.size(), processed.changed(),
-                    processed.autoPublished(), processed.reviewRequired(), snapshotId);
+                            "reviewRequired", totalReviewRequired));
+            return new SyncSummary(runId, state, parsed.prices().size(), parsed.prices().size(), processed.changed(),
+                    processed.autoPublished(), totalReviewRequired, snapshotId);
         } catch (Exception e) {
             logs.add(log("FAILED", Map.of("message", safe(e.getMessage()))));
             jdbc.update("""
@@ -370,11 +473,16 @@ public class ProviderPriceSyncService {
                 """, safe(e.getMessage()), parseDiagnostics.status(), parseDiagnostics.tableCount(),
                     parseDiagnostics.matchedTableCount(), parseDiagnostics.generatedPriceCount(),
                     write(parseDiagnostics.snapshot()), write(logs), runId);
+            OffsetDateTime retryAt = isSystemReference(source)
+                    ? OffsetDateTime.now().plus(referenceRetryDelay(text(source.get("id"))))
+                    : null;
             jdbc.update("""
                 update provider_price_source set
                   status=case when status in ('PAUSED','DISABLED') then status else 'DEGRADED' end,
-                  last_failure_at=now(),last_error=?,updated_at=now() where id=?
-                """, safe(e.getMessage()), source.get("id"));
+                  last_checked_at=now(),last_failure_at=now(),last_error=?,
+                  next_run_at=case when ?::timestamptz is null then next_run_at else ? end,
+                  updated_at=now() where id=?
+                """, safe(e.getMessage()), retryAt, retryAt, source.get("id"));
             ensureSyncAlert(source, e);
             return new SyncSummary(runId, "FAILED", 0, 0, 0, 0, 0, null);
         }
@@ -389,7 +497,7 @@ public class ProviderPriceSyncService {
         String adapter = text(source.get("adapter_code"));
         int responseLimit = responseLimit(source);
         ProviderInstance authenticatedInstance = authenticatedInstance(source);
-        String managedApiKey = authenticatedInstance == null ? null : providerConnections.resolveManagedApiKey(authenticatedInstance);
+        String managedApiKey = authenticatedInstance == null ? null : resolvePricingCredential(source, authenticatedInstance);
         HttpPage first = fetchHttpPage(source, initialUri, conditional, originalHost,
                 authenticatedInstance, managedApiKey, responseLimit);
         if (first.statusCode() == 304) {
@@ -548,13 +656,15 @@ public class ProviderPriceSyncService {
 
     private int responseLimit(Map<String,Object> source) {
         Map<String,Object> config = readMap(source.get("config"));
-        int configured = integer(config.get("maxResponseBytes"), MAX_RESPONSE_BYTES);
+        int configured = integer(source.get("max_document_bytes"),
+                integer(config.get("maxResponseBytes"), MAX_RESPONSE_BYTES));
         return Math.max(1_000_000, Math.min(configured, MAX_CONFIGURED_RESPONSE_BYTES));
     }
 
     private int maxPages(Map<String,Object> source) {
         Map<String,Object> config = readMap(source.get("config"));
-        return Math.max(1, Math.min(integer(config.get("maxPages"), 20), 100));
+        return Math.max(1, Math.min(integer(source.get("max_document_pages"),
+                integer(config.get("maxPages"), 20)), 500));
     }
 
     private boolean shouldFallbackToHeadless(Map<String,Object> source, PriceSourceParseResult parsed) {
@@ -649,6 +759,14 @@ public class ProviderPriceSyncService {
     private PriceSourceParseResult parseDetailed(Map<String,Object> source, String content,
                                                   String contentType, String checksum, String endpoint) {
         Map<String,Object> config = readMap(source.get("config"));
+        config.put("documentType", value(text(source.get("document_type")), "AUTO"));
+        config.put("extractionMode", value(text(source.get("extraction_mode")), "DETERMINISTIC"));
+        config.put("minimumConfidence", decimal(source.get("minimum_confidence"), new BigDecimal("0.85000")));
+        config.put("requireManualReview", Boolean.TRUE.equals(source.get("require_manual_review")));
+        config.put("maxPages", integer(source.get("max_document_pages"), integer(config.get("maxPages"), 200)));
+        config.put("maxResponseBytes", integer(source.get("max_document_bytes"), integer(config.get("maxResponseBytes"), 20_000_000)));
+        if (!blank(text(source.get("llm_model")))) config.put("llmModel", text(source.get("llm_model")));
+        if (mappings != null) config = mappings.enrichConfig(text(source.get("id")), config);
         PriceSourceAdapterContext context = new PriceSourceAdapterContext(
                 text(source.get("id")), text(source.get("adapter_code")), nullableText(source.get("provider_type")),
                 value(endpoint, text(source.get("endpoint"))), value(text(source.get("region")), "global"),
@@ -830,8 +948,10 @@ public class ProviderPriceSyncService {
                   id,name,source_class,adapter_code,provider_type,provider_instance_id,auth_mode,endpoint,
                   official_hosts,region,default_currency,schedule_expression,auto_publish,max_auto_change_ratio,
                   confirmation_runs,config,status,next_run_at,parser_version,fetch_mode,source_priority,price_nature,
-                  created_by,updated_by)
-                values(?,?,?,?,?,?,?,?,cast(? as jsonb),?,?,?,?,?,?,cast(? as jsonb),?,?,?,?,?,?,?,?)
+                  connector_code,data_scope,trust_level,publish_policy,schema_version,credential_ref,
+                  credential_purpose,mapping_profile,document_type,extraction_mode,minimum_confidence,
+                  require_manual_review,max_document_pages,max_document_bytes,llm_model,created_by,updated_by)
+                values(?,?,?,?,?,?,?,?,cast(? as jsonb),?,?,?,?,?,?,cast(? as jsonb),?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 on conflict(id) do nothing
                 """, sourceId, value(text(source.get("name")), "Kimi 官方价格") + " - " + page.getValue(),
                     source.get("source_class"), source.get("adapter_code"), source.get("provider_type"),
@@ -840,7 +960,12 @@ public class ProviderPriceSyncService {
                     source.get("schedule_expression"), source.get("auto_publish"), source.get("max_auto_change_ratio"),
                     source.get("confirmation_runs"), write(childConfig), childStatus, nextRun,
                     source.get("parser_version"), source.get("fetch_mode"), source.get("source_priority"),
-                    source.get("price_nature"), "SYSTEM", "SYSTEM");
+                    source.get("price_nature"), source.get("connector_code"), source.get("data_scope"),
+                    source.get("trust_level"), source.get("publish_policy"), source.get("schema_version"),
+                    source.get("credential_ref"), source.get("credential_purpose"), source.get("mapping_profile"),
+                    source.get("document_type"), source.get("extraction_mode"), source.get("minimum_confidence"),
+                    source.get("require_manual_review"), source.get("max_document_pages"),
+                    source.get("max_document_bytes"), source.get("llm_model"), "SYSTEM", "SYSTEM");
             changed++;
         }
         return changed;
@@ -856,6 +981,17 @@ public class ProviderPriceSyncService {
                     path, uri.getQuery(), null).toString();
         } catch (Exception ignored) {
             return "";
+        }
+    }
+
+    private int refreshReferencePriceBindings() {
+        try {
+            Integer count = jdbc.queryForObject(
+                    "select tokensea_refresh_reference_price_bindings()",
+                    Integer.class);
+            return count == null ? 0 : count;
+        } catch (RuntimeException exception) {
+            return -1;
         }
     }
 
@@ -877,8 +1013,10 @@ public class ProviderPriceSyncService {
                   input_unit_price,cache_read_unit_price,cache_read_mode,cache_write_unit_price,cache_write_mode,
                   output_unit_price,price_components,component_schema_version,price_completeness_status,
                   price_nature,pricing_conditions,source_priority,source_evidence_path,source_published_at,
-                  source_ref,evidence_hash,source_confidence,status,observed_at)
-                values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,cast(? as jsonb),2,?,?,cast(? as jsonb),?,?,?,?,?,0.7000,'ACTIVE',now())
+                  source_ref,evidence_hash,source_confidence,status,observed_at,
+                  bundle_version,source_rank,is_current,last_seen_at,stale_at,price_status)
+                values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,cast(? as jsonb),2,?,?,cast(? as jsonb),?,?,?,?,?,0.7000,'ACTIVE',now(),
+                  null,?,true,now(),now()+make_interval(hours => ?),'CURRENT')
                 on conflict(price_source_id,provider_type,provider_model_name,region,request_mode,service_tier,context_tier)
                 do update set raw_snapshot_id=excluded.raw_snapshot_id,sync_run_id=excluded.sync_run_id,
                   canonical_name=excluded.canonical_name,display_name=excluded.display_name,currency=excluded.currency,
@@ -891,7 +1029,8 @@ public class ProviderPriceSyncService {
                   pricing_conditions=excluded.pricing_conditions,source_priority=excluded.source_priority,
                   source_evidence_path=excluded.source_evidence_path,source_published_at=excluded.source_published_at,
                   source_ref=excluded.source_ref,evidence_hash=excluded.evidence_hash,status='ACTIVE',
-                  observed_at=now(),updated_at=now()
+                  source_rank=excluded.source_rank,is_current=true,last_seen_at=now(),stale_at=excluded.stale_at,
+                  price_status='CURRENT',observed_at=now(),updated_at=now()
                 where public_model_price_reference.evidence_hash is distinct from excluded.evidence_hash
                 """, id(), source.get("id"), snapshotId, runId, price.providerType(), price.providerModelName(),
                     canonical, price.displayName(), price.currency(), price.billingBasis(), price.billingQuantity(),
@@ -900,7 +1039,8 @@ public class ProviderPriceSyncService {
                     summary.cacheWriteUnitPrice(), summary.cacheWriteMode(), summary.outputUnitPrice(), componentJson,
                     summary.priceCompletenessStatus(), priceNature(price, source), write(pricingConditions(price)),
                     sourcePriority(price, source), sourceEvidencePath(price), sourcePublishedAt(price),
-                    price.sourceRef(), evidenceHash);
+                    price.sourceRef(), evidenceHash, sourcePriority(price, source),
+                    integer(source.get("stale_after_hours"), 168));
             jdbc.update("""
                 insert into public_model_reference(id,canonical_name,display_name,vendor,source_type,source_ref,
                   source_confidence,reference_prices,reference_source_hash,reference_updated_at)
@@ -1222,6 +1362,42 @@ public class ProviderPriceSyncService {
         );
     }
 
+    private void finishExtractionReview(String runId,
+                                        Map<String,Object> source,
+                                        FetchResult fetched,
+                                        String sourceChecksum,
+                                        PriceSourceParseResult parsed,
+                                        ParseDiagnostics diagnostics,
+                                        PriceDocumentExtractionService.PersistenceResult extraction,
+                                        List<Map<String,Object>> logs) {
+        logs.add(log("EXTRACTION_REVIEW_REQUIRED", Map.of(
+                "extractionRunId", extraction.runId(),
+                "pendingReview", extraction.pendingReview(),
+                "rejected", extraction.rejected())));
+        jdbc.update("""
+            update provider_price_sync_run set status='REVIEW_REQUIRED',http_status=?,records_fetched=?,
+              records_normalized=?,records_changed=0,records_auto_published=0,records_review_required=?,
+              parse_status=?,parsed_table_count=?,matched_table_count=?,generated_price_count=?,
+              diagnostic_snapshot=cast(? as jsonb),completed_at=now(),execution_log=cast(? as jsonb),
+              heartbeat_at=now(),updated_at=now() where id=?
+            """, fetched.statusCode(), parsed.prices().size(), parsed.prices().size(), extraction.pendingReview(),
+                diagnostics.status(), diagnostics.tableCount(), diagnostics.matchedTableCount(),
+                diagnostics.generatedPriceCount(), write(diagnostics.snapshot()), write(logs), runId);
+        jdbc.update("""
+            update provider_price_source set
+              status=case when status in ('PAUSED','DISABLED') then status else 'ACTIVE' end,
+              last_checked_at=now(),last_success_at=now(),last_good_sync_at=now(),last_error=null,
+              etag=?,last_modified=?,last_content_hash=?,updated_at=now()
+            where id=?
+            """, fetched.etag(), fetched.lastModified(), sourceChecksum, source.get("id"));
+        audits.record("PRICE_DOCUMENT_EXTRACTION_REVIEW_REQUIRED", "PriceDocumentExtractionRun",
+                extraction.runId(), null, Map.of(
+                        "sourceId", source.get("id"),
+                        "syncRunId", runId,
+                        "pendingReview", extraction.pendingReview(),
+                        "rejected", extraction.rejected()));
+    }
+
     private void finishNoChange(String runId, Map<String,Object> source, FetchResult fetched, List<Map<String,Object>> logs) {
         logs.add(log("NO_CHANGE", Map.of("httpStatus", fetched.statusCode())));
         jdbc.update("""
@@ -1233,8 +1409,8 @@ public class ProviderPriceSyncService {
         jdbc.update("""
             update provider_price_source set
               status=case when status in ('PAUSED','DISABLED') then status else 'ACTIVE' end,
-              last_success_at=now(),last_error=null,etag=coalesce(?,etag),
-              last_modified=coalesce(?,last_modified),updated_at=now() where id=?
+              last_checked_at=now(),last_success_at=now(),last_good_sync_at=now(),last_error=null,
+              etag=coalesce(?,etag),last_modified=coalesce(?,last_modified),updated_at=now() where id=?
             """, fetched.etag(), fetched.lastModified(), source.get("id"));
     }
 
@@ -1295,6 +1471,14 @@ public class ProviderPriceSyncService {
         instance.setKeyStatus(text(row.get("key_status")));
         instance.setStatus(text(row.get("status")));
         return instance;
+    }
+
+    private String resolvePricingCredential(Map<String,Object> source, ProviderInstance instance) {
+        if (purposeCredentials == null) {
+            throw new IllegalStateException("价格目录专用凭据服务未配置");
+        }
+        String reference = nullableText(source.get("credential_ref"));
+        return purposeCredentials.resolve(reference, instance.getId(), "PRICING_READ");
     }
 
     private void validateContentType(String adapter, String contentType) {
@@ -1519,8 +1703,7 @@ public class ProviderPriceSyncService {
     }
 
     private static String canonicalReference(PriceSourceParser.NormalizedPrice price) {
-        String model = price.providerModelName();
-        return model.contains("/") ? model : price.providerType() + "/" + model;
+        return ReferenceModelMatcher.canonical(price.providerType(), price.providerModelName());
     }
 
     private static String scopeKey(PriceSourceParser.NormalizedPrice price) {
@@ -1561,9 +1744,34 @@ public class ProviderPriceSyncService {
         catch (Exception e) { throw new IllegalStateException("JSON 序列化失败", e); }
     }
 
-    private OffsetDateTime nextRun(String expression) {
-        try { return OffsetDateTime.now().plus(Duration.parse(expression)); }
-        catch (Exception e) { throw new IllegalArgumentException("同步周期必须是 ISO-8601 Duration"); }
+    private boolean isSystemReference(Map<String,Object> source) {
+        return "SYSTEM".equals(text(source.get("managed_by")))
+                && "REFERENCE".equals(text(source.get("source_purpose")));
+    }
+
+    private Duration referenceRetryDelay(String sourceId) {
+        Integer failures = jdbc.queryForObject("""
+            select count(*) from provider_price_sync_run
+            where price_source_id=? and status='FAILED' and created_at>=now()-interval '24 hours'
+            """, Integer.class, sourceId);
+        int count = failures == null ? 1 : failures;
+        if (count <= 1) return Duration.ofMinutes(30);
+        if (count == 2) return Duration.ofHours(2);
+        return Duration.ofDays(1);
+    }
+
+    private OffsetDateTime nextRun(String expression, boolean addJitter) {
+        try {
+            Duration interval = Duration.parse(expression);
+            OffsetDateTime next = OffsetDateTime.now().plus(interval);
+            if (addJitter && interval.compareTo(Duration.ofHours(1)) >= 0) {
+                long upperBound = Math.min(900L, Math.max(1L, interval.toSeconds() / 20L));
+                next = next.plusSeconds(ThreadLocalRandom.current().nextLong(upperBound + 1L));
+            }
+            return next;
+        } catch (Exception e) {
+            throw new IllegalArgumentException("同步周期必须是 ISO-8601 Duration");
+        }
     }
 
     private static String accept(String adapter) {

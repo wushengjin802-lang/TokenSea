@@ -80,11 +80,23 @@ class ProviderPriceSyncIntegrationTests {
                 jdbc, json, new PriceSourceParser(json), matcher, audits, providerConnections, pricingComponents,
                 new DataSourceTransactionManager(dataSource), "", 18080, "official.example");
 
+        String scheduledRun = service.enqueueScheduledNow("builtin_models_dev");
+        OffsetDateTime nextRun = jdbc.queryForObject("""
+            select next_run_at from provider_price_source where id='builtin_models_dev'
+            """, OffsetDateTime.class);
+        assertThat(nextRun).isAfter(OffsetDateTime.now().plusHours(23));
+        assertThat(service.enqueueScheduledNow("builtin_models_dev")).isEqualTo(scheduledRun);
+        assertThat(jdbc.queryForObject("""
+            select count(*) from provider_price_sync_run
+            where price_source_id='builtin_models_dev' and status in ('PENDING','RUNNING')
+            """, Integer.class)).isEqualTo(1);
+
         jdbc.update("""
             insert into provider_price_source(id,name,source_class,adapter_code,provider_type,endpoint,official_hosts,
-              default_currency,status)
+              default_currency,status,connector_code,data_scope,trust_level,publish_policy,credential_purpose)
             values('source-it','Official Test','OFFICIAL','OFFICIAL_JSON','provider-a',
-              'https://official.example/prices','["official.example"]','USD','ACTIVE')
+              'https://official.example/prices','["official.example"]','USD','ACTIVE','HTTP_DOCUMENT',
+              'DOCUMENT','OFFICIAL_PUBLIC','MANUAL_ONLY','NONE')
             """);
         jdbc.update("""
             insert into provider_price_sync_run(id,price_source_id,status)
@@ -217,7 +229,9 @@ class ProviderPriceSyncIntegrationTests {
         method.invoke(service, publicSource, "run-public", "snapshot-public", "b".repeat(64), List.of(reference));
 
         assertThat(jdbc.queryForObject("select count(*) from public_model_price_reference", Integer.class)).isEqualTo(1);
+        assertThat(jdbc.queryForObject("select count(*) from public_model_price_reference where price_status='CURRENT' and is_current=true and stale_at>now()", Integer.class)).isEqualTo(1);
         assertThat(jdbc.queryForObject("select count(*) from public_model_reference where canonical_name='provider-a/model-a'", Integer.class)).isEqualTo(1);
+        assertThat(jdbc.queryForObject("select count(*) from provider_price_diff where price_source_id='builtin_litellm_cost_map'", Integer.class)).isZero();
 
         var fingerprintMethod = ProviderPriceSyncService.class.getDeclaredMethod("updateStructureFingerprint",
                 Map.class, String.class, String.class, String.class);
@@ -234,10 +248,12 @@ class ProviderPriceSyncIntegrationTests {
         jdbc.update("""
             insert into provider_price_source(
               id,name,source_class,adapter_code,provider_type,endpoint,official_hosts,region,
-              default_currency,auto_publish,status,config)
+              default_currency,auto_publish,status,config,connector_code,data_scope,trust_level,
+              publish_policy,credential_purpose)
             values('kimi-parent','Kimi Parent','OFFICIAL','KIMI_OFFICIAL_PAGE','moonshot',
               'https://platform.kimi.com/docs/pricing/chat-k26','["platform.kimi.com"]','cn',
-              'CNY',true,'ACTIVE','{"seedPricingPages":[]}')
+              'CNY',true,'ACTIVE','{"seedPricingPages":[]}','HTTP_DOCUMENT','DOCUMENT',
+              'OFFICIAL_PUBLIC','AUTO_LOW_RISK','NONE')
             """);
         var childSourceMethod = ProviderPriceSyncService.class.getDeclaredMethod("persistDiscoveredPriceSources",
                 Map.class, List.class);
@@ -285,9 +301,11 @@ class ProviderPriceSyncIntegrationTests {
 
         jdbc.update("""
             insert into provider_price_source(id,name,source_class,adapter_code,provider_type,endpoint,official_hosts,
-              default_currency,auto_publish,max_auto_change_ratio,confirmation_runs,status)
+              default_currency,auto_publish,max_auto_change_ratio,confirmation_runs,status,
+              connector_code,data_scope,trust_level,publish_policy,credential_purpose)
             values('source-confirm','Official Confirm','OFFICIAL','OFFICIAL_JSON','provider-a',
-              'https://official.example/prices','["official.example"]','USD',true,0.3000,2,'ACTIVE')
+              'https://official.example/prices','["official.example"]','USD',true,0.3000,2,'ACTIVE',
+              'HTTP_DOCUMENT','DOCUMENT','OFFICIAL_PUBLIC','AUTO_LOW_RISK','NONE')
             """);
 
         var processOfficial = ProviderPriceSyncService.class.getDeclaredMethod("processOfficial",

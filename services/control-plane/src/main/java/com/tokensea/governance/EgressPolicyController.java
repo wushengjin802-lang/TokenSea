@@ -43,7 +43,7 @@ public class EgressPolicyController {
         Set<String> hosts = new TreeSet<>();
         List<Map<String,Object>> rows = jdbc.queryForList("""
             select official_hosts from provider_price_source
-            where status in ('ACTIVE','PAUSED','DEGRADED')
+            where status in ('DRAFT','ACTIVE','PAUSED','DEGRADED')
             """);
         for (Map<String,Object> row : rows) hosts.addAll(readHosts(row.get("official_hosts")));
         List<String> fxSources = jdbc.queryForList("""
